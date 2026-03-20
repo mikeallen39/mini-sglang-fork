@@ -31,7 +31,7 @@ class AttentionLayer(StateLessOP):
         self.head_dim = head_dim
         tp_size = get_tp_info().size
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
-        self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
+        self.num_kv_heads = div_even(num_kv_heads, tp_size)
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.rotary = get_rope(
@@ -40,6 +40,7 @@ class AttentionLayer(StateLessOP):
             max_position=rotary_config.max_position,
             base=rotary_config.base,
             rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+            is_neox=rotary_config.is_neox,
         )
         self.q_norm = q_norm
         self.k_norm = k_norm

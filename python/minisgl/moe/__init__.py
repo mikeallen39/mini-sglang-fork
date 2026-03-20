@@ -23,6 +23,13 @@ def create_fused_moe_backend():
     return FusedMoe()
 
 
+@SUPPORTED_MOE_BACKENDS.register("torch")
+def create_torch_moe_backend():
+    from .torch_backend import TorchMoe
+
+    return TorchMoe()
+
+
 def create_moe_backend(backend: str) -> BaseMoeBackend:
     return SUPPORTED_MOE_BACKENDS[backend]()
 

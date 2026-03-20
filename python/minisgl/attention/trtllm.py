@@ -10,6 +10,7 @@ from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
+    from minisgl.kvcache import BaseKVCache
     from minisgl.models import ModelConfig
 
 
@@ -33,17 +34,16 @@ class TRTLLMMetadata(BaseAttnMetadata):
 
 
 class TensorRTLLMBackend(BaseAttnBackend):
-    def __init__(self, config: ModelConfig):
-        ctx = get_global_ctx()
+    def __init__(self, config: ModelConfig, kvcache: BaseKVCache):
         self.config = config
-        self.kvcache = ctx.kv_cache
-        self.page_size = ctx.page_size
+        self.kvcache = kvcache
         self.capture: TRTLLMCaptureData | None = None
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
-        self.scale = config.head_dim**-0.5
+        self.scale = config.attn_head_dim**-0.5
+        self.page_size = get_global_ctx().page_size
         self.workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
+            128 * 1024 * 1024, dtype=torch.uint8, device=kvcache.device
         )
 
     def forward(

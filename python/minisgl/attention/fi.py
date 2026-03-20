@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         BatchPrefillWithPagedKVCacheWrapper,
         CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
+    from minisgl.kvcache import BaseKVCache
     from minisgl.models import ModelConfig
 
 
@@ -78,15 +79,15 @@ class FIMetadata(BaseAttnMetadata):
 
 
 class FlashInferBackend(BaseAttnBackend):
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, kvcache: BaseKVCache) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
             BatchPrefillWithPagedKVCacheWrapper,
         )
 
         self.config = config
-        self.kvcache = get_global_ctx().kv_cache
-        self.device = self.kvcache.device
+        self.kvcache = kvcache
+        self.device = kvcache.device
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -109,7 +110,8 @@ class FlashInferBackend(BaseAttnBackend):
         # initialize some data members
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
+        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
+        self.attn_head_dim = self.config.attn_head_dim
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
@@ -117,19 +119,15 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
-        self.last_event = torch.cuda.Event()
-        self.last_event.record()
 
-    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+    @staticmethod
+    def _initialize_metadata_once(metadata: FIMetadata) -> None:
         if metadata.initialized:
             return
 
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
-        # FlashInfer planning reuses a pinned host staging buffer and launches an
-        # async H2D copy. Wait here before the next plan mutates that host buffer.
-        self.last_event.synchronize()
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -163,7 +161,6 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
-        self.last_event.record()
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -216,7 +213,7 @@ class FlashInferBackend(BaseAttnBackend):
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
-            head_dim=self.config.head_dim,
+            head_dim=self.attn_head_dim,
             page_size=1,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,

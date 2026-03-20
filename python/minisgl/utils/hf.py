@@ -3,33 +3,39 @@ import json
 import os
 from typing import Any
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 from tqdm.asyncio import tqdm
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
 
+
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
-        kwargs.pop("name", None)
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs, disable=True)
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    # Some Mistral models store chat_template in a separate JSON file
-    if not getattr(tokenizer, "chat_template", None):
-        try:
-            path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
-                tokenizer.chat_template = json.load(f)["chat_template"]
-        except Exception:
-            pass
-    return tokenizer
+    try:
+        return AutoTokenizer.from_pretrained(model_path, fix_mistral_regex=True)
+    except TypeError:
+        # Older transformers versions may not support fix_mistral_regex.
+        return AutoTokenizer.from_pretrained(model_path)
 
 
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
-    return AutoConfig.from_pretrained(model_path)
+    try:
+        return AutoConfig.from_pretrained(model_path)
+    except Exception:
+        # Fallback for model types unknown to the installed transformers version
+        # (e.g. glm4_moe_lite on older releases).
+        config_file = os.path.join(model_path, "config.json")
+        if not os.path.isfile(config_file):
+            raise
+        with open(config_file, "r", encoding="utf-8") as f:
+            config_dict = json.load(f)
+        model_type = config_dict.get("model_type", "")
+        fallback_cls = type("LocalFallbackConfig", (PretrainedConfig,), {"model_type": model_type})
+        return fallback_cls(**config_dict)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:

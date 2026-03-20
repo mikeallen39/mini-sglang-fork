@@ -10,6 +10,10 @@ from transformers import PreTrainedTokenizerBase
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
+        self._strip_glm_think = (
+            getattr(tokenizer, "name_or_path", "").endswith("GLM-4.7-Flash")
+            or tokenizer.convert_tokens_to_ids("[gMASK]") not in (-1, None)
+        )
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
         results: List[torch.Tensor] = []
@@ -22,6 +26,8 @@ class TokenizeManager:
                     add_generation_prompt=True,
                 )
                 assert isinstance(prompt, str)
+                if self._strip_glm_think and prompt.endswith("<think>"):
+                    prompt = prompt[: -len("<think>")]
             else:
                 prompt = msg.text
             input_ids: torch.Tensor = (  # type: ignore

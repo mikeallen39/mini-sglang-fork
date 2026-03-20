@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
 from transformers import PretrainedConfig
 
 
@@ -11,6 +13,7 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    is_neox: bool = True
 
 
 @dataclass(frozen=True)
@@ -33,21 +36,47 @@ class ModelConfig:
     model_type: str
     architectures: list[str]
 
+    # ===== GLM4.7 / DeepSeek V2 MLA related =====
+    # Multi-Latent Attention (MLA) configuration
+    qk_lora_rank: Optional[int] = None       # Q low-rank compression dimension
+    kv_lora_rank: Optional[int] = None       # KV low-rank compression dimension
+    qk_nope_head_dim: int = 0                # QK head dimension without RoPE
+    qk_rope_head_dim: int = 0                # QK head dimension with RoPE
+    v_head_dim: int = 0                      # V head dimension
+
+    # ===== GLM4.7 MoE related =====
+    n_routed_experts: int = 0               # Number of routed experts
+    n_shared_experts: int = 0                # Number of shared experts
+    num_expert_group: int = 0               # Number of expert groups (for Grouped TopK)
+    topk_group: int = 0                      # Number of experts per group (for Grouped TopK)
+    routed_scaling_factor: float = 1.0       # Routing scaling factor
+    use_mla_backend: bool = False           # Whether to use MLA kv cache backend (else MHA)
+
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
 
+    @property
+    def use_mla(self) -> bool:
+        """Whether to use Multi-Latent Attention"""
+        return self.qk_lora_rank is not None and self.kv_lora_rank is not None
+
+    @property
+    def attn_head_dim(self) -> int:
+        """The Q/K head size expected by MHA-style attention backends.
+
+        GLM-4.7 Flash uses MLA-specific config fields and does not expose a meaningful
+        ``head_dim`` in its HuggingFace config. When we fall back to standard MHA
+        kernels, the backend still needs the real Q/K head size.
+        """
+        if self.use_mla and self.qk_nope_head_dim and self.qk_rope_head_dim:
+            return self.qk_nope_head_dim + self.qk_rope_head_dim
+        return self.head_dim
+
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
-        if hasattr(config, "text_config") and config.text_config is not None:
-            top = config
-            config = config.text_config
-            for attr in ("architectures", "rope_theta", "rope_scaling"):
-                if not getattr(config, attr, None) and getattr(top, attr, None):
-                    setattr(config, attr, getattr(top, attr))
-
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
         num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
@@ -56,9 +85,65 @@ class ModelConfig:
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
-        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
+        # ===== GLM4.7 / DeepSeek V2 MLA related =====
+        qk_lora_rank = getattr(config, "q_lora_rank", None)
+        kv_lora_rank = getattr(config, "kv_lora_rank", None)
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+        v_head_dim = getattr(config, "v_head_dim", 0)
+
+        # Handle MLA head dimensions
+        if qk_lora_rank is not None and qk_nope_head_dim == 0:
+            # If MLA is used but qk_nope_head_dim not set, derive from config
+            qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 128)  # default value
+        if qk_lora_rank is not None and qk_rope_head_dim == 0:
+            qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 64)  # default value
+        if qk_lora_rank is not None and v_head_dim == 0:
+            v_head_dim = getattr(config, "v_head_dim", 128)  # default value
+
+        # ===== GLM4.7 MoE related =====
+        n_routed_experts = getattr(config, "n_routed_experts", 0)
+        n_shared_experts = getattr(config, "n_shared_experts", 0)
+        num_expert_group = getattr(config, "n_group", 0)
+        topk_group = getattr(config, "topk_group", 0)
+        routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+
+        # Auto-enable MLA backend if MLA dimensions are present
+        # Can be overridden by environment variable DISABLE_MLA_BACKEND=1
+        import os
+        disable_mla = os.environ.get("DISABLE_MLA_BACKEND", "0") == "1"
+        use_mla_backend = (qk_lora_rank is not None and kv_lora_rank is not None) and not disable_mla
+
+        # Handle rope_theta / rope_scaling / rope_interleave
+        # Try to get from attributes first, then fall back to config.to_dict()
+        config_dict = config.to_dict()
         rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        if rope_scaling is None:
+            rope_scaling = config_dict.get("rope_scaling", None)
+
+        # Extract rope_theta from rope_scaling if present (GLM-4 style)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = config_dict.get("rope_theta", 10000.0)
+
+        rope_interleave = getattr(config, "rope_interleave", None)
+        if rope_interleave is None:
+            rope_interleave = config_dict.get("rope_interleave")
+        if rope_interleave is None and model_type == "glm4_moe_lite":
+            rope_interleave = True
+
+        # GLM-4 puts rope_theta inside rope_scaling
+        if rope_scaling is not None and isinstance(rope_scaling, dict) and "rope_theta" in rope_scaling:
+            rope_theta = rope_scaling["rope_theta"]
+
+        # Check if rope_scaling is a default value (added by transformers)
+        if rope_scaling is not None and isinstance(rope_scaling, dict) and "rope_type" in rope_scaling:
+            # transformers adds default rope_scaling, check if it's just the default
+            if rope_scaling.get("rope_type") == "default":
+                rope_scaling = None
+
+        # For MLA models, use qk_rope_head_dim for RoPE; otherwise use head_dim
+        rope_head_dim = qk_rope_head_dim if qk_lora_rank is not None else head_dim
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -72,11 +157,12 @@ class ModelConfig:
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
-                head_dim=head_dim,
-                rotary_dim=head_dim,
+                head_dim=rope_head_dim,
+                rotary_dim=rope_head_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
+                is_neox=not rope_interleave,
             ),
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -84,4 +170,17 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            # ===== GLM4.7 / MLA related =====
+            qk_lora_rank=qk_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            # ===== GLM4.7 MoE related =====
+            n_routed_experts=n_routed_experts,
+            n_shared_experts=n_shared_experts,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            use_mla_backend=use_mla_backend,
         )

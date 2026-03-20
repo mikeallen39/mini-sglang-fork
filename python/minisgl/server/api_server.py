@@ -32,6 +32,7 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+_ROLE_MARKERS = ("<|user|>", "<|assistant|>", "<|observation|>", "<|system|>")
 
 
 def get_global_state() -> FrontendManager:
@@ -49,6 +50,17 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
         return result
     assert isinstance(msg, UserReply)
     return [msg]
+
+
+def _strip_role_marker(text: str) -> tuple[str, bool]:
+    stop_at = None
+    for marker in _ROLE_MARKERS:
+        idx = text.find(marker)
+        if idx != -1 and (stop_at is None or idx < stop_at):
+            stop_at = idx
+    if stop_at is None:
+        return text, False
+    return text[:stop_at], True
 
 
 class GenerateRequest(BaseModel):
@@ -151,22 +163,34 @@ class FrontendManager:
         del self.event_map[uid]
 
     async def stream_generate(self, uid: int):
+        saw_role_marker = False
         async for ack in self.wait_for_ack(uid):
-            yield f"data: {ack.incremental_output}\n".encode()
+            text, hit_role_marker = _strip_role_marker(ack.incremental_output)
+            if text:
+                yield f"data: {text}\n".encode()
+            if hit_role_marker:
+                saw_role_marker = True
+                break
             if ack.finished:
                 break
+        if saw_role_marker:
+            asyncio.create_task(self.abort_user(uid))
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_chat_completions(self, uid: int):
         first_chunk = True
+        saw_role_marker = False
         async for ack in self.wait_for_ack(uid):
             delta = {}
             if first_chunk:
                 delta["role"] = "assistant"
+            text, hit_role_marker = _strip_role_marker(ack.incremental_output)
+            if first_chunk:
+                text = text.lstrip("\n")
                 first_chunk = False
-            if ack.incremental_output:
-                delta["content"] = ack.incremental_output
+            if text:
+                delta["content"] = text
 
             chunk = {
                 "id": f"cmpl-{uid}",
@@ -175,8 +199,13 @@ class FrontendManager:
             }
             yield f"data: {json.dumps(chunk)}\n\n".encode()
 
+            if hit_role_marker:
+                saw_role_marker = True
+                break
             if ack.finished:
                 break
+        if saw_role_marker:
+            asyncio.create_task(self.abort_user(uid))
 
         # send final finish_reason
         end_chunk = {

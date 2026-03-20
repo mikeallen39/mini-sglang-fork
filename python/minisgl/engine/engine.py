@@ -7,9 +7,9 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import create_kvcache
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_weight
+from minisgl.models import create_model, load_weight, load_weight_to_model
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
@@ -38,6 +38,7 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        self.allow_memory_imbalance = config.num_page_override is not None
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -49,12 +50,18 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+
+        # Use streaming weight loading for better performance
+        if config.use_dummy_weight:
+            self.model.load_state_dict(self._load_weight_state_dict(config))
+        else:
+            # Streaming load: directly loads weights into model on GPU
+            load_weight_to_model(config.model_path, self.model, device=self.device)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+        self.kv_cache = create_kvcache(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
@@ -74,7 +81,9 @@ class Engine:
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
+            config.attention_backend,
+            config.model_config,
+            self.kv_cache,
         )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
@@ -143,18 +152,37 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device).items()
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
-        )
+
+        # Calculate KV cache size per page
+        if config.model_config.use_mla_backend:
+            # MLA uses compressed latent representation
+            # KV cache dimension = kv_lora_rank + qk_rope_head_dim (single buffer, not 2x)
+            kv_cache_dim = config.model_config.kv_lora_rank + config.model_config.qk_rope_head_dim
+            cache_per_page = (
+                kv_cache_dim  # Single latent buffer (not 2x for K+V)
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
+        else:
+            # Standard MHA with same head_dim for K and V
+            # For MLA models, use v_head_dim as the K/V dimension
+            kv_dim = config.model_config.v_head_dim if hasattr(config.model_config, "v_head_dim") else config.model_config.head_dim
+            cache_per_page = (
+                2  # key + value
+                * kv_dim
+                * div_even(config.model_config.num_kv_heads, config.tp_info.size)
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
+
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -180,11 +208,15 @@ class Engine:
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
-            logger.error(
+            msg = (
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
             )
-            raise RuntimeError("Memory across TP ranks are imbalanced")
+            if self.allow_memory_imbalance:
+                logger.warning(msg + " (continuing because --num-pages was set explicitly)")
+            else:
+                logger.error(msg)
+                raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
 
@@ -220,7 +252,11 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        # Check if model uses MLA
+        if config.model_config.use_mla_backend:
+            backend = "mla"
+        else:
+            backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
@@ -229,5 +265,9 @@ def _adjust_config(config: EngineConfig):
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
-        override("moe_backend", "fused")
+        # GLM4-MoE is more stable with the conservative torch backend on some environments.
+        if config.model_config.model_type == "glm4_moe_lite":
+            override("moe_backend", "torch")
+        else:
+            override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

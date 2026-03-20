@@ -4,10 +4,10 @@ import torch
 from minisgl.distributed import get_tp_info
 from minisgl.utils import div_even
 
-from .base import BaseKVCachePool
+from .base import BaseKVCache
 
 
-class MHAKVCache(BaseKVCachePool):
+class MHAKVCache(BaseKVCache):
     """
     Base class for key-value caches.
     This class defines the interface for key-value caches used in LLMs.
@@ -24,7 +24,7 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
     ) -> None:
         tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        local_kv_heads = div_even(num_kv_heads, tp_info.size)
         self._kv_buffer = torch.empty(
             (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
             device=device,
@@ -46,6 +46,10 @@ class MHAKVCache(BaseKVCachePool):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
         from minisgl.kernel import store_cache
+
+        # Flatten 3D tensors to 2D: [num_tokens, num_heads, head_dim] -> [num_tokens, num_heads * head_dim]
+        k = k.reshape(k.size(0), -1)
+        v = v.reshape(v.size(0), -1)
 
         store_cache(
             k_cache=self._k_buffer[layer_id].view(self._storage_shape),

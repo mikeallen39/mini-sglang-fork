@@ -7,37 +7,45 @@ from minisgl.utils import Registry, init_logger
 from .base import BaseAttnBackend, BaseAttnMetadata, HybridBackend
 
 if TYPE_CHECKING:
+    from minisgl.kvcache import BaseKVCache
     from minisgl.models import ModelConfig
 
 logger = init_logger(__name__)
 
 
 class BackendCreator(Protocol):
-    def __call__(self, config: ModelConfig) -> BaseAttnBackend: ...
+    def __call__(self, config: ModelConfig, kvcache: BaseKVCache) -> BaseAttnBackend: ...
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("trtllm")
-def create_trtllm_backend(config: ModelConfig):
+def create_trtllm_backend(config: ModelConfig, kvcache: BaseKVCache):
     from .trtllm import TensorRTLLMBackend
 
-    return TensorRTLLMBackend(config)
+    return TensorRTLLMBackend(config, kvcache)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fi")
-def create_fi_backend(config: ModelConfig):
+def create_fi_backend(config: ModelConfig, kvcache: BaseKVCache):
     from .fi import FlashInferBackend
 
-    return FlashInferBackend(config)
+    return FlashInferBackend(config, kvcache)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fa")
-def create_fa_backend(config: ModelConfig):
+def create_fa_backend(config: ModelConfig, kvcache: BaseKVCache):
     from .fa import FlashAttentionBackend
 
-    return FlashAttentionBackend(config)
+    return FlashAttentionBackend(config, kvcache)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register("mla")
+def create_mla_backend(config: ModelConfig, kvcache: BaseKVCache):
+    from .mla_backend import MLABackend
+
+    return MLABackend(config, kvcache)
 
 
 def validate_attn_backend(backend: str, allow_auto: bool = True):
@@ -52,20 +60,29 @@ def validate_attn_backend(backend: str, allow_auto: bool = True):
 def create_attention_backend(
     backend: str,
     config: ModelConfig,
+    kvcache: BaseKVCache,
 ) -> BaseAttnBackend:
     validate_attn_backend(backend, allow_auto=False)
+
+    # Auto-detect MLA and use MLA backend
+    if config.use_mla_backend:
+        logger.info("Detected MLA model, using MLA attention backend")
+        from .mla_backend import MLABackend
+
+        return MLABackend(config, kvcache)
+
     if "," in backend:
         assert backend.count(",") == 1, "Only one comma is allowed in hybrid backend"
         p_backend, d_backend = backend.split(",", 1)
         if p_backend != d_backend:
             logger.info(f"Using hybrid attention backend: prefill={p_backend}, decode={d_backend}")
-            p_backend = create_attention_backend(p_backend, config)
-            d_backend = create_attention_backend(d_backend, config)
+            p_backend = create_attention_backend(p_backend, config, kvcache)
+            d_backend = create_attention_backend(d_backend, config, kvcache)
             return HybridBackend(p_backend, d_backend)
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
-    return SUPPORTED_ATTENTION_BACKENDS[backend](config)
+    return SUPPORTED_ATTENTION_BACKENDS[backend](config, kvcache)
 
 
 __all__ = [

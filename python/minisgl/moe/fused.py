@@ -1,5 +1,5 @@
 import functools
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from minisgl.moe import BaseMoeBackend
@@ -25,6 +25,122 @@ def fused_topk(
     if num_token_non_padded is not None:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = -1
+    return topk_weights, topk_ids
+
+
+def grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    correction_bias: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Grouped TopK routing for MoE.
+
+    Reference: transformers/models/glm4_moe_lite/modeling_glm4_moe_lite.py:467-490
+
+    This implements the GLM4 MoE Lite routing:
+    1. Apply sigmoid to get scores
+    2. Add correction_bias for group selection only
+    3. For each group, compute group score as topk(2).sum()
+    4. Select topk_group groups
+    5. Within selected groups, select topk experts
+    6. Get weights from original sigmoid scores (without correction_bias)
+    7. Renormalize and apply routed_scaling_factor
+
+    Parameters:
+    - hidden_states: Input tensor [num_tokens, hidden_size]
+    - gating_output: Router logits [num_tokens, num_experts]
+    - topk: Total number of experts to select
+    - renormalize: Whether to renormalize topk weights
+    - num_expert_group: Number of expert groups (n_group)
+    - topk_group: Number of groups to select
+    - num_fused_shared_experts: Number of fused shared experts
+    - routed_scaling_factor: Scaling factor for routed experts
+    - correction_bias: e_score_correction_bias tensor
+    """
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_tokens = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
+    experts_per_group = num_experts // num_expert_group
+
+    # Step 1: Apply sigmoid to get scores (transformers uses sigmoid, not softmax)
+    scores = gating_output.sigmoid()
+
+    # Step 2: Add correction_bias for group/choice selection only
+    # correction_bias is used only for selecting experts, not for final weights
+    scores_for_choice = scores
+    if correction_bias is not None:
+        scores_for_choice = scores + correction_bias
+
+    # Step 3: Compute group scores using topk(2).sum() (not max!)
+    # Reference: transformers line 470-474
+    group_scores = (
+        scores_for_choice.view(num_tokens, num_expert_group, experts_per_group)
+        .topk(2, dim=-1)[0]  # Get top 2 scores in each group
+        .sum(dim=-1)  # Sum them to get group score
+    )  # [num_tokens, num_expert_group]
+
+    # Step 4: Select topk_group groups
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+
+    # Step 5: Create mask for selected groups
+    group_mask = torch.zeros_like(group_scores)  # [num_tokens, num_expert_group]
+    group_mask.scatter_(1, group_idx, 1)
+
+    # Expand group mask to expert level
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_expert_group, experts_per_group)
+        .reshape(num_tokens, num_experts)
+    )  # [num_tokens, num_experts]
+
+    # Step 6: Apply mask to scores_for_choice for expert selection
+    masked_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+    # Step 7: Select topk experts from masked scores
+    topk_ids = torch.topk(masked_scores, k=topk, dim=-1, sorted=False)[1]
+
+    # Step 8: Get weights from ORIGINAL sigmoid scores (not scores_for_choice!)
+    # This is critical: correction_bias only affects selection, not weights
+    topk_weights = scores.gather(1, topk_ids)
+
+    # Step 9: Renormalize weights
+    if renormalize:
+        denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+        topk_weights = topk_weights / denominator
+
+    # Step 10: Apply routed_scaling_factor
+    if routed_scaling_factor is not None:
+        topk_weights = topk_weights * routed_scaling_factor
+
+    # Convert to expected dtype
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+
+    # Handle fused shared experts (if applicable)
+    if num_fused_shared_experts:
+        # Replace last expert ID with shared expert
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+
+    # Mask padded region if needed
+    if num_token_non_padded is not None:
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+
     return topk_weights, topk_ids
 
 
@@ -228,6 +344,10 @@ def fused_experts_impl(
 
 
 class FusedMoe(BaseMoeBackend):
+    """
+    Stateless MoE backend - all configuration passed through forward().
+    """
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -238,13 +358,34 @@ class FusedMoe(BaseMoeBackend):
         renormalize: bool,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        # Grouped TopK parameters
+        use_grouped_topk: bool = False,
+        num_expert_group: int = 0,
+        topk_group: int = 0,
+        routed_scaling_factor: float = 1.0,
+        correction_bias: Optional[torch.Tensor] = None,
+        num_fused_shared_experts: int = 0,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=gating_output,
-            topk=topk,
-            renormalize=renormalize,
-        )
+        if use_grouped_topk:
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                correction_bias=correction_bias,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+            )
+
         return fused_experts_impl(
             hidden_states,
             w1,

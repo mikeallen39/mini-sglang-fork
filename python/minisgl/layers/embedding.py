@@ -29,6 +29,18 @@ class VocabParallelEmbedding(BaseOP):
         self.weight = torch.empty(self.num_embeddings_tp, embedding_dim)
         self._comm = DistributedCommunicator()
 
+    def weight_loader(self, loaded_weight: torch.Tensor, shard_id=None):
+        if shard_id is not None:
+            raise ValueError("VocabParallelEmbedding does not support stacked shard loading")
+        if loaded_weight.shape[0] == self.num_embeddings:
+            start = self.num_embeddings_tp * get_tp_info().rank
+            end = min(start + self.num_embeddings_tp, self.num_embeddings)
+            loaded_weight = loaded_weight[start:end].contiguous()
+        if self.weight.is_meta:
+            self.weight = loaded_weight
+        else:
+            self.weight.copy_(loaded_weight)
+
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from minisgl.kernel import indexing
@@ -105,6 +117,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
-        output_tensor = output_tensor.permute(1, 0, 2).contiguous()
+        output_tensor = output_tensor.movedim(0, -1)
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def weight_loader(self, loaded_weight: torch.Tensor, shard_id=None):
+        return super().weight_loader(loaded_weight, shard_id=shard_id)

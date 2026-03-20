@@ -33,6 +33,9 @@ class RMSNormFused(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            return self.rmsnorm(x, self.weight, self.eps), x
+            try:
+                return self.rmsnorm(x, self.weight, self.eps), x
+            except RuntimeError:
+                import rpdb; rpdb.set_trace(port=4444)
         self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
