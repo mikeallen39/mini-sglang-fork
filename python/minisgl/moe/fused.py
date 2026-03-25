@@ -6,6 +6,29 @@ from minisgl.moe import BaseMoeBackend
 from minisgl.utils import div_ceil
 
 
+def _remap_global_experts_to_local(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    num_global_experts: int | None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if num_global_experts is None or (
+        local_expert_start == 0 and num_local_experts == num_global_experts
+    ):
+        return topk_weights, topk_ids
+
+    local_expert_end = local_expert_start + num_local_experts
+    local_mask = (topk_ids >= local_expert_start) & (topk_ids < local_expert_end)
+    remapped_ids = torch.where(
+        local_mask,
+        topk_ids - local_expert_start,
+        torch.full_like(topk_ids, num_local_experts),
+    )
+    remapped_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+    return remapped_weights, remapped_ids
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -365,6 +388,8 @@ class FusedMoe(BaseMoeBackend):
         routed_scaling_factor: float = 1.0,
         correction_bias: Optional[torch.Tensor] = None,
         num_fused_shared_experts: int = 0,
+        local_expert_start: int = 0,
+        num_global_experts: int | None = None,
     ) -> torch.Tensor:
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
@@ -385,6 +410,14 @@ class FusedMoe(BaseMoeBackend):
                 topk=topk,
                 renormalize=renormalize,
             )
+
+        topk_weights, topk_ids = _remap_global_experts_to_local(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            local_expert_start=local_expert_start,
+            num_local_experts=w1.shape[0],
+            num_global_experts=num_global_experts,
+        )
 
         return fused_experts_impl(
             hidden_states,

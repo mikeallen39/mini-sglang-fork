@@ -2,7 +2,12 @@ from typing import Optional
 
 import torch
 from minisgl.core import get_global_ctx
-from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import (
+    DistributedCommunicator,
+    get_local_expert_range,
+    get_moe_tp_info,
+    get_tp_info,
+)
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -35,6 +40,9 @@ class MoELayer(BaseOP):
 
         tp_info = get_tp_info()
         self.tp_size = tp_size = tp_info.size
+        self.moe_tp_size = get_moe_tp_info(tp_info).size
+        self.local_expert_start, local_expert_end = get_local_expert_range(num_experts)
+        self.num_local_experts = local_expert_end - self.local_expert_start
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -45,14 +53,14 @@ class MoELayer(BaseOP):
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
 
-        intermediate_size_per_partition = div_even(intermediate_size, tp_size)
+        intermediate_size_per_partition = div_even(intermediate_size, self.moe_tp_size)
         self.gate_up_proj = torch.empty(
-            num_experts,
+            self.num_local_experts,
             2 * intermediate_size_per_partition,
             hidden_size,
         )
         self.down_proj = torch.empty(
-            num_experts,
+            self.num_local_experts,
             hidden_size,
             intermediate_size_per_partition,
         )
@@ -82,6 +90,8 @@ class MoELayer(BaseOP):
             routed_scaling_factor=self.routed_scaling_factor,
             correction_bias=correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            local_expert_start=self.local_expert_start,
+            num_global_experts=self.num_experts,
         )
         if self.tp_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
-from minisgl.distributed import DistributedInfo
+from minisgl.distributed import DistributedInfo, build_ep_info
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
 
@@ -51,6 +51,26 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
+def _validate_parallelism(tp_size: int, ep_size: int, model_config) -> None:
+    if ep_size < 1:
+        raise ValueError(f"ep_size must be >= 1, got {ep_size}")
+    if ep_size not in (1, tp_size):
+        raise ValueError(
+            f"Phase-A EP only supports ep_size in {{1, tp_size}}, got ep_size={ep_size}, tp_size={tp_size}"
+        )
+    if ep_size == 1:
+        return
+    if not model_config.is_moe:
+        raise ValueError("ep_size > 1 is only supported for MoE models")
+    num_routed_experts = model_config.n_routed_experts or model_config.num_experts
+    if num_routed_experts <= 0:
+        raise ValueError("ep_size > 1 requires routed experts in the model config")
+    if num_routed_experts % ep_size != 0:
+        raise ValueError(
+            f"Number of routed experts ({num_routed_experts}) must be divisible by ep_size ({ep_size})"
+        )
+
+
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
     """
     Parse command line arguments and return an EngineConfig.
@@ -89,6 +109,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument(
+        "--expert-parallel-size",
+        "--ep-size",
+        type=int,
+        default=ServerArgs.ep_info.size,
+        help="The expert parallelism size. Phase-A currently only supports 1 or tp_size.",
     )
 
     parser.add_argument(
@@ -269,8 +297,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
+    if hf_config is None:
+        from minisgl.utils import cached_load_hf_config
+
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+    from minisgl.models import ModelConfig
+
+    tp_size = kwargs["tensor_parallel_size"]
+    ep_size = kwargs["expert_parallel_size"]
+    _validate_parallelism(tp_size, ep_size, ModelConfig.from_hf(hf_config))
+
+    kwargs["tp_info"] = DistributedInfo(0, tp_size)
+    kwargs["ep_info"] = build_ep_info(0, tp_size, ep_size)
     del kwargs["tensor_parallel_size"]
+    del kwargs["expert_parallel_size"]
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

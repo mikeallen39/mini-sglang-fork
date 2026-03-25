@@ -6,7 +6,12 @@ from typing import Any, Dict, NamedTuple, Tuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_ep_info,
+    set_tp_info,
+)
 from minisgl.kvcache import create_kvcache
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight, load_weight_to_model
@@ -30,6 +35,7 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_ep_info(rank=config.ep_info.rank, size=config.ep_info.size)
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -258,6 +264,24 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.ep_info.size not in (1, config.tp_info.size):
+        raise ValueError(
+            f"Phase-A EP only supports ep_size in {{1, tp_size}}, got ep_size={config.ep_info.size}, tp_size={config.tp_info.size}"
+        )
+    if config.ep_info.size > 1:
+        if not config.model_config.is_moe:
+            raise ValueError("ep_size > 1 is only supported for MoE models")
+        num_routed_experts = config.model_config.n_routed_experts or config.model_config.num_experts
+        if num_routed_experts <= 0:
+            raise ValueError("ep_size > 1 requires routed experts in the model config")
+        if num_routed_experts % config.ep_info.size != 0:
+            raise ValueError(
+                f"Number of routed experts ({num_routed_experts}) must be divisible by ep_size ({config.ep_info.size})"
+            )
+        if config.cuda_graph_max_bs != 0:
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("CUDA graph is disabled for ep_size > 1 in the current EP path")
 
     if config.attention_backend == "auto":
         if config.model_config.use_mla_backend:

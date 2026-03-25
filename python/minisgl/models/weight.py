@@ -9,7 +9,7 @@ from typing import Dict, Generator, Tuple
 import safetensors
 import torch
 from tqdm import tqdm
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_ep_info, get_local_expert_range, get_moe_tp_info, get_tp_info
 from minisgl.layers.base import BaseOP
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 
@@ -113,17 +113,21 @@ def _stream_shard_tensor(
     value: torch.Tensor,
     tp_rank: int,
     tp_size: int,
+    moe_tp_rank: int,
+    moe_tp_size: int,
     num_kv_heads: int,
 ) -> torch.Tensor:
+    shard_rank = moe_tp_rank if ".experts." in key else tp_rank
+    shard_size = moe_tp_size if ".experts." in key else tp_size
     if any(key.count(sub) for sub in _STREAM_SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
-        if is_kv_proj and num_kv_heads < tp_size:
+        if is_kv_proj and num_kv_heads < shard_size:
             head_dim = value.shape[0] // num_kv_heads
-            head_idx = tp_rank * num_kv_heads // tp_size
+            head_idx = shard_rank * num_kv_heads // shard_size
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
-        return value.chunk(tp_size, dim=0)[tp_rank].clone()
+        return value.chunk(shard_size, dim=0)[shard_rank].clone()
     if any(key.count(sub) for sub in _STREAM_SPLIT_DIM_1):
-        return value.chunk(tp_size, dim=1)[tp_rank].clone()
+        return value.chunk(shard_size, dim=1)[shard_rank].clone()
     if key.count("lm_head") or key.count("embed_tokens"):
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, tp_size)
@@ -173,6 +177,14 @@ def _set_module_tensor(module_dict, checkpoint_key: str, weight: torch.Tensor) -
     return True
 
 
+def _get_local_expert_layout(num_experts: int) -> tuple[int, int, int]:
+    ep_info = get_ep_info()
+    if ep_info.size == 1:
+        return 0, num_experts, num_experts
+    start, end = get_local_expert_range(num_experts, ep_info)
+    return start, end, end - start
+
+
 def load_weight(
     model_path: str,
     device: torch.device,
@@ -185,6 +197,10 @@ def load_weight(
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    moe_tp_info = get_moe_tp_info(tp_info)
+    local_expert_start, local_expert_end, num_local_experts = _get_local_expert_layout(
+        config.num_experts
+    )
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, tuple[torch.Tensor, set[int]]] = {}
     result: Dict[str, torch.Tensor] = {}
@@ -195,12 +211,18 @@ def load_weight(
                 name = _normalize_checkpoint_key(raw_name, config.num_layers)
                 if name is None:
                     continue
+                if config.is_moe and (expert_info := _stream_get_expert_stack_info(name)) is not None:
+                    _, expert_idx = expert_info
+                    if not (local_expert_start <= expert_idx < local_expert_end):
+                        continue
                 raw = f.get_tensor(raw_name)
                 tensor = _stream_shard_tensor(
                     name,
                     raw,
                     tp_info.rank,
                     tp_info.size,
+                    moe_tp_info.rank,
+                    moe_tp_info.size,
                     config.num_kv_heads,
                 )
                 del raw
@@ -219,10 +241,10 @@ def load_weight(
                 if config.is_moe and (expert_info := _stream_get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info
                     slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
+                    slots[expert_idx - local_expert_start] = out[1]
+                    if len(slots) != num_local_experts:
                         continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
+                    experts = [slots[idx] for idx in range(num_local_experts)]
                     del expert_buf[packed_key]
                     result[packed_key] = torch.stack(experts, dim=0)
                 else:
@@ -275,6 +297,10 @@ def load_weight_to_model(
 
     module_dict = _build_module_dict(model)
     tp_info = get_tp_info()
+    moe_tp_info = get_moe_tp_info(tp_info)
+    local_expert_start, local_expert_end, num_local_experts = _get_local_expert_layout(
+        config.num_experts
+    )
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     unmatched_keys: list[str] = []
@@ -287,12 +313,18 @@ def load_weight_to_model(
                     name = _normalize_checkpoint_key(raw_name, config.num_layers)
                     if name is None:
                         continue
+                    if config.is_moe and (expert_info := _stream_get_expert_stack_info(name)) is not None:
+                        _, expert_idx = expert_info
+                        if not (local_expert_start <= expert_idx < local_expert_end):
+                            continue
 
                     tensor = _stream_shard_tensor(
                         name,
                         f.get_tensor(raw_name),
                         tp_info.rank,
                         tp_info.size,
+                        moe_tp_info.rank,
+                        moe_tp_info.size,
                         config.num_kv_heads,
                     )
 
@@ -311,16 +343,17 @@ def load_weight_to_model(
                         packed_key, expert_idx = expert_info
                         if packed_key not in expert_buf:
                             packed = torch.empty(
-                                (config.num_experts,) + out_tensor.shape,
+                                (num_local_experts,) + out_tensor.shape,
                                 dtype=out_tensor.dtype,
                                 device=out_tensor.device,
                             )
                             expert_buf[packed_key] = (packed, set())
 
                         packed, seen = expert_buf[packed_key]
-                        packed[expert_idx].copy_(out_tensor)
-                        seen.add(expert_idx)
-                        if len(seen) != config.num_experts:
+                        local_expert_idx = expert_idx - local_expert_start
+                        packed[local_expert_idx].copy_(out_tensor)
+                        seen.add(local_expert_idx)
+                        if len(seen) != num_local_experts:
                             continue
                         del expert_buf[packed_key]
                         out_key, out_tensor = packed_key, packed

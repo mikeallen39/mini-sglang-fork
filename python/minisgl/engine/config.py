@@ -17,6 +17,7 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    ep_info: DistributedInfo = DistributedInfo(0, 1)
     max_running_req: int = 256
     attention_backend: str = "auto"
     moe_backend: str = "auto"
@@ -49,6 +50,10 @@ class EngineConfig:
     @property
     def max_forward_len(self) -> int:
         return self.max_seq_len
+
+    @property
+    def ep_size(self) -> int:
+        return self.ep_info.size
 
     @property
     def distributed_addr(self) -> str:

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from minisgl.moe import BaseMoeBackend
 
-from .fused import fused_topk, grouped_topk
+from .fused import _remap_global_experts_to_local, fused_topk, grouped_topk
 
 
 def _apply_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -42,6 +42,8 @@ class TorchMoe(BaseMoeBackend):
         routed_scaling_factor: float = 1.0,
         correction_bias: Optional[torch.Tensor] = None,
         num_fused_shared_experts: int = 0,
+        local_expert_start: int = 0,
+        num_global_experts: int | None = None,
     ) -> torch.Tensor:
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
@@ -62,6 +64,14 @@ class TorchMoe(BaseMoeBackend):
                 topk=topk,
                 renormalize=renormalize,
             )
+
+        topk_weights, topk_ids = _remap_global_experts_to_local(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            local_expert_start=local_expert_start,
+            num_local_experts=w1.shape[0],
+            num_global_experts=num_global_experts,
+        )
 
         num_tokens, hidden_size = hidden_states.shape
         num_experts = w1.shape[0]
@@ -90,4 +100,3 @@ class TorchMoe(BaseMoeBackend):
 
         assert output.shape == (num_tokens, hidden_size)
         return output
-

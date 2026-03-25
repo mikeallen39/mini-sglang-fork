@@ -15,4 +15,6 @@ class BaseMoeBackend(ABC):
         renormalize: bool,
         activation: str,
         apply_router_weight_on_input: bool,
+        local_expert_start: int = 0,
+        num_global_experts: int | None = None,
     ) -> torch.Tensor: ...

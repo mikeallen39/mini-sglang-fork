@@ -31,6 +31,7 @@ class LLM(Scheduler):
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),
             dtype=dtype,
+            ep_info=DistributedInfo(0, 1),
             offline_mode=True,
             **kwargs,
         )

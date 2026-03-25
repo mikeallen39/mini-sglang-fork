@@ -6,7 +6,7 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from minisgl.distributed import DistributedInfo
+from minisgl.distributed import DistributedInfo, build_ep_info
 from minisgl.utils import init_logger
 
 if TYPE_CHECKING:
@@ -60,6 +60,7 @@ def launch_server(run_shell: bool = False) -> None:
             new_args = replace(
                 server_args,
                 tp_info=DistributedInfo(i, world_size),
+                ep_info=build_ep_info(i, world_size, server_args.ep_info.size),
             )
             mp.Process(
                 target=_run_scheduler,

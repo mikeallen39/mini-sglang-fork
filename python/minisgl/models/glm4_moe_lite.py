@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
-from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import (
+    DistributedCommunicator,
+    get_local_expert_range,
+    get_moe_tp_info,
+    get_tp_info,
+)
 from minisgl.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -251,15 +256,18 @@ class Glm4MoeLiteTopkRouter(BaseOP):
 class Glm4MoeLiteExperts(BaseOP):
     def __init__(self, config: ModelConfig):
         tp_info = get_tp_info()
-        intermediate_size = div_even(config.moe_intermediate_size, tp_info.size)
+        moe_tp_info = get_moe_tp_info(tp_info)
+        intermediate_size = div_even(config.moe_intermediate_size, moe_tp_info.size)
         self.num_experts = config.n_routed_experts
+        self.local_expert_start, local_expert_end = get_local_expert_range(self.num_experts)
+        self.num_local_experts = local_expert_end - self.local_expert_start
         self.gate_up_proj = torch.empty(
-            config.n_routed_experts,
+            self.num_local_experts,
             intermediate_size * 2,
             config.hidden_size,
         )
         self.down_proj = torch.empty(
-            config.n_routed_experts,
+            self.num_local_experts,
             config.hidden_size,
             intermediate_size,
         )
@@ -273,15 +281,16 @@ class Glm4MoeLiteExperts(BaseOP):
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.zeros_like(hidden_states)
-        for expert_id in range(self.num_experts):
-            token_idx, topk_pos = torch.where(topk_ids == expert_id)
+        for local_expert_id in range(self.num_local_experts):
+            global_expert_id = self.local_expert_start + local_expert_id
+            token_idx, topk_pos = torch.where(topk_ids == global_expert_id)
             if token_idx.numel() == 0:
                 continue
             routed_x = hidden_states[token_idx]
             routed_w = topk_weights[token_idx, topk_pos].to(hidden_states.dtype)
-            inter = F.linear(routed_x, self.gate_up_proj[expert_id])
+            inter = F.linear(routed_x, self.gate_up_proj[local_expert_id])
             inter = silu_and_mul(inter)
-            routed_out = F.linear(inter, self.down_proj[expert_id])
+            routed_out = F.linear(inter, self.down_proj[local_expert_id])
             routed_out = routed_out * routed_w.unsqueeze(-1)
             output.index_add_(0, token_idx, routed_out)
         if self._tp_size > 1:
