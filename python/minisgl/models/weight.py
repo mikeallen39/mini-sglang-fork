@@ -159,7 +159,17 @@ def _set_module_tensor(module_dict, checkpoint_key: str, weight: torch.Tensor) -
         module.weight_loader(weight)
         return True
 
-    setattr(module, attr_name, weight)
+    current = getattr(module, attr_name)
+    if (
+        isinstance(current, torch.Tensor)
+        and not current.is_meta
+        and current.shape == weight.shape
+        and current.dtype == weight.dtype
+        and current.device == weight.device
+    ):
+        current.copy_(weight)
+    else:
+        setattr(module, attr_name, weight)
     return True
 
 

@@ -48,7 +48,16 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        with torch.device("meta"), torch_dtype(config.dtype):
+        model_init_device = (
+            self.device
+            if (
+                config.model_config.model_type == "glm4_moe_lite"
+                and config.tp_info.size == 1
+                and not config.use_dummy_weight
+            )
+            else torch.device("meta")
+        )
+        with torch.device(model_init_device), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
 
         if config.use_dummy_weight:
