@@ -25,6 +25,7 @@ from minisgl.layers import (
     get_rope,
     silu_and_mul,
 )
+from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
@@ -280,14 +281,20 @@ class Glm4MoeLiteExperts(BaseOP):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
+        dispatch_plan = build_local_expert_dispatch_plan(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            local_expert_start=self.local_expert_start,
+            num_local_experts=self.num_local_experts,
+            num_global_experts=self.num_experts,
+        )
         output = torch.zeros_like(hidden_states)
         for local_expert_id in range(self.num_local_experts):
-            global_expert_id = self.local_expert_start + local_expert_id
-            token_idx, topk_pos = torch.where(topk_ids == global_expert_id)
+            token_idx, topk_pos = torch.where(dispatch_plan.topk_ids == local_expert_id)
             if token_idx.numel() == 0:
                 continue
             routed_x = hidden_states[token_idx]
-            routed_w = topk_weights[token_idx, topk_pos].to(hidden_states.dtype)
+            routed_w = dispatch_plan.topk_weights[token_idx, topk_pos].to(hidden_states.dtype)
             inter = F.linear(routed_x, self.gate_up_proj[local_expert_id])
             inter = silu_and_mul(inter)
             routed_out = F.linear(inter, self.down_proj[local_expert_id])

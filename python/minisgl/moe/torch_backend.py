@@ -6,8 +6,9 @@ import torch
 import torch.nn.functional as F
 
 from minisgl.moe import BaseMoeBackend
+from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 
-from .fused import _remap_global_experts_to_local, fused_topk, grouped_topk
+from .fused import fused_topk, grouped_topk
 
 
 def _apply_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -65,13 +66,15 @@ class TorchMoe(BaseMoeBackend):
                 renormalize=renormalize,
             )
 
-        topk_weights, topk_ids = _remap_global_experts_to_local(
+        dispatch_plan = build_local_expert_dispatch_plan(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             local_expert_start=local_expert_start,
             num_local_experts=w1.shape[0],
             num_global_experts=num_global_experts,
         )
+        topk_weights = dispatch_plan.topk_weights
+        topk_ids = dispatch_plan.topk_ids
 
         num_tokens, hidden_size = hidden_states.shape
         num_experts = w1.shape[0]

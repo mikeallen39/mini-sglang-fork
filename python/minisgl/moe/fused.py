@@ -3,30 +3,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from minisgl.moe import BaseMoeBackend
+from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 from minisgl.utils import div_ceil
-
-
-def _remap_global_experts_to_local(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    local_expert_start: int,
-    num_local_experts: int,
-    num_global_experts: int | None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if num_global_experts is None or (
-        local_expert_start == 0 and num_local_experts == num_global_experts
-    ):
-        return topk_weights, topk_ids
-
-    local_expert_end = local_expert_start + num_local_experts
-    local_mask = (topk_ids >= local_expert_start) & (topk_ids < local_expert_end)
-    remapped_ids = torch.where(
-        local_mask,
-        topk_ids - local_expert_start,
-        torch.full_like(topk_ids, num_local_experts),
-    )
-    remapped_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
-    return remapped_weights, remapped_ids
 
 
 def fused_topk(
@@ -411,7 +389,7 @@ class FusedMoe(BaseMoeBackend):
                 renormalize=renormalize,
             )
 
-        topk_weights, topk_ids = _remap_global_experts_to_local(
+        dispatch_plan = build_local_expert_dispatch_plan(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             local_expert_start=local_expert_start,
@@ -423,8 +401,8 @@ class FusedMoe(BaseMoeBackend):
             hidden_states,
             w1,
             w2,
-            topk_weights,
-            topk_ids,
+            dispatch_plan.topk_weights,
+            dispatch_plan.topk_ids,
             activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )

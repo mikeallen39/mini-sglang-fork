@@ -153,3 +153,36 @@ regression to about:
 The critical regression that was removed was:
 
 - reading remote expert tensors from checkpoint and only discarding them after GPU materialization
+
+## Dispatcher Refactor Follow-up
+
+After the correctness-first EP path was validated, the local expert remap logic was
+refactored into a shared minimal dispatcher/mapping utility:
+
+- `python/minisgl/moe/dispatch.py`
+
+Current purpose:
+
+- unify `global expert id -> local expert slot` remap logic
+- keep GLM custom MoE path and generic fused/torch MoE backends on the same semantics
+- reduce the amount of EP-specific logic duplicated across model code
+
+Updated call sites:
+
+- `python/minisgl/moe/fused.py`
+- `python/minisgl/moe/torch_backend.py`
+- `python/minisgl/models/glm4_moe_lite.py`
+
+Validation:
+
+- added `tests/misc/test_moe_dispatch.py`
+- reran:
+  - `tests/misc/test_glm4_config.py`
+  - `tests/misc/test_moe_dispatch.py`
+- real GPU regression check repeated on:
+  - `tp=2`
+  - `ep=2`
+  - `attention_backend=mla`
+  - OpenAI-style HTTP request with prompt `hi`
+- result remained correct:
+  - `Hello! How can I assist you today?`
