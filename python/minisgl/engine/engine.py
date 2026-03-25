@@ -51,11 +51,9 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
 
-        # Use streaming weight loading for better performance
         if config.use_dummy_weight:
             self.model.load_state_dict(self._load_weight_state_dict(config))
         else:
-            # Streaming load: directly loads weights into model on GPU
             load_weight_to_model(config.model_path, self.model, device=self.device)
 
         # ======================= KV cache initialization ========================
@@ -67,6 +65,7 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            attention_backend=config.attention_backend,
         )
 
         # ======================= Page table initialization ========================
@@ -160,7 +159,7 @@ class Engine:
         new_free_memory = self._sync_get_memory()[1]
 
         # Calculate KV cache size per page
-        if config.model_config.use_mla_backend:
+        if config.attention_backend == "mla":
             # MLA uses compressed latent representation
             # KV cache dimension = kv_lora_rank + qk_rope_head_dim (single buffer, not 2x)
             kv_cache_dim = config.model_config.kv_lora_rank + config.model_config.qk_rope_head_dim
@@ -252,7 +251,6 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        # Check if model uses MLA
         if config.model_config.use_mla_backend:
             backend = "mla"
         else:
@@ -265,9 +263,5 @@ def _adjust_config(config: EngineConfig):
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
-        # GLM4-MoE is more stable with the conservative torch backend on some environments.
-        if config.model_config.model_type == "glm4_moe_lite":
-            override("moe_backend", "torch")
-        else:
-            override("moe_backend", "fused")
+        override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

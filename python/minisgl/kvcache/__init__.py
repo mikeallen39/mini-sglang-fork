@@ -29,9 +29,9 @@ def create_kvcache(
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    attention_backend: str,
 ) -> BaseKVCache:
-    # Check if model uses MLA (Multi-Latent Attention)
-    if model_config.use_mla_backend:
+    if attention_backend == "mla":
         from .mla_pool import MLAKVCache
 
         return MLAKVCache(
@@ -47,14 +47,12 @@ def create_kvcache(
     # Standard MHA
     from .mha_pool import MHAKVCache
 
-    # For MLA models, use v_head_dim as the K/V dimension (head_dim is not meaningful)
-    kv_dim = model_config.v_head_dim if hasattr(model_config, "v_head_dim") else model_config.head_dim
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
         num_layers=model_config.num_layers,
-        head_dim=kv_dim,
+        head_dim=model_config.attn_head_dim,
         device=device,
         dtype=dtype,
     )

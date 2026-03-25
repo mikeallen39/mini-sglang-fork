@@ -130,24 +130,17 @@ class BaseOP:
                 continue
 
             if isinstance(param, torch.Tensor):
-                if "experts" in prefix:
-                    mapped_name = name
-                    matched_keys = _collect_expert_keys(state_dict, prefix, mapped_name)
-
-                    items = [state_dict.pop(k) for k in matched_keys]
-                    if not items:
-                        raise ValueError(
-                            f"No weights found in state_dict for {prefix} and {mapped_name}"
-                        )
-
-                    item = torch.stack(items, dim=0)
-                else:
-                    if _concat_prefix(prefix, name) not in state_dict:
-                        raise KeyError(f"Key '{_concat_prefix(prefix, name)}' not found in state_dict")
-                    item = state_dict.pop(_concat_prefix(prefix, name))
+                if _concat_prefix(prefix, name) not in state_dict:
+                    raise KeyError(f"Key '{_concat_prefix(prefix, name)}' not found in state_dict")
+                item = state_dict.pop(_concat_prefix(prefix, name))
 
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
+                if param.shape != item.shape or param.dtype != item.dtype:
+                    raise AssertionError(
+                        f"State dict mismatch for {_concat_prefix(prefix, name)}: "
+                        f"model shape={tuple(param.shape)} dtype={param.dtype}, "
+                        f"state shape={tuple(item.shape)} dtype={item.dtype}"
+                    )
 
                 setattr(self, name, item)
 

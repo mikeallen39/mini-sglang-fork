@@ -64,13 +64,6 @@ def create_attention_backend(
 ) -> BaseAttnBackend:
     validate_attn_backend(backend, allow_auto=False)
 
-    # Auto-detect MLA and use MLA backend
-    if config.use_mla_backend:
-        logger.info("Detected MLA model, using MLA attention backend")
-        from .mla_backend import MLABackend
-
-        return MLABackend(config, kvcache)
-
     if "," in backend:
         assert backend.count(",") == 1, "Only one comma is allowed in hybrid backend"
         p_backend, d_backend = backend.split(",", 1)

@@ -17,7 +17,6 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
-    use_mla_backend: bool = False  # Whether to use MLA kv cache backend (else MHA)
 
     @property
     def share_tokenizer(self) -> bool:
@@ -219,12 +218,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--use-mla-backend",
-        action="store_true",
-        help="Use MLA kv cache backend (default: MHA backend).",
-    )
-
-    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -236,10 +229,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        # Only override default value if user hasn't explicitly set it
-        parser_args = parser.parse_args(args)
-        if parser_args.cuda_graph_max_bs == parser.get_default("cuda_graph_max_bs"):
-            kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
@@ -258,10 +247,21 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 
+    hf_config = None
+    if run_shell and kwargs["cuda_graph_max_bs"] is None:
+        from minisgl.utils import cached_load_hf_config
+
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        kwargs["cuda_graph_max_bs"] = (
+            0 if getattr(hf_config, "model_type", "") == "glm4_moe_lite" else 1
+        )
+
     if (dtype_str := kwargs["dtype"]) == "auto":
         from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        if hf_config is None:
+            hf_config = cached_load_hf_config(kwargs["model_path"])
+        dtype_str = hf_config.dtype
 
     DTYPE_MAP = {
         "float16": torch.float16,

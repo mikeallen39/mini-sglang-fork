@@ -65,6 +65,7 @@ class MLAMetadata(BaseAttnMetadata):
     kv_lora_rank:      int
     qk_rope_head_dim:  int
     page_size:         Literal[1]
+    causal:            bool
     wrapper:           BatchMLAPagedAttentionWrapper
     initialized:       bool = False
     # fmt: on
@@ -143,7 +144,7 @@ class MLABackend(BaseAttnBackend):
             head_dim_ckv=metadata.kv_lora_rank,
             head_dim_kpe=metadata.qk_rope_head_dim,
             page_size=metadata.page_size,
-            causal=True,
+            causal=metadata.causal,
             sm_scale=1.0 / math.sqrt(metadata.kv_lora_rank + metadata.qk_rope_head_dim),
             q_data_type=torch.bfloat16,  # TODO: get from config
             kv_data_type=torch.bfloat16,
@@ -237,8 +238,8 @@ class MLABackend(BaseAttnBackend):
         page_table = get_global_ctx().page_table
         kv_indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
 
-        # Build kv_len_arr (query length of each request)
-        kv_len_arr_cpu = torch.tensor(seqlens_q, **CPU_KWARGS)
+        # FlashInfer MLA expects the KV lengths for each request here.
+        kv_len_arr_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
 
         batch.attn_metadata = MLAMetadata(
             qo_indptr_cpu=qo_indptr_cpu,
@@ -249,6 +250,7 @@ class MLABackend(BaseAttnBackend):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             page_size=1,
+            causal=batch.is_prefill,
             wrapper=self.decode_wrapper if batch.is_decode else self.prefill_wrapper,
         )
 

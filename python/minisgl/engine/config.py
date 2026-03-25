@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -39,14 +38,7 @@ class EngineConfig:
     def model_config(self) -> ModelConfig:
         from minisgl.models import ModelConfig
 
-        model_config = ModelConfig.from_hf(self.hf_config)
-        # ServerArgs carries an explicit --use-mla-backend switch.
-        # Respect that explicit runtime choice if present.
-        if hasattr(self, "use_mla_backend"):
-            use_mla_backend = bool(getattr(self, "use_mla_backend"))
-            if model_config.use_mla_backend != use_mla_backend:
-                model_config = replace(model_config, use_mla_backend=use_mla_backend)
-        return model_config
+        return ModelConfig.from_hf(self.hf_config)
 
     @property
     def max_seq_len(self) -> int:
