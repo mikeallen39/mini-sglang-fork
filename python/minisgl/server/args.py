@@ -247,6 +247,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none" if ServerArgs.quantization is None else ServerArgs.quantization,
+        choices=["none", "w8a8_int8"],
+        help="Optional model quantization mode. 'w8a8_int8' enables real weight-int8 and activation-int8 linear kernels.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -312,6 +320,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     kwargs["ep_info"] = build_ep_info(0, tp_size, ep_size)
     del kwargs["tensor_parallel_size"]
     del kwargs["expert_parallel_size"]
+    kwargs["quantization"] = None if kwargs["quantization"] == "none" else kwargs["quantization"]
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

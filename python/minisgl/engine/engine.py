@@ -16,6 +16,7 @@ from minisgl.kvcache import create_kvcache
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight, load_weight_to_model
 from minisgl.moe import create_moe_backend
+from minisgl.quantization import process_weights_after_loading, set_quantization
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
@@ -37,6 +38,7 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_ep_info(rank=config.ep_info.rank, size=config.ep_info.size)
         _adjust_config(config)
+        set_quantization(config.quantization)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -70,6 +72,7 @@ class Engine:
             self.model.load_state_dict(self._load_weight_state_dict(config))
         else:
             load_weight_to_model(config.model_path, self.model, device=self.device)
+        process_weights_after_loading(self.model)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -296,6 +299,18 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    if config.quantization == "w8a8_int8":
+        if config.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"w8a8_int8 only supports float16/bfloat16 activations, got dtype={config.dtype}"
+            )
+        if config.model_config.is_moe and config.moe_backend != "torch":
+            override("moe_backend", "torch")
+            logger.warning_rank0("MoE backend is overridden to torch for w8a8_int8 quantization")
+        if config.cuda_graph_max_bs != 0:
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("CUDA graph is disabled for w8a8_int8 quantization")
 
     if config.ep_info.size > 1 and config.moe_backend == "torch" and config.cuda_graph_max_bs != 0:
         override("cuda_graph_max_bs", 0)

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
+from minisgl.quantization import apply_w8a8_int8_linear
 
 from .fused import fused_topk, grouped_topk
 
@@ -30,7 +31,9 @@ class TorchMoe(BaseMoeBackend):
         self,
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
+        w1_scale: torch.Tensor | None,
         w2: torch.Tensor,
+        w2_scale: torch.Tensor | None,
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
@@ -93,9 +96,17 @@ class TorchMoe(BaseMoeBackend):
             if apply_router_weight_on_input:
                 routed_x = routed_x * routed_w.unsqueeze(-1)
 
-            inter = F.linear(routed_x, w1[expert_id])
+            if w1.dtype == torch.int8:
+                assert w1_scale is not None
+                inter = apply_w8a8_int8_linear(routed_x, w1[expert_id], w1_scale[expert_id], None)
+            else:
+                inter = F.linear(routed_x, w1[expert_id])
             inter = _apply_activation(inter, activation)
-            routed_out = F.linear(inter, w2[expert_id])
+            if w2.dtype == torch.int8:
+                assert w2_scale is not None
+                routed_out = apply_w8a8_int8_linear(inter, w2[expert_id], w2_scale[expert_id], None)
+            else:
+                routed_out = F.linear(inter, w2[expert_id])
 
             if not apply_router_weight_on_input:
                 routed_out = routed_out * routed_w.unsqueeze(-1)

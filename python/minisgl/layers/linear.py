@@ -5,6 +5,11 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.quantization import (
+    apply_w8a8_int8_linear,
+    is_w8a8_int8_enabled,
+    quantize_weight_per_channel_int8,
+)
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -27,6 +32,7 @@ class _LinearTPImpl(BaseOP):
         self.local_output_size = local_osize
         self.weight = torch.empty(local_osize, local_isize)
         self.bias = torch.empty(local_osize) if has_bias else None
+        self.weight_scale: torch.Tensor | None = None
         # For stacked params loading (qkv_proj, gate_up_proj)
         self._stacked_params = {}
 
@@ -57,7 +63,15 @@ class _LinearTPImpl(BaseOP):
         pass
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight.dtype == torch.int8:
+            assert self.weight_scale is not None
+            return apply_w8a8_int8_linear(x, self.weight, self.weight_scale, self.bias)
         return F.linear(x, self.weight, self.bias)
+
+    def process_weights_after_loading(self) -> None:
+        if not is_w8a8_int8_enabled() or self.weight.dtype == torch.int8:
+            return
+        self.weight, self.weight_scale = quantize_weight_per_channel_int8(self.weight)
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -260,7 +274,7 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = super().forward(x)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -291,7 +305,7 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = super().forward(x)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

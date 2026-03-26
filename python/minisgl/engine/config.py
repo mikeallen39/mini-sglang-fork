@@ -18,6 +18,7 @@ class EngineConfig:
     tp_info: DistributedInfo
     dtype: torch.dtype
     ep_info: DistributedInfo = DistributedInfo(0, 1)
+    quantization: str | None = None
     max_running_req: int = 256
     attention_backend: str = "auto"
     moe_backend: str = "auto"

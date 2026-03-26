@@ -356,7 +356,9 @@ class FusedMoe(BaseMoeBackend):
         self,
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
+        w1_scale: torch.Tensor | None,
         w2: torch.Tensor,
+        w2_scale: torch.Tensor | None,
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
@@ -373,6 +375,8 @@ class FusedMoe(BaseMoeBackend):
         num_global_experts: int | None = None,
         num_dispatch_experts: int | None = None,
     ) -> torch.Tensor:
+        if w1.dtype == torch.int8 or w2.dtype == torch.int8 or w1_scale is not None or w2_scale is not None:
+            raise RuntimeError("Quantized MoE weights require the torch MoE backend")
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,

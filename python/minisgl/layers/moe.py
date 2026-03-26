@@ -8,6 +8,7 @@ from minisgl.distributed import (
     get_moe_tp_info,
     get_tp_info,
 )
+from minisgl.quantization import is_w8a8_int8_enabled, quantize_weight_per_channel_int8
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -59,11 +60,13 @@ class MoELayer(BaseOP):
             2 * intermediate_size_per_partition,
             hidden_size,
         )
+        self.gate_up_proj_scale: torch.Tensor | None = None
         self.down_proj = torch.empty(
             self.num_local_experts,
             hidden_size,
             intermediate_size_per_partition,
         )
+        self.down_proj_scale: torch.Tensor | None = None
 
     def forward(
         self,
@@ -77,7 +80,9 @@ class MoELayer(BaseOP):
         final_hidden_states = moe_backend.forward(
             hidden_states=hidden_states,
             w1=self.gate_up_proj,
+            w1_scale=self.gate_up_proj_scale,
             w2=self.down_proj,
+            w2_scale=self.down_proj_scale,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
@@ -97,3 +102,24 @@ class MoELayer(BaseOP):
         if self.tp_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states
+
+    def process_weights_after_loading(self) -> None:
+        if not is_w8a8_int8_enabled() or self.gate_up_proj.dtype == torch.int8:
+            return
+
+        gate_up_q = []
+        gate_up_scale = []
+        down_q = []
+        down_scale = []
+        for expert_id in range(self.num_local_experts):
+            q_w1, s_w1 = quantize_weight_per_channel_int8(self.gate_up_proj[expert_id])
+            q_w2, s_w2 = quantize_weight_per_channel_int8(self.down_proj[expert_id])
+            gate_up_q.append(q_w1)
+            gate_up_scale.append(s_w1)
+            down_q.append(q_w2)
+            down_scale.append(s_w2)
+
+        self.gate_up_proj = torch.stack(gate_up_q, dim=0).contiguous()
+        self.gate_up_proj_scale = torch.stack(gate_up_scale, dim=0).contiguous()
+        self.down_proj = torch.stack(down_q, dim=0).contiguous()
+        self.down_proj_scale = torch.stack(down_scale, dim=0).contiguous()
