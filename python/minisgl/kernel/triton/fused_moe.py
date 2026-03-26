@@ -53,6 +53,8 @@ def fused_moe_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -73,6 +75,10 @@ def fused_moe_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsn,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -81,6 +87,8 @@ def fused_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
+    per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
 ):
@@ -158,6 +166,11 @@ def fused_moe_kernel(
         + off_experts * stride_be
         + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
+    if use_int8_w8a8 and per_channel_quant:
+        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+        b_scale = tl.load(b_scale_ptrs)
+        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+        a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -186,10 +199,16 @@ def fused_moe_kernel(
 
         # We accumulate along the K dimension.
 
-        accumulator += tl.dot(a, b)
+        if use_int8_w8a8:
+            accumulator += tl.dot(a, b)
+        else:
+            accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if use_int8_w8a8:
+        accumulator *= a_scale * b_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)

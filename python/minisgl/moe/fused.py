@@ -245,6 +245,8 @@ def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
@@ -261,6 +263,9 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+    if w1.dtype == torch.int8 or w2.dtype == torch.int8:
+        assert w1.dtype == torch.int8 and w2.dtype == torch.int8
+        assert w1_scale is not None and w2_scale is not None
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -311,6 +316,8 @@ def fused_experts_impl(
         curr_hidden_states,
         w1,
         intermediate_cache1,
+        None,
+        w1_scale,
         curr_topk_weights,
         curr_topk_ids,
         sorted_token_ids,
@@ -328,6 +335,8 @@ def fused_experts_impl(
         intermediate_cache2,
         w2,
         (intermediate_cache3),
+        None,
+        w2_scale,
         curr_topk_weights,
         curr_topk_ids,
         sorted_token_ids,
@@ -375,8 +384,6 @@ class FusedMoe(BaseMoeBackend):
         num_global_experts: int | None = None,
         num_dispatch_experts: int | None = None,
     ) -> torch.Tensor:
-        if w1.dtype == torch.int8 or w2.dtype == torch.int8 or w1_scale is not None or w2_scale is not None:
-            raise RuntimeError("Quantized MoE weights require the torch MoE backend")
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
@@ -414,6 +421,8 @@ class FusedMoe(BaseMoeBackend):
             hidden_states,
             w1,
             w2,
+            w1_scale,
+            w2_scale,
             dispatch_plan.topk_weights,
             dispatch_plan.topk_ids,
             activation,

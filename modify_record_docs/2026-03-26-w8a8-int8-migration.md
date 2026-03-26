@@ -10,7 +10,9 @@ This migration is intentionally narrow:
 - Dense linear layers are post-processed into real int8 weights with per-channel scales.
 - Activations are quantized dynamically per token at runtime.
 - Execution uses `sgl_kernel.int8_scaled_mm`, so this is real int8 GEMM rather than fake quantization.
-- MoE expert MLPs can run in real int8 through the conservative `torch` MoE backend.
+- MoE expert MLPs can run in real int8 through both:
+  - the conservative `torch` MoE backend
+  - the Triton-based fused MoE backend
 
 ## Implementation Notes
 
@@ -22,13 +24,15 @@ This migration is intentionally narrow:
   - `gate_up_proj`: `[num_local_experts, hidden, 2 * intermediate_per_partition]`
   - `down_proj`: `[num_local_experts, intermediate_per_partition, hidden]`
 - Under `w8a8_int8`, CUDA graph is disabled conservatively for safety.
-- Under `w8a8_int8`, MoE backend is forced to `torch` because the current fused MoE path is float-only.
+- Under `w8a8_int8`, CUDA graph is still disabled conservatively.
+- The fused MoE int8 path uses per-token activation int8 quantization and per-output-channel weight scales.
 
 ## Current Limitations
 
 - This does not yet add checkpoint-native quantized weight loading; it quantizes after loading float weights.
 - `ParallelLMHead` / embedding weights are not quantized in this pass.
-- Quantized MoE currently uses the `torch` backend, not fused MoE kernels.
+- Quantized MoE fused execution is implemented only for the current per-channel `W8A8 int8` path.
+- This path was added without GPU runtime validation on this machine.
 - No GPU validation was run in this task because there were no idle GPUs available.
 
 ## Intended Usage
@@ -41,4 +45,4 @@ python -m minisgl \
   --quantization w8a8_int8
 ```
 
-For MoE models, no extra `--moe-backend torch` flag is required; the engine now overrides that automatically when `w8a8_int8` is enabled.
+For MoE models, `--moe-backend fused` and `--moe-backend torch` are both valid under `w8a8_int8`.

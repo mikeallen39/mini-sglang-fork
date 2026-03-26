@@ -305,9 +305,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 f"w8a8_int8 only supports float16/bfloat16 activations, got dtype={config.dtype}"
             )
-        if config.model_config.is_moe and config.moe_backend != "torch":
-            override("moe_backend", "torch")
-            logger.warning_rank0("MoE backend is overridden to torch for w8a8_int8 quantization")
         if config.cuda_graph_max_bs != 0:
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("CUDA graph is disabled for w8a8_int8 quantization")

@@ -33,6 +33,17 @@ def quantize_weight_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor
     return qweight.t().contiguous(), scales.contiguous()
 
 
+def quantize_weight_per_channel_int8_row_major(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.ndim != 2:
+        raise ValueError(f"Expected a 2D weight matrix, got shape={tuple(weight.shape)}")
+    weight_fp32 = weight.to(torch.float32)
+    scales = weight_fp32.abs().amax(dim=1, keepdim=True).clamp_min_(1e-10) / 127.0
+    qweight = torch.round(weight_fp32 / scales).clamp_(-128, 127).to(torch.int8)
+    return qweight.contiguous(), scales.contiguous()
+
+
 def quantize_activation_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if x.ndim < 2:
         raise ValueError(f"Expected an input with ndim >= 2, got ndim={x.ndim}")

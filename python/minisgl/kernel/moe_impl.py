@@ -7,6 +7,8 @@ def fused_moe_kernel_triton(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -22,10 +24,22 @@ def fused_moe_kernel_triton(
     import triton.language as tl
 
     from .triton.fused_moe import fused_moe_kernel
+    from minisgl.quantization import quantize_activation_per_token_int8
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     padded_size = 0
+    use_int8_w8a8 = B.dtype == torch.int8
+    per_channel_quant = use_int8_w8a8
+    if use_int8_w8a8:
+        if B_scale is None:
+            raise ValueError("B_scale must be provided for int8 fused MoE")
+        if A_scale is None:
+            A, A_scale = quantize_activation_per_token_int8(A)
+        else:
+            A = A.contiguous()
+    A_scale_arg = A if A_scale is None else A_scale
+    B_scale_arg = B if B_scale is None else B_scale
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -40,6 +54,8 @@ def fused_moe_kernel_triton(
         A,
         B,
         C,
+        A_scale_arg,
+        B_scale_arg,
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -55,9 +71,15 @@ def fused_moe_kernel_triton(
         B.stride(1),
         C.stride(1),
         C.stride(2),
+        A_scale_arg.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+        A_scale_arg.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+        B_scale_arg.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale_arg.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
         MUL_ROUTED_WEIGHT=mul_routed_weight,  # type: ignore
         top_k=top_k,  # type: ignore
         compute_type=dtype,  # type: ignore
+        use_int8_w8a8=use_int8_w8a8,  # type: ignore
+        per_channel_quant=per_channel_quant,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
         filter_expert=filter_expert,  # type: ignore
         **config,

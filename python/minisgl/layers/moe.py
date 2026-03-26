@@ -8,7 +8,10 @@ from minisgl.distributed import (
     get_moe_tp_info,
     get_tp_info,
 )
-from minisgl.quantization import is_w8a8_int8_enabled, quantize_weight_per_channel_int8
+from minisgl.quantization import (
+    is_w8a8_int8_enabled,
+    quantize_weight_per_channel_int8_row_major,
+)
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -112,14 +115,14 @@ class MoELayer(BaseOP):
         down_q = []
         down_scale = []
         for expert_id in range(self.num_local_experts):
-            q_w1, s_w1 = quantize_weight_per_channel_int8(self.gate_up_proj[expert_id])
-            q_w2, s_w2 = quantize_weight_per_channel_int8(self.down_proj[expert_id])
+            q_w1, s_w1 = quantize_weight_per_channel_int8_row_major(self.gate_up_proj[expert_id])
+            q_w2, s_w2 = quantize_weight_per_channel_int8_row_major(self.down_proj[expert_id])
             gate_up_q.append(q_w1)
             gate_up_scale.append(s_w1)
             down_q.append(q_w2)
             down_scale.append(s_w2)
 
         self.gate_up_proj = torch.stack(gate_up_q, dim=0).contiguous()
-        self.gate_up_proj_scale = torch.stack(gate_up_scale, dim=0).contiguous()
+        self.gate_up_proj_scale = torch.stack(gate_up_scale, dim=0).squeeze(-1).contiguous()
         self.down_proj = torch.stack(down_q, dim=0).contiguous()
-        self.down_proj_scale = torch.stack(down_scale, dim=0).contiguous()
+        self.down_proj_scale = torch.stack(down_scale, dim=0).squeeze(-1).contiguous()
