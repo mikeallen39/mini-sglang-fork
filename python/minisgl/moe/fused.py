@@ -249,6 +249,7 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    filter_expert: bool = False,
 ) -> torch.Tensor:
     from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from minisgl.layers import gelu_and_mul, silu_and_mul
@@ -289,7 +290,7 @@ def fused_experts_impl(
     )
     compute_type = hidden_states.dtype
 
-    out_hidden_states = hidden_states
+    out_hidden_states = torch.empty_like(hidden_states)
     curr_hidden_states = hidden_states
     tokens_num, _ = curr_hidden_states.shape
     begin_token_idx, end_token_idx = 0, num_tokens
@@ -319,6 +320,7 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config,
         compute_type=compute_type,
+        filter_expert=filter_expert,
     )
     FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
     FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -335,6 +337,7 @@ def fused_experts_impl(
         1,
         config,
         compute_type=compute_type,
+        filter_expert=filter_expert,
     )
 
     moe_sum_reduce_triton(
@@ -368,6 +371,7 @@ class FusedMoe(BaseMoeBackend):
         num_fused_shared_experts: int = 0,
         local_expert_start: int = 0,
         num_global_experts: int | None = None,
+        num_dispatch_experts: int | None = None,
     ) -> torch.Tensor:
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
@@ -393,8 +397,13 @@ class FusedMoe(BaseMoeBackend):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             local_expert_start=local_expert_start,
-            num_local_experts=w1.shape[0],
+            num_local_experts=w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts,
             num_global_experts=num_global_experts,
+        )
+        filter_expert = (
+            num_global_experts is not None
+            and (w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts)
+            != num_global_experts
         )
 
         return fused_experts_impl(
@@ -405,4 +414,5 @@ class FusedMoe(BaseMoeBackend):
             dispatch_plan.topk_ids,
             activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            filter_expert=filter_expert,
         )

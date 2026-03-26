@@ -280,9 +280,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 f"Number of routed experts ({num_routed_experts}) must be divisible by ep_size ({config.ep_info.size})"
             )
-        if config.cuda_graph_max_bs != 0:
-            override("cuda_graph_max_bs", 0)
-            logger.warning_rank0("CUDA graph is disabled for ep_size > 1 in the current EP path")
 
     if config.attention_backend == "auto":
         if config.model_config.use_mla_backend:
@@ -299,3 +296,7 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    if config.ep_info.size > 1 and config.moe_backend == "torch" and config.cuda_graph_max_bs != 0:
+        override("cuda_graph_max_bs", 0)
+        logger.warning_rank0("CUDA graph is disabled for EP when using the torch MoE backend")

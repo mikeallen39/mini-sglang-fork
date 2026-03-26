@@ -45,6 +45,7 @@ class TorchMoe(BaseMoeBackend):
         num_fused_shared_experts: int = 0,
         local_expert_start: int = 0,
         num_global_experts: int | None = None,
+        num_dispatch_experts: int | None = None,
     ) -> torch.Tensor:
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
@@ -70,7 +71,7 @@ class TorchMoe(BaseMoeBackend):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             local_expert_start=local_expert_start,
-            num_local_experts=w1.shape[0],
+            num_local_experts=w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts,
             num_global_experts=num_global_experts,
         )
         topk_weights = dispatch_plan.topk_weights

@@ -25,48 +25,12 @@ from minisgl.layers import (
     get_rope,
     silu_and_mul,
 )
-from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
 
 if TYPE_CHECKING:
     from .config import ModelConfig
-
-
-def _grouped_topk(
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int,
-    topk_group: int,
-    routed_scaling_factor: float,
-    correction_bias: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = gating_output.sigmoid()
-    choose_scores = scores if correction_bias is None else scores + correction_bias
-
-    if num_expert_group > 1 and topk_group > 0:
-        num_tokens, num_experts = choose_scores.shape
-        experts_per_group = num_experts // num_expert_group
-        grouped = choose_scores.view(num_tokens, num_expert_group, experts_per_group)
-        group_scores = grouped.topk(min(2, experts_per_group), dim=-1)[0].sum(dim=-1)
-        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(1, group_idx, True)
-        expert_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(num_tokens, num_expert_group, experts_per_group)
-            .reshape(num_tokens, num_experts)
-        )
-        choose_scores = choose_scores.masked_fill(~expert_mask, float("-inf"))
-
-    topk_ids = torch.topk(choose_scores, k=topk, dim=-1, sorted=False)[1]
-    topk_weights = scores.gather(1, topk_ids).to(torch.float32)
-    if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-    topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights, topk_ids.to(torch.int32)
 
 
 class Glm4MoeLiteAttention(BaseOP):
@@ -278,28 +242,33 @@ class Glm4MoeLiteExperts(BaseOP):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        num_expert_group: int,
+        topk_group: int,
+        routed_scaling_factor: float,
+        correction_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        dispatch_plan = build_local_expert_dispatch_plan(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+        ctx = get_global_ctx()
+        output = ctx.moe_backend.forward(
+            hidden_states=hidden_states,
+            w1=self.gate_up_proj,
+            w2=self.down_proj,
+            gating_output=router_logits,
+            topk=top_k,
+            renormalize=renormalize,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            use_grouped_topk=True,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            correction_bias=correction_bias,
             local_expert_start=self.local_expert_start,
-            num_local_experts=self.num_local_experts,
             num_global_experts=self.num_experts,
+            num_dispatch_experts=self.num_local_experts,
         )
-        output = torch.zeros_like(hidden_states)
-        for local_expert_id in range(self.num_local_experts):
-            token_idx, topk_pos = torch.where(dispatch_plan.topk_ids == local_expert_id)
-            if token_idx.numel() == 0:
-                continue
-            routed_x = hidden_states[token_idx]
-            routed_w = dispatch_plan.topk_weights[token_idx, topk_pos].to(hidden_states.dtype)
-            inter = F.linear(routed_x, self.gate_up_proj[local_expert_id])
-            inter = silu_and_mul(inter)
-            routed_out = F.linear(inter, self.down_proj[local_expert_id])
-            routed_out = routed_out * routed_w.unsqueeze(-1)
-            output.index_add_(0, token_idx, routed_out)
         if self._tp_size > 1:
             output = self._comm.all_reduce(output)
         return output
@@ -325,16 +294,16 @@ class Glm4MoeLiteSparseMoeBlock(BaseOP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate.forward(hidden_states)
-        topk_weights, topk_ids = _grouped_topk(
-            router_logits,
-            topk=self.top_k,
+        output = self.experts.forward(
+            hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
             renormalize=self.renormalize,
             num_expert_group=self.num_expert_group,
             topk_group=self.topk_group,
             routed_scaling_factor=self.routed_scaling_factor,
             correction_bias=self.gate.e_score_correction_bias,
         )
-        output = self.experts.forward(hidden_states, topk_ids, topk_weights)
         if self.shared_experts is not None:
             output = output + self.shared_experts.forward(hidden_states)
         return output

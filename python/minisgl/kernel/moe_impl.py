@@ -16,6 +16,7 @@ def fused_moe_kernel_triton(
     top_k: int,
     config: Dict[str, Any],
     compute_type: torch.dtype,
+    filter_expert: bool = False,
 ) -> None:
     import triton
     import triton.language as tl
@@ -58,6 +59,7 @@ def fused_moe_kernel_triton(
         top_k=top_k,  # type: ignore
         compute_type=dtype,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
+        filter_expert=filter_expert,  # type: ignore
         **config,
     )
 

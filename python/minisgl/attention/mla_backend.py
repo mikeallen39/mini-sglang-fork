@@ -265,10 +265,16 @@ class MLABackend(BaseAttnBackend):
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 
-        # Create graph wrappers for each batch size
+        # FlashInfer MLA requires explicit replay buffers when CUDA graph is enabled.
+        # Without these static buffers, the eager wrapper state is not replay-safe.
         for bs in bs_list:
             self.graph_wrappers[bs] = BatchMLAPagedAttentionWrapper(
                 self.float_workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=capture.cu_seqlens_q[: bs + 1],
+                kv_indptr=capture.cu_seqlens_k[: bs + 1],
+                kv_indices=capture.page_table,
+                kv_len_arr=capture.seq_lens[:bs],
                 backend="auto",
             )
 

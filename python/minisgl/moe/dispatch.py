@@ -33,7 +33,7 @@ def build_local_expert_dispatch_plan(
     remapped_ids = torch.where(
         local_mask,
         topk_ids - local_expert_start,
-        torch.full_like(topk_ids, num_local_experts),
+        torch.full_like(topk_ids, -1),
     )
     remapped_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
     return LocalExpertDispatchPlan(

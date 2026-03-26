@@ -35,5 +35,5 @@ def test_local_expert_dispatch_plan_remaps_and_masks_remote_experts():
     )
 
     assert torch.equal(plan.local_mask, torch.tensor([[False, True, False]]))
-    assert torch.equal(plan.topk_ids, torch.tensor([[2, 1, 2]], dtype=torch.int32))
+    assert torch.equal(plan.topk_ids, torch.tensor([[-1, 1, -1]], dtype=torch.int32))
     assert torch.allclose(plan.topk_weights, torch.tensor([[0.0, 0.2, 0.0]], dtype=torch.float32))

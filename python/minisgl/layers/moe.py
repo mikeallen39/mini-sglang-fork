@@ -92,6 +92,7 @@ class MoELayer(BaseOP):
             num_fused_shared_experts=self.num_fused_shared_experts,
             local_expert_start=self.local_expert_start,
             num_global_experts=self.num_experts,
+            num_dispatch_experts=self.num_local_experts,
         )
         if self.tp_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)

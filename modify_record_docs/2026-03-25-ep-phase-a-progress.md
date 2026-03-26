@@ -234,3 +234,99 @@ So the current status for divisor EP is:
 - local tests passed
 - real multi-GPU launch reached loading successfully
 - a clean end-to-end `tp=4, ep=2` generation run still needs a less contended 4-GPU window
+
+## 2026-03-26 Fused EP Graph-Safety Follow-up
+
+This round focused on making the GLM routed-expert path graph-safe without giving up
+the fused MoE backend.
+
+### Changes
+
+- removed the GLM-specific dynamic local expert loop from:
+  - `python/minisgl/models/glm4_moe_lite.py`
+- routed GLM MoE execution through the shared MoE backend path
+- kept CUDA graph enabled for:
+  - `moe_backend=fused`
+  - `ep_size > 1`
+- kept CUDA graph disabled only for:
+  - `moe_backend=torch`
+  - `ep_size > 1`
+- changed EP local expert remap semantics in:
+  - `python/minisgl/moe/dispatch.py`
+  from a positive sentinel local id to:
+  - `-1`
+- extended the Triton fused MoE kernel path to treat filtered expert blocks as zero-output
+  blocks instead of indexing a fake expert slot
+
+### What Was Validated
+
+Local tests:
+
+- reran:
+  - `tests/misc/test_glm4_config.py`
+  - `tests/misc/test_moe_dispatch.py`
+- current result:
+  - `10 passed`
+
+Targeted correctness checks on a single GPU:
+
+- fused local MoE vs torch local MoE:
+  - matched for non-EP and EP-partitioned cases
+- simulated EP split-and-sum vs full 32-expert reference:
+  - matched for both torch and fused paths
+- observed error scale:
+  - max diff about `1.22e-4`
+  - mean diff about `7.9e-6`
+
+These checks confirm that the current fused EP local routing and zero-filtered expert
+handling are numerically aligned with the torch reference at the operator level.
+
+### Real GPU GLM Validation
+
+Validated launch configuration:
+
+- model:
+  - `/mnt/82_store/LLM-weights/ZhipuAI/GLM-4.7-Flash`
+- `tp=2`
+- `ep=2`
+- attention backend:
+  - `mla`
+- MoE backend:
+  - `fused`
+- temporary paths moved off `/tmp`:
+  - `TRITON_CACHE_DIR=/mnt/42_store/zxz/.triton-cache-mini-sglang`
+  - `TMPDIR=/mnt/42_store/zxz/tmp-mini-sglang`
+
+Observed behavior:
+
+- model loading completed successfully
+- CUDA graph capture completed successfully
+- scheduler and OpenAI-compatible API server became ready successfully
+
+This confirms that the earlier blockers were resolved:
+
+- graph-unsafe GLM local expert loop
+- Triton cache failure on full root filesystem
+- EP filtered-expert crash during graph capture
+
+### Remaining Issue
+
+Although the server now starts and captures graphs correctly, real generation quality is
+still not acceptable in this configuration.
+
+Observed symptom:
+
+- OpenAI-style chat requests such as `hi` returned garbled text rather than a normal reply
+
+Current conclusion:
+
+- startup correctness is now much better
+- operator-level EP correctness checks pass
+- but real-model end-to-end behavior for this exact `tp=2, ep=2, mla, fused` GLM path is
+  still not fully validated as correct
+
+So this configuration should currently be treated as:
+
+- launchable
+- graph-capturable
+- not yet fully behavior-validated for user-visible generation quality

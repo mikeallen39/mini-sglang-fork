@@ -150,7 +150,7 @@ def test_adjust_config_rejects_ep_on_dense_model(monkeypatch):
         raise AssertionError("Expected ep_size > 1 to be rejected for dense models")
 
 
-def test_adjust_config_disables_cuda_graph_for_ep(monkeypatch):
+def test_adjust_config_keeps_cuda_graph_for_fused_ep(monkeypatch):
     monkeypatch.setattr(
         engine_config_module,
         "cached_load_hf_config",
@@ -169,7 +169,8 @@ def test_adjust_config_disables_cuda_graph_for_ep(monkeypatch):
 
     engine_module._adjust_config(config)
 
-    assert config.cuda_graph_max_bs == 0
+    assert config.moe_backend == "fused"
+    assert config.cuda_graph_max_bs == 32
 
 
 def test_adjust_config_accepts_divisor_ep_size(monkeypatch):
@@ -192,4 +193,27 @@ def test_adjust_config_accepts_divisor_ep_size(monkeypatch):
     engine_module._adjust_config(config)
 
     assert config.ep_info == DistributedInfo(rank=0, size=2)
+    assert config.cuda_graph_max_bs == 16
+
+
+def test_adjust_config_disables_cuda_graph_for_torch_ep(monkeypatch):
+    monkeypatch.setattr(
+        engine_config_module,
+        "cached_load_hf_config",
+        lambda _: DummyGlm4Config(),
+    )
+    monkeypatch.setattr(engine_module.logger, "info_rank0", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_module.logger, "warning_rank0", lambda *args, **kwargs: None)
+
+    config = ServerArgs(
+        model_path="dummy-glm4",
+        tp_info=DistributedInfo(rank=0, size=2),
+        dtype=torch.bfloat16,
+        ep_info=DistributedInfo(rank=0, size=2),
+        cuda_graph_max_bs=32,
+        moe_backend="torch",
+    )
+
+    engine_module._adjust_config(config)
+
     assert config.cuda_graph_max_bs == 0
