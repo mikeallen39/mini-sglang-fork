@@ -5,7 +5,7 @@ from transformers import PretrainedConfig
 
 import minisgl.engine.engine as engine_module
 import minisgl.engine.config as engine_config_module
-from minisgl.distributed import DistributedInfo
+from minisgl.distributed import DistributedInfo, build_ep_info, get_moe_tp_info
 from minisgl.server.args import ServerArgs, parse_args
 
 
@@ -106,6 +106,28 @@ def test_parse_args_builds_ep_info(monkeypatch):
     assert config.ep_info == DistributedInfo(rank=0, size=2)
 
 
+def test_build_ep_info_supports_divisor_ep_size():
+    ep_infos = [build_ep_info(tp_rank=i, tp_size=4, ep_size=2) for i in range(4)]
+
+    assert ep_infos == [
+        DistributedInfo(rank=0, size=2),
+        DistributedInfo(rank=0, size=2),
+        DistributedInfo(rank=1, size=2),
+        DistributedInfo(rank=1, size=2),
+    ]
+
+    moe_tp_infos = [
+        get_moe_tp_info(tp_info=DistributedInfo(rank=i, size=4), ep_info=ep_infos[i])
+        for i in range(4)
+    ]
+    assert moe_tp_infos == [
+        DistributedInfo(rank=0, size=2),
+        DistributedInfo(rank=1, size=2),
+        DistributedInfo(rank=0, size=2),
+        DistributedInfo(rank=1, size=2),
+    ]
+
+
 def test_adjust_config_rejects_ep_on_dense_model(monkeypatch):
     monkeypatch.setattr(
         engine_config_module,
@@ -147,4 +169,27 @@ def test_adjust_config_disables_cuda_graph_for_ep(monkeypatch):
 
     engine_module._adjust_config(config)
 
+    assert config.cuda_graph_max_bs == 0
+
+
+def test_adjust_config_accepts_divisor_ep_size(monkeypatch):
+    monkeypatch.setattr(
+        engine_config_module,
+        "cached_load_hf_config",
+        lambda _: DummyGlm4Config(),
+    )
+    monkeypatch.setattr(engine_module.logger, "info_rank0", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_module.logger, "warning_rank0", lambda *args, **kwargs: None)
+
+    config = ServerArgs(
+        model_path="dummy-glm4",
+        tp_info=DistributedInfo(rank=0, size=4),
+        dtype=torch.bfloat16,
+        ep_info=DistributedInfo(rank=0, size=2),
+        cuda_graph_max_bs=16,
+    )
+
+    engine_module._adjust_config(config)
+
+    assert config.ep_info == DistributedInfo(rank=0, size=2)
     assert config.cuda_graph_max_bs == 0

@@ -265,9 +265,10 @@ def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
-    if config.ep_info.size not in (1, config.tp_info.size):
+    if config.ep_info.size > config.tp_info.size or config.tp_info.size % config.ep_info.size != 0:
         raise ValueError(
-            f"Phase-A EP only supports ep_size in {{1, tp_size}}, got ep_size={config.ep_info.size}, tp_size={config.tp_info.size}"
+            "Current EP support requires ep_size to be a positive divisor of tp_size, "
+            f"got ep_size={config.ep_info.size}, tp_size={config.tp_info.size}"
         )
     if config.ep_info.size > 1:
         if not config.model_config.is_moe:

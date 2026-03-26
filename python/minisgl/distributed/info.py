@@ -56,11 +56,18 @@ def try_get_ep_info() -> DistributedInfo | None:
 def build_ep_info(tp_rank: int, tp_size: int, ep_size: int) -> DistributedInfo:
     if ep_size == 1:
         return DistributedInfo(rank=0, size=1)
-    if ep_size == tp_size:
-        return DistributedInfo(rank=tp_rank, size=ep_size)
-    raise ValueError(
-        f"Phase-A EP only supports ep_size in {{1, tp_size}}, got ep_size={ep_size}, tp_size={tp_size}"
-    )
+    if ep_size <= 0 or ep_size > tp_size or tp_size % ep_size != 0:
+        raise ValueError(
+            "Current EP support requires ep_size to be a positive divisor of tp_size, "
+            f"got ep_size={ep_size}, tp_size={tp_size}"
+        )
+    moe_tp_size = tp_size // ep_size
+    ep_rank = tp_rank // moe_tp_size
+    if ep_rank >= ep_size:
+        raise ValueError(
+            f"Computed invalid ep_rank={ep_rank} from tp_rank={tp_rank}, tp_size={tp_size}, ep_size={ep_size}"
+        )
+    return DistributedInfo(rank=ep_rank, size=ep_size)
 
 
 def get_local_expert_range(

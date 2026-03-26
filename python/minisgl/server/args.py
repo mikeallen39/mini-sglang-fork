@@ -54,9 +54,10 @@ class ServerArgs(SchedulerConfig):
 def _validate_parallelism(tp_size: int, ep_size: int, model_config) -> None:
     if ep_size < 1:
         raise ValueError(f"ep_size must be >= 1, got {ep_size}")
-    if ep_size not in (1, tp_size):
+    if ep_size > tp_size or tp_size % ep_size != 0:
         raise ValueError(
-            f"Phase-A EP only supports ep_size in {{1, tp_size}}, got ep_size={ep_size}, tp_size={tp_size}"
+            "Current EP support requires ep_size to be a positive divisor of tp_size, "
+            f"got ep_size={ep_size}, tp_size={tp_size}"
         )
     if ep_size == 1:
         return
@@ -116,7 +117,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--ep-size",
         type=int,
         default=ServerArgs.ep_info.size,
-        help="The expert parallelism size. Phase-A currently only supports 1 or tp_size.",
+        help="The expert parallelism size. Current support requires ep_size to divide tp_size.",
     )
 
     parser.add_argument(

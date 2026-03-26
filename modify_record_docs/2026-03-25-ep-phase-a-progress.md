@@ -186,3 +186,51 @@ Validation:
   - OpenAI-style HTTP request with prompt `hi`
 - result remained correct:
   - `Hello! How can I assist you today?`
+
+## Divisor EP Follow-up
+
+The EP grouping logic was then extended from:
+
+- `ep_size in {1, tp_size}`
+
+to:
+
+- `ep_size` is any positive divisor of `tp_size`
+
+Current grouping policy is contiguous:
+
+- `ep_rank = tp_rank // moe_tp_size`
+- `moe_tp_size = tp_size / ep_size`
+- `moe_tp_rank = tp_rank % moe_tp_size`
+
+This keeps the current correctness-first EP path compatible with:
+
+- local expert ownership
+- local-only expert loading
+- expert weight sharding by `moe_tp`
+- full-TP `all_reduce` as the current combine path
+
+### Validation
+
+Local validation:
+
+- added unit coverage for divisor EP grouping in `tests/misc/test_glm4_config.py`
+- reran:
+  - `tests/misc/test_glm4_config.py`
+  - `tests/misc/test_moe_dispatch.py`
+- result:
+  - `9 passed`
+
+Real GPU validation status:
+
+- attempted `tp=4, ep=2` with small `--num-pages` to tolerate memory imbalance
+- launch and grouping logic were accepted
+- loading began successfully
+- did not complete end-to-end generation in that run because the available 4-GPU set was under heavy external load and checkpoint loading degraded to roughly 9 seconds per file
+
+So the current status for divisor EP is:
+
+- code path implemented
+- local tests passed
+- real multi-GPU launch reached loading successfully
+- a clean end-to-end `tp=4, ep=2` generation run still needs a less contended 4-GPU window
