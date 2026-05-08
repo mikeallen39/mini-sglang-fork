@@ -17,7 +17,16 @@ from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight, load_weight_to_model
 from minisgl.moe import create_moe_backend
 from minisgl.quantization import process_weights_after_loading, set_quantization
-from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.utils import (
+    div_even,
+    has_sglang_linear_attn_kernel,
+    set_linear_attn_backend,
+    init_logger,
+    is_sm90_supported,
+    is_sm100_supported,
+    local_kv_heads,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -39,6 +48,7 @@ class Engine:
         set_ep_info(rank=config.ep_info.rank, size=config.ep_info.size)
         _adjust_config(config)
         set_quantization(config.quantization)
+        set_linear_attn_backend(config.linear_attn_backend)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -194,7 +204,7 @@ class Engine:
             cache_per_page = (
                 2  # key + value
                 * kv_dim
-                * div_even(config.model_config.num_kv_heads, config.tp_info.size)
+                * local_kv_heads(config.model_config.num_kv_heads, config.tp_info.size)
                 * config.page_size
                 * self.dtype.itemsize
                 * config.model_config.num_layers
@@ -308,6 +318,13 @@ def _adjust_config(config: EngineConfig):
         if config.cuda_graph_max_bs != 0:
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("CUDA graph is disabled for w8a8_int8 quantization")
+
+    if config.linear_attn_backend == "sglang":
+        if not has_sglang_linear_attn_kernel():
+            raise ValueError("linear_attn_backend='sglang' requires Triton")
+        if config.cuda_graph_max_bs != 0:
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("CUDA graph is disabled for the sglang linear attention backend")
 
     if config.ep_info.size > 1 and config.moe_backend == "torch" and config.cuda_graph_max_bs != 0:
         override("cuda_graph_max_bs", 0)

@@ -9,7 +9,7 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
-from minisgl.utils import div_even, init_logger
+from minisgl.utils import div_even, init_logger, local_kv_heads
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -110,7 +110,7 @@ class FlashInferBackend(BaseAttnBackend):
         # initialize some data members
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
+        self.kv_head_local = local_kv_heads(self.config.num_kv_heads, tp_size)
         self.attn_head_dim = self.config.attn_head_dim
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)

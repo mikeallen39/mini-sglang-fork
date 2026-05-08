@@ -21,6 +21,7 @@ _STREAM_SPLIT_DIM_0 = [
     ".up_proj",
     ".q_b_proj",
     ".kv_b_proj",
+    ".conv1d.weight",
 ]
 _STREAM_SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 _STREAM_MERGE_GROUPS = {
@@ -100,7 +101,10 @@ def _normalize_checkpoint_key(name: str, num_layers: int) -> str | None:
     if name.startswith(("vision_tower.", "multi_modal_projector.")):
         return None
 
-    name = name.removeprefix("language_model.")
+    if name.startswith("model.language_model."):
+        name = f"model.{name.removeprefix('model.language_model.')}"
+    elif name.startswith("language_model."):
+        name = f"model.{name.removeprefix('language_model.')}"
     if name.startswith("model.layers."):
         parts = name.split(".")
         if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) >= num_layers:
@@ -138,8 +142,12 @@ def _stream_shard_tensor(
 
 
 def _stream_get_merge_info(key: str):
+    if key.count(".qkv_proj") and any(key.count(sub) for sub in (".q_proj", ".k_proj", ".v_proj")):
+        return None
     for suffix, (fused_suffix, slots) in _STREAM_MERGE_GROUPS.items():
         if key.count(suffix):
+            if suffix in (".gate_proj", ".up_proj") and ".shared_expert." not in key and ".experts." not in key:
+                continue
             return key.replace(suffix, fused_suffix), _STREAM_SLOT_NAMES[suffix], slots
     return None
 
@@ -175,6 +183,71 @@ def _set_module_tensor(module_dict, checkpoint_key: str, weight: torch.Tensor) -
     else:
         setattr(module, attr_name, weight)
     return True
+
+
+def _stream_qwen3_5_local_qkv(
+    config,
+    model,
+    module_dict,
+    raw_name: str,
+    tensor: torch.Tensor,
+    device: torch.device,
+) -> bool:
+    if config.architectures[0] not in {"Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"}:
+        return False
+    if ".self_attn." not in raw_name:
+        return False
+    if not any(raw_name.endswith(suffix) for suffix in (".q_proj.weight", ".k_proj.weight", ".v_proj.weight")):
+        return False
+
+    base_name = raw_name
+    if base_name.startswith("model.language_model."):
+        base_name = f"model.{base_name.removeprefix('model.language_model.')}"
+    elif base_name.startswith("language_model."):
+        base_name = f"model.{base_name.removeprefix('language_model.')}"
+    if base_name.startswith("model.layers."):
+        parts = base_name.split(".")
+        if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) >= config.num_layers:
+            return False
+
+    if base_name.endswith(".q_proj.weight"):
+        slot = "q"
+    elif base_name.endswith(".k_proj.weight"):
+        slot = "k"
+    else:
+        slot = "v"
+    fused_key = base_name.replace(f".{slot}_proj.weight", ".qkv_proj.weight")
+    if fused_key not in module_dict:
+        return False
+
+    module, attr_name = module_dict[fused_key]
+    if attr_name != "weight" or type(module).__name__ != "Qwen3_5LocalQKVProj":
+        return False
+
+    if not hasattr(module, "_stacked_params"):
+        module._stacked_params = {}
+    module._stacked_params[slot] = tensor
+    if len(module._stacked_params) < 3:
+        return True
+
+    tp_info = get_tp_info()
+    q = module._stacked_params.pop("q")
+    k = module._stacked_params.pop("k")
+    v = module._stacked_params.pop("v")
+    q = q.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
+    if config.num_kv_heads >= tp_info.size:
+        k = k.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
+        v = v.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
+    else:
+        kv_group = tp_info.size // config.num_kv_heads
+        kv_rank = tp_info.rank // kv_group
+        kv_chunk = k.shape[0] // config.num_kv_heads
+        start = kv_rank * kv_chunk
+        end = start + kv_chunk
+        k = k[start:end].contiguous()
+        v = v[start:end].contiguous()
+    fused = torch.cat([q, k, v], dim=0).to(device=device)
+    return _set_module_tensor(module_dict, fused_key, fused)
 
 
 def _get_local_expert_layout(num_experts: int) -> tuple[int, int, int]:
@@ -308,7 +381,7 @@ def load_weight_to_model(
 
     with tqdm(total=len(files), desc="Loading weights to GPU", disable=disable_tqdm, unit="file") as pbar:
         for file in files:
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
                 for raw_name in f.keys():
                     name = _normalize_checkpoint_key(raw_name, config.num_layers)
                     if name is None:
@@ -327,6 +400,16 @@ def load_weight_to_model(
                         moe_tp_info.size,
                         config.num_kv_heads,
                     )
+
+                    if _stream_qwen3_5_local_qkv(
+                        config,
+                        model,
+                        module_dict,
+                        raw_name,
+                        tensor,
+                        device,
+                    ):
+                        continue
 
                     if (info := _stream_get_merge_info(name)) is None:
                         out_key, out_tensor = name, tensor
@@ -358,9 +441,14 @@ def load_weight_to_model(
                         del expert_buf[packed_key]
                         out_key, out_tensor = packed_key, packed
 
+                    if out_tensor.device != device:
+                        out_tensor = out_tensor.to(device=device)
                     if not _set_module_tensor(module_dict, out_key, out_tensor):
                         unmatched_keys.append(out_key)
+                    del out_tensor
             pbar.update(1)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"

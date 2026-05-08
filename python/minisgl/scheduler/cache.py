@@ -22,9 +22,11 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_size = page_size
 
-    def match_req(self, req: PendingReq):
+    def match_req(self, req: PendingReq, *, enable_prefix_cache: bool = True):
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
+        if not enable_prefix_cache:
+            return self.manager.match_prefix(req.input_ids[:0])
         return self.manager.match_prefix(req.input_ids[: input_len - 1])
 
     @property

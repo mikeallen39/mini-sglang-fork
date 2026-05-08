@@ -104,7 +104,7 @@ class GraphRunner:
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
-        if self.max_graph_bs == 0:
+        if self.max_graph_bs == 0 or not model.supports_cuda_graph:
             return logger.info_rank0("CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
@@ -147,7 +147,7 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return bool(self.graph_bs_list) and batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

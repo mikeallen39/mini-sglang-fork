@@ -12,3 +12,14 @@ if TYPE_CHECKING:
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
+
+    @property
+    def supports_prefix_cache(self) -> bool:
+        return True
+
+    @property
+    def supports_cuda_graph(self) -> bool:
+        return True
+
+    def clear_runtime_state_slot(self, table_idx: int) -> None:
+        _ = table_idx

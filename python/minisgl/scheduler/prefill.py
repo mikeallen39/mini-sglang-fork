@@ -35,12 +35,16 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    enable_prefix_cache: bool = True
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
-        handle, match_indices = self.cache_manager.match_req(req)
+        handle, match_indices = self.cache_manager.match_req(
+            req,
+            enable_prefix_cache=self.enable_prefix_cache,
+        )
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -117,6 +121,7 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    enable_prefix_cache: bool = True
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -132,6 +137,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            enable_prefix_cache=self.enable_prefix_cache,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

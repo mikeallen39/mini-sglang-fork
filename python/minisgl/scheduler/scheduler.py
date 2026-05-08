@@ -63,7 +63,10 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            enable_prefix_cache=self.engine.model.supports_prefix_cache,
         )
 
         # some alias for easy access
@@ -148,6 +151,7 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        self.engine.model.clear_runtime_state_slot(req.table_idx)
         self.table_manager.free(req.table_idx)
         self.cache_manager.free_and_cache_finished_req(req, self.page_table)
 

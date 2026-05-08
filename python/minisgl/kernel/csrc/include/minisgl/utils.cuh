@@ -7,7 +7,6 @@
 
 #include <concepts>
 #include <cstddef>
-#include <source_location>
 #include <type_traits>
 
 namespace device {
@@ -62,7 +61,7 @@ namespace host {
 
 inline auto
 CUDA_CHECK(::cudaError_t error,
-           std::source_location location = std::source_location::current())
+           SourceLocation location = SourceLocation::current())
     -> void {
   if (error != ::cudaSuccess) {
     [[unlikely]];
@@ -71,7 +70,7 @@ CUDA_CHECK(::cudaError_t error,
 }
 
 inline auto
-CUDA_CHECK(std::source_location location = std::source_location::current())
+CUDA_CHECK(SourceLocation location = SourceLocation::current())
     -> void {
   return CUDA_CHECK(::cudaGetLastError(), location);
 }

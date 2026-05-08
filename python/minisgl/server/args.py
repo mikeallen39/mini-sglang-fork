@@ -8,7 +8,7 @@ from typing import List, Tuple
 import torch
 from minisgl.distributed import DistributedInfo, build_ep_info
 from minisgl.scheduler import SchedulerConfig
-from minisgl.utils import init_logger
+from minisgl.utils import has_sglang_linear_attn_kernel, init_logger
 
 
 @dataclass(frozen=True)
@@ -255,6 +255,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--linear-attn-backend",
+        type=str,
+        default="torch",
+        choices=["torch", "sglang", "auto"],
+        help="Backend for Qwen3.5 linear attention. 'torch' uses the pure PyTorch fallback; "
+        "'sglang' enables the migrated fused decode kernel; 'auto' selects 'sglang' when Triton is available.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -321,6 +330,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
     del kwargs["expert_parallel_size"]
     kwargs["quantization"] = None if kwargs["quantization"] == "none" else kwargs["quantization"]
+    if kwargs["linear_attn_backend"] == "auto":
+        kwargs["linear_attn_backend"] = "sglang" if has_sglang_linear_attn_kernel() else "torch"
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

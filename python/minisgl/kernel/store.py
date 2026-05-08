@@ -3,11 +3,15 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
+import torch
+from minisgl.utils import init_logger
 from .utils import KernelConfig, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi import Module
+
+logger = init_logger(__name__)
 
 DEFAULT_INDEX_KERNEL_CONFIG = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
 
@@ -19,12 +23,16 @@ def _jit_store_module(
     config: KernelConfig = DEFAULT_INDEX_KERNEL_CONFIG,
 ) -> Module:
     args = make_cpp_args(element_size, *config)
-    return load_jit(
-        "store",
-        *args,
-        cuda_files=["store.cu"],
-        cuda_wrappers=[("launch", f"StoreKernel<{args}>::run")],
-    )
+    try:
+        return load_jit(
+            "store",
+            *args,
+            cuda_files=["store.cu"],
+            cuda_wrappers=[("launch", f"StoreKernel<{args}>::run")],
+        )
+    except Exception as exc:
+        logger.warning("Falling back to torch store kernel: %s", exc)
+        return None  # type: ignore[return-value]
 
 
 def store_cache(
@@ -39,4 +47,10 @@ def store_cache(
     v_cache = v_cache.view(num_tokens, -1)
     element_size = k_cache.shape[1] * k_cache.element_size()
     module = _jit_store_module(element_size)
+    if module is None:
+        indices_long = indices.to(torch.long)
+        k_cache[indices_long] = k
+        v_cache[indices_long] = v
+        return
+
     module.launch(k_cache, v_cache, indices, k, v)

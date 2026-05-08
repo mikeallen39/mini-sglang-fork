@@ -1,0 +1,587 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Tuple
+
+import torch
+import torch.nn.functional as F
+from minisgl.core import get_global_ctx
+from minisgl.distributed import get_tp_info
+from minisgl.linear_attention import (
+    fused_gdn_gating_sglang,
+    fused_linear_attn_decode_sglang,
+    fused_linear_attn_prefill_sglang,
+)
+from minisgl.layers import (
+    BaseOP,
+    GemmaRMSNorm,
+    GemmaRMSNormFused,
+    LinearOProj,
+    LinearReplicated,
+    LinearRowParallel,
+    OPList,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    silu_and_mul,
+)
+from minisgl.utils import div_even, get_linear_attn_backend, local_kv_heads, nvtx_annotate
+
+from .base import BaseLLMModel
+from .utils import GatedMLP
+
+if TYPE_CHECKING:
+    from .config import ModelConfig
+
+
+def _freeze_rope_scaling(scaling: dict | None) -> tuple[tuple[str, object], ...] | None:
+    if scaling is None:
+        return None
+    frozen = []
+    for key, value in scaling.items():
+        if isinstance(value, list):
+            value = tuple(value)
+        frozen.append((key, value))
+    return tuple(frozen)
+
+
+class Qwen3_5LinearStateCache:
+    def __init__(self):
+        self._states: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def get(
+        self,
+        layer_id: int,
+        table_idx: int,
+        *,
+        conv_dim: int,
+        conv_kernel_size: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer_states = self._states.setdefault(layer_id, {})
+        state = layer_states.get(table_idx)
+        if state is not None:
+            return state
+
+        conv_state = torch.zeros(
+            conv_dim,
+            conv_kernel_size - 1,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        ssm_state = torch.zeros(
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        layer_states[table_idx] = (conv_state, ssm_state)
+        return layer_states[table_idx]
+
+    def clear(self, table_idx: int) -> None:
+        for layer_states in self._states.values():
+            layer_states.pop(table_idx, None)
+
+
+class Qwen3_5RMSNormGated(BaseOP):
+    def __init__(self, hidden_size: int, eps: float):
+        self.weight = torch.empty(hidden_size)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        x_shape = x.shape
+        out_dtype = gate.dtype
+        x = x.reshape(-1, x_shape[-1])
+        gate = gate.reshape(-1, x_shape[-1])
+        compute_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+        x = x.to(compute_dtype)
+        variance = x.square().mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = (x * self.weight.to(compute_dtype)).to(out_dtype)
+        x = x * F.silu(gate)
+        return x.reshape(x_shape)
+
+
+class Qwen3_5SparseMoeBlock(BaseOP):
+    def __init__(self, config: ModelConfig):
+        self.experts = __import__("minisgl.layers", fromlist=["MoELayer"]).MoELayer(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+        )
+        self.gate = LinearReplicated(
+            config.hidden_size,
+            config.num_experts,
+            has_bias=False,
+        )
+        self.shared_expert = None
+        self.shared_expert_gate = None
+        if config.shared_expert_intermediate_size > 0:
+            self.shared_expert = Qwen3_5SharedExpert(config)
+            self.shared_expert_gate = LinearReplicated(
+                config.hidden_size,
+                1,
+                has_bias=False,
+            )
+
+    @nvtx_annotate("MoE")
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits = self.gate.forward(hidden_states)
+        output = self.experts.forward(hidden_states, router_logits)
+        if self.shared_expert is not None and self.shared_expert_gate is not None:
+            shared_output = self.shared_expert.forward(hidden_states)
+            shared_output = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_output
+            output = output + shared_output
+        return output
+
+
+class Qwen3_5Conv1dWeight(BaseOP):
+    def __init__(self, output_size: int, kernel_size: int):
+        tp_size = get_tp_info().size
+        self.weight = torch.empty(div_even(output_size, tp_size), 1, kernel_size)
+
+
+class Qwen3_5LocalQKVProj(BaseOP):
+    def __init__(self, input_size: int, q_output_size: int, kv_output_size: int):
+        self.weight = torch.empty(q_output_size + 2 * kv_output_size, input_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
+
+    def weight_loader(self, loaded_weight: torch.Tensor) -> None:
+        if self.weight.is_meta:
+            self.weight = loaded_weight
+        else:
+            self.weight.copy_(loaded_weight)
+
+
+class Qwen3_5SharedExpert(BaseOP):
+    def __init__(self, config: ModelConfig):
+        from minisgl.layers import LinearColParallelMerged
+
+        self.gate_up_proj = LinearColParallelMerged(
+            config.hidden_size,
+            [config.shared_expert_intermediate_size, config.shared_expert_intermediate_size],
+            has_bias=False,
+        )
+        self.down_proj = LinearRowParallel(
+            config.shared_expert_intermediate_size,
+            config.hidden_size,
+            has_bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+
+
+class Qwen3_5FullAttention(BaseOP):
+    def __init__(self, config: ModelConfig, layer_id: int):
+        self.layer_id = layer_id
+        self.head_dim = config.head_dim
+        self.num_qo_heads = config.num_qo_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.attn_output_gate = config.attn_output_gate
+        tp_size = get_tp_info().size
+        self.local_num_qo_heads = div_even(config.num_qo_heads, tp_size)
+        self.local_num_kv_heads = local_kv_heads(config.num_kv_heads, tp_size)
+        self.q_dim = self.local_num_qo_heads * self.head_dim
+        self.kv_dim = self.local_num_kv_heads * self.head_dim
+
+        from minisgl.layers import get_rope
+
+        self.qkv_proj = Qwen3_5LocalQKVProj(
+            config.hidden_size,
+            self.q_dim * (2 if config.attn_output_gate else 1),
+            self.kv_dim,
+        )
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.rotary = get_rope(
+            head_dim=config.head_dim,
+            rotary_dim=config.rotary_config.rotary_dim,
+            max_position=config.rotary_config.max_position,
+            base=config.rotary_config.base,
+            rope_scaling=_freeze_rope_scaling(config.rotary_config.scaling),
+            is_neox=config.rotary_config.is_neox,
+        )
+        self.o_proj = LinearOProj(
+            config.head_dim * config.num_qo_heads,
+            config.hidden_size,
+            has_bias=False,
+        )
+
+    @nvtx_annotate("MHA")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ctx = get_global_ctx()
+        qkv = self.qkv_proj.forward(x)
+        if self.attn_output_gate:
+            q_and_gate, k, v = qkv.split([self.q_dim * 2, self.kv_dim, self.kv_dim], dim=-1)
+            orig_shape = q_and_gate.shape[:-1]
+            q_and_gate = q_and_gate.view(*orig_shape, self.local_num_qo_heads, -1)
+            q, gate = torch.chunk(q_and_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+        else:
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            gate = None
+
+        self.q_norm.forward_inplace(q.view(-1, self.local_num_qo_heads, self.head_dim))
+        self.k_norm.forward_inplace(k.view(-1, self.local_num_kv_heads, self.head_dim))
+        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        q = q.view(-1, self.local_num_qo_heads, self.head_dim)
+        attn_output = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        attn_output = attn_output.view(-1, self.q_dim)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        return self.o_proj.forward(attn_output)
+
+
+class Qwen3_5LinearAttention(BaseOP):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        state_cache: Qwen3_5LinearStateCache,
+    ):
+        self.layer_id = layer_id
+        self.state_cache = state_cache
+        self.tp_size = get_tp_info().size
+        self.num_q_heads = div_even(config.linear_num_key_heads, self.tp_size)
+        self.num_k_heads = div_even(config.linear_num_key_heads, self.tp_size)
+        self.num_v_heads = div_even(config.linear_num_value_heads, self.tp_size)
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+        self.value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+        self.local_key_dim = self.num_k_heads * self.head_k_dim
+        self.local_value_dim = self.num_v_heads * self.head_v_dim
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.scale = self.head_k_dim**-0.5
+        self.activation = config.hidden_act
+        self.conv_dim = 2 * self.local_key_dim + self.local_value_dim
+        self.conv1d = Qwen3_5Conv1dWeight(
+            output_size=self.key_dim * 2 + self.value_dim,
+            kernel_size=self.conv_kernel_size,
+        )
+        from minisgl.layers import LinearColParallelMerged
+
+        self.in_proj_qkv = LinearColParallelMerged(
+            config.hidden_size,
+            [self.key_dim, self.key_dim, self.value_dim],
+            has_bias=False,
+        )
+        self.in_proj_z = LinearColParallelMerged(
+            config.hidden_size,
+            [self.value_dim],
+            has_bias=False,
+        )
+        self.in_proj_b = LinearColParallelMerged(
+            config.hidden_size,
+            [config.linear_num_value_heads],
+            has_bias=False,
+        )
+        self.in_proj_a = LinearColParallelMerged(
+            config.hidden_size,
+            [config.linear_num_value_heads],
+            has_bias=False,
+        )
+        self.norm = Qwen3_5RMSNormGated(config.linear_value_head_dim, eps=config.rms_norm_eps)
+        self.out_proj = LinearRowParallel(
+            self.value_dim,
+            config.hidden_size,
+            has_bias=False,
+        )
+        self.A_log = torch.empty(self.num_v_heads)
+        self.dt_bias = torch.empty(self.num_v_heads)
+        self.backend = get_linear_attn_backend()
+
+        assert self.num_v_heads % self.num_k_heads == 0, "Expected grouped value heads."
+        self.kv_group_size = self.num_v_heads // self.num_k_heads
+
+    def _run_depthwise_conv(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        conv_weight = self.conv1d.weight.squeeze(1).to(dtype=mixed_qkv.dtype)
+        x = mixed_qkv.transpose(0, 1)
+        padded = torch.cat((conv_state.to(dtype=x.dtype), x), dim=-1).unsqueeze(0)
+        conv = F.conv1d(
+            padded,
+            conv_weight.unsqueeze(1),
+            bias=None,
+            groups=conv_weight.shape[0],
+        ).squeeze(0).transpose(0, 1).contiguous()
+        if self.activation == "silu":
+            conv = F.silu(conv)
+        elif self.activation == "swish":
+            conv = conv * torch.sigmoid(conv)
+        elif self.activation != "identity":
+            raise ValueError(f"Unsupported linear attention activation: {self.activation}")
+        next_state = padded.squeeze(0)[:, -(self.conv_kernel_size - 1) :].to(dtype=conv_state.dtype)
+        return conv, next_state
+
+    def _reshape_qkv(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        query, key, value = mixed_qkv.split(
+            [self.local_key_dim, self.local_key_dim, self.local_value_dim], dim=-1
+        )
+        query = query.view(-1, self.num_q_heads, self.head_k_dim)
+        key = key.view(-1, self.num_k_heads, self.head_k_dim)
+        value = value.view(-1, self.num_v_heads, self.head_v_dim)
+        z = z.view(-1, self.num_v_heads, self.head_v_dim)
+        gather_idx = torch.arange(self.num_v_heads, device=query.device) // self.kv_group_size
+        query = query[:, gather_idx, :]
+        key = key[:, gather_idx, :]
+        return query, key, value, z
+
+    def _forward_one_req(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        table_idx: int,
+    ) -> torch.Tensor:
+        conv_state, ssm_state = self.state_cache.get(
+            self.layer_id,
+            table_idx,
+            conv_dim=self.conv_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            num_v_heads=self.num_v_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            device=mixed_qkv.device,
+        )
+        mixed_qkv, next_conv_state = self._run_depthwise_conv(mixed_qkv, conv_state)
+        conv_state.copy_(next_conv_state)
+
+        query, key, value, z = self._reshape_qkv(mixed_qkv, z)
+        query = F.normalize(query.float(), dim=-1, eps=1e-6) * self.scale
+        key = F.normalize(key.float(), dim=-1, eps=1e-6)
+        value = value.float()
+        gate = -torch.exp(self.A_log.float()).unsqueeze(0) * F.softplus(
+            a.float() + self.dt_bias.float().unsqueeze(0)
+        )
+        beta = torch.sigmoid(b.float())
+
+        outputs = torch.empty_like(value)
+        for i in range(query.shape[0]):
+            ssm_state.mul_(torch.exp(gate[i]).view(-1, 1, 1))
+            value_residual = value[i] - torch.einsum("hkv,hk->hv", ssm_state, key[i])
+            value_residual = value_residual * beta[i].unsqueeze(-1)
+            ssm_state.add_(key[i].unsqueeze(-1) * value_residual.unsqueeze(-2))
+            outputs[i] = torch.einsum("hk,hkv->hv", query[i], ssm_state).to(outputs.dtype)
+
+        outputs = self.norm.forward(outputs, z)
+        return self.out_proj.forward(outputs.reshape(outputs.shape[0], -1).contiguous())
+
+    def _forward_one_req_sglang(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        table_idx: int,
+        *,
+        is_decode: bool,
+    ) -> torch.Tensor:
+        conv_state, ssm_state = self.state_cache.get(
+            self.layer_id,
+            table_idx,
+            conv_dim=self.conv_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            num_v_heads=self.num_v_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            device=mixed_qkv.device,
+        )
+        mixed_qkv, next_conv_state = self._run_depthwise_conv(mixed_qkv, conv_state)
+        conv_state.copy_(next_conv_state)
+
+        a = a.float().contiguous()
+        b = b.float().contiguous()
+        A_log = self.A_log.float().contiguous()
+        dt_bias = self.dt_bias.float().contiguous()
+        if is_decode:
+            if mixed_qkv.shape[0] != 1:
+                raise ValueError(
+                    "Decode batches must have exactly one extend token per request for linear attention"
+                )
+            state = ssm_state.unsqueeze(0).contiguous()
+            state_indices = torch.tensor([0], dtype=torch.int32, device=mixed_qkv.device)
+            outputs = fused_linear_attn_decode_sglang(
+                mixed_qkv.contiguous(),
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state,
+                state_indices,
+                self.scale,
+            )
+            ssm_state.copy_(state.squeeze(0))
+        else:
+            query, key, value, _ = self._reshape_qkv(mixed_qkv, z)
+            gate, beta = fused_gdn_gating_sglang(A_log, a, b, dt_bias)
+            outputs = fused_linear_attn_prefill_sglang(
+                query.contiguous(),
+                key.contiguous(),
+                value.float().contiguous(),
+                gate.contiguous(),
+                beta.contiguous(),
+                ssm_state,
+                self.scale,
+            )
+        outputs = self.norm.forward(outputs, z)
+        return self.out_proj.forward(outputs.reshape(outputs.shape[0], -1).contiguous())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = get_global_ctx().batch
+        mixed_qkv = self.in_proj_qkv.forward(x)
+        z = self.in_proj_z.forward(x)
+        b = self.in_proj_b.forward(x)
+        a = self.in_proj_a.forward(x)
+
+        outputs = []
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            req_slice = slice(offset, offset + length)
+            if self.backend == "torch":
+                outputs.append(
+                    self._forward_one_req(
+                        mixed_qkv[req_slice],
+                        z[req_slice],
+                        a[req_slice],
+                        b[req_slice],
+                        req.table_idx,
+                    )
+                )
+            elif self.backend == "sglang":
+                outputs.append(
+                    self._forward_one_req_sglang(
+                        mixed_qkv[req_slice],
+                        z[req_slice],
+                        a[req_slice],
+                        b[req_slice],
+                        req.table_idx,
+                        is_decode=batch.is_decode,
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported linear attention backend: {self.backend}")
+            offset += length
+        return torch.cat(outputs, dim=0)
+
+
+class Qwen3_5DecoderLayer(BaseOP):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        state_cache: Qwen3_5LinearStateCache,
+    ):
+        layer_types = config.layer_types or ["full_attention"] * config.num_layers
+        self.layer_type = layer_types[layer_id]
+        if self.layer_type == "full_attention":
+            self.self_attn = Qwen3_5FullAttention(config, layer_id)
+        elif self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3_5LinearAttention(config, layer_id, state_cache)
+        else:
+            raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type}")
+
+        self.mlp = (
+            Qwen3_5SparseMoeBlock(config)
+            if config.is_moe
+            else GatedMLP(config)
+        )
+        self.input_layernorm = GemmaRMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = GemmaRMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self._layer_id = layer_id
+
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, residual = self.input_layernorm.forward(x, residual)
+        if self.layer_type == "full_attention":
+            x = self.self_attn.forward(x)
+        else:
+            x = self.linear_attn.forward(x)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        x = self.mlp.forward(x)
+        return x, residual
+
+
+class Qwen3_5Model(BaseOP):
+    def __init__(self, config: ModelConfig):
+        self.linear_state_cache = Qwen3_5LinearStateCache()
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+        )
+        self.layers = OPList(
+            [
+                Qwen3_5DecoderLayer(config, layer_id, self.linear_state_cache)
+                for layer_id in range(config.num_layers)
+            ]
+        )
+        self.norm = GemmaRMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embed_tokens.forward(input_ids)
+        residual: torch.Tensor | None = None
+        for layer in self.layers.op_list:
+            x, residual = layer.forward(x, residual)
+        return self.norm.forward(x, residual)[0]
+
+
+class Qwen3_5ForCausalLM(BaseLLMModel):
+    def __init__(self, config: ModelConfig):
+        self.model = Qwen3_5Model(config)
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+        )
+        super().__init__()
+
+    def forward(self) -> torch.Tensor:
+        output = self.model.forward(get_global_ctx().batch.input_ids)
+        return self.lm_head.forward(output)
+
+    @property
+    def supports_prefix_cache(self) -> bool:
+        return False
+
+    @property
+    def supports_cuda_graph(self) -> bool:
+        return False
+
+    def clear_runtime_state_slot(self, table_idx: int) -> None:
+        self.model.linear_state_cache.clear(table_idx)
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    pass
+
+
+__all__ = ["Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"]

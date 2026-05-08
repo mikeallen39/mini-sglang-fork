@@ -13,7 +13,6 @@
 #include <initializer_list>
 #include <optional>
 #include <ranges>
-#include <source_location>
 #include <span>
 #include <sstream>
 #include <string>
@@ -362,7 +361,7 @@ private:
   using SizeRef = details::SizeRef;
   using DTypeRef = details::DTypeRef;
   using DeviceRef = details::DeviceRef;
-  using Loc_t = std::source_location;
+  using Loc_t = SourceLocation;
 
 public:
   TensorMatcher(const TensorMatcher &) = delete;

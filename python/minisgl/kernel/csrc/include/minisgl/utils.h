@@ -1,41 +1,61 @@
 #pragma once
 
-// ref:
-// https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
-#ifdef __CUDACC__
-#pragma push_macro("__cpp_consteval")
-#pragma push_macro("_NODISCARD")
-#pragma push_macro("__builtin_LINE")
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wbuiltin-macro-redefined"
-#define __cpp_consteval 201811L
-#pragma clang diagnostic pop
-
-#ifdef _NODISCARD
-#undef _NODISCARD
-#define _NODISCARD
-#endif
-
-#define consteval constexpr
-
-#include <source_location>
-
-#undef consteval
-#pragma pop_macro("__cpp_consteval")
-#pragma pop_macro("_NODISCARD")
-#else
-#include <source_location>
-#endif
-
 #include <dlpack/dlpack.h>
 
 #include <concepts>
+#include <cstdint>
 #include <ostream>
 #include <sstream>
 #include <utility>
 
+namespace minisgl_compat {
+
+#if defined(__has_include)
+#if __has_include(<source_location>)
+#include <source_location>
+using source_location = std::source_location;
+#else
+struct source_location {
+  static constexpr auto current(const char *file = __builtin_FILE(),
+                                const char *function = __builtin_FUNCTION(),
+                                std::uint_least32_t line = __builtin_LINE(),
+                                std::uint_least32_t column = 0) noexcept
+      -> source_location {
+    return source_location(file, function, line, column);
+  }
+
+  constexpr source_location(const char *file = "unknown",
+                            const char *function = "",
+                            std::uint_least32_t line = 0,
+                            std::uint_least32_t column = 0) noexcept
+      : m_file(file), m_function(function), m_line(line), m_column(column) {}
+
+  constexpr auto file_name() const noexcept -> const char * { return m_file; }
+  constexpr auto function_name() const noexcept -> const char * {
+    return m_function;
+  }
+  constexpr auto line() const noexcept -> std::uint_least32_t { return m_line; }
+  constexpr auto column() const noexcept -> std::uint_least32_t {
+    return m_column;
+  }
+
+private:
+  const char *m_file;
+  const char *m_function;
+  std::uint_least32_t m_line;
+  std::uint_least32_t m_column;
+};
+#endif
+#else
+#include <source_location>
+using source_location = std::source_location;
+#endif
+
+} // namespace minisgl_compat
+
 namespace host {
+
+using SourceLocation = minisgl_compat::source_location;
 
 struct PanicError : public std::runtime_error {
 public:
@@ -53,7 +73,7 @@ private:
 
 template <typename... Args>
 [[noreturn]]
-inline auto panic(std::source_location location, Args &&...args) -> void {
+inline auto panic(SourceLocation location, Args &&...args) -> void {
   std::ostringstream os;
   os << "Runtime check failed at " << location.file_name() << ":"
      << location.line();
@@ -67,8 +87,8 @@ inline auto panic(std::source_location location, Args &&...args) -> void {
 }
 
 template <typename... Args> struct Panic {
-  explicit Panic(Args &&...args, std::source_location location =
-                                     std::source_location::current()) {
+  explicit Panic(Args &&...args,
+                 SourceLocation location = SourceLocation::current()) {
     [[unlikely]];
     ::host::panic(location, std::forward<Args>(args)...);
   }
@@ -78,8 +98,7 @@ template <typename... Args> struct Panic {
 template <typename... Args> struct RuntimeCheck {
   template <typename T>
   explicit RuntimeCheck(
-      T &&condition, Args &&...args,
-      std::source_location location = std::source_location::current()) {
+      T &&condition, Args &&...args, SourceLocation location = SourceLocation::current()) {
     if (!condition) {
       [[unlikely]];
       ::host::panic(location, std::forward<Args>(args)...);

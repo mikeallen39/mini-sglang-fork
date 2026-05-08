@@ -13,6 +13,24 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs, disable=True)
 
 
+def _normalize_multimodal_config_dict(config_dict: dict[str, Any]) -> dict[str, Any]:
+    text_config = config_dict.get("text_config")
+    if not isinstance(text_config, dict):
+        return config_dict
+
+    normalized = dict(text_config)
+    if "tie_word_embeddings" not in normalized and "tie_word_embeddings" in config_dict:
+        normalized["tie_word_embeddings"] = config_dict["tie_word_embeddings"]
+
+    architectures = normalized.get("architectures") or config_dict.get("architectures") or []
+    arch_map = {
+        "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+    }
+    normalized["architectures"] = [arch_map.get(arch, arch) for arch in architectures]
+    return normalized
+
+
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     try:
         return AutoTokenizer.from_pretrained(model_path, fix_mistral_regex=True)
@@ -33,6 +51,7 @@ def _load_hf_config(model_path: str) -> Any:
             raise
         with open(config_file, "r", encoding="utf-8") as f:
             config_dict = json.load(f)
+        config_dict = _normalize_multimodal_config_dict(config_dict)
         model_type = config_dict.get("model_type", "")
         fallback_cls = type("LocalFallbackConfig", (PretrainedConfig,), {"model_type": model_type})
         return fallback_cls(**config_dict)

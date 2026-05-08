@@ -14,15 +14,23 @@ def fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sgl_kernel import topk_softmax
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
-    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
-    if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+    try:
+        from sgl_kernel import topk_softmax
+
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
+        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
+        if renormalize:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+    except Exception:
+        scores = torch.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)
+        if renormalize:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        topk_ids = topk_ids.to(torch.int32)
+
     if num_token_non_padded is not None:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = -1

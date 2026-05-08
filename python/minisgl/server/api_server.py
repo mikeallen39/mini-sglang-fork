@@ -67,6 +67,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
     ignore_eos: bool = False
+    use_chat_template: bool = True
 
 
 class Message(BaseModel):
@@ -260,14 +261,22 @@ async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     uid = state.new_user()
+    prompt: str | List[Dict[str, str]]
+    chat_template_kwargs = None
+    if req.use_chat_template:
+        prompt = [{"role": "user", "content": req.prompt}]
+        chat_template_kwargs = {"enable_thinking": False}
+    else:
+        prompt = req.prompt
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=req.prompt,
+            text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
+            chat_template_kwargs=chat_template_kwargs,
         )
     )
 
@@ -304,6 +313,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            chat_template_kwargs={"enable_thinking": False},
         )
     )
 
@@ -337,6 +347,7 @@ async def shell_completion(req: OpenAICompletionRequest):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            chat_template_kwargs={"enable_thinking": False},
         )
     )
 

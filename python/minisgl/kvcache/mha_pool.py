@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from minisgl.distributed import get_tp_info
-from minisgl.utils import div_even
+from minisgl.utils import local_kv_heads
 
 from .base import BaseKVCache
 
@@ -24,9 +24,9 @@ class MHAKVCache(BaseKVCache):
         device: torch.device,
     ) -> None:
         tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size)
+        num_local_kv_heads = local_kv_heads(num_kv_heads, tp_info.size)
         self._kv_buffer = torch.empty(
-            (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
+            (2, num_layers, num_pages, page_size, num_local_kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
@@ -34,7 +34,7 @@ class MHAKVCache(BaseKVCache):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, num_local_kv_heads, head_dim)
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]

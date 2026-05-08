@@ -7,6 +7,8 @@ _MODEL_REGISTRY = {
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
+    "Qwen3_5ForCausalLM": (".qwen3_5_moe", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": (".qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
     # GLM4 models
     "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
 }
