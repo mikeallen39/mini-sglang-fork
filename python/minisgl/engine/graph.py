@@ -102,6 +102,7 @@ class GraphRunner:
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
+        self.capture_dummy_reqs: Dict[int, List[Req]] = {}
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -135,7 +136,8 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            dummy_reqs = self._make_capture_dummy_reqs(bs)
+            batch = Batch(reqs=dummy_reqs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
@@ -146,6 +148,7 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            self.capture_dummy_reqs[bs] = dummy_reqs
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -161,6 +164,9 @@ class GraphRunner:
         g.replay()
         return self.buffer.logits[: batch.size]
 
+    def get_capture_dummy_reqs(self, bs: int) -> List[Req]:
+        return self.capture_dummy_reqs[bs]
+
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
@@ -168,6 +174,22 @@ class GraphRunner:
             else batch.size
         )
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
+
+    def _make_capture_dummy_reqs(self, bs: int) -> List[Req]:
+        reqs = []
+        for i in range(bs):
+            reqs.append(
+                Req(
+                    input_ids=self.dummy_req.input_ids,
+                    table_idx=self.dummy_req.table_idx + i,
+                    cached_len=self.dummy_req.cached_len,
+                    output_len=self.dummy_req.output_len,
+                    uid=self.dummy_req.uid - i,
+                    sampling_params=self.dummy_req.sampling_params,
+                    cache_handle=self.dummy_req.cache_handle,
+                )
+            )
+        return reqs
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:

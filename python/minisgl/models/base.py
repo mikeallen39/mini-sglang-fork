@@ -22,11 +22,11 @@ class BaseLLMModel(ABC, BaseOP):
     def supports_cuda_graph(self) -> bool:
         return True
 
-    def prepare_for_cuda_graph_replay(self, batch: Batch, dummy_req: Req) -> None:
-        _ = batch, dummy_req
+    def prepare_for_cuda_graph_replay(self, batch: Batch, dummy_reqs: list[Req]) -> None:
+        _ = batch, dummy_reqs
 
-    def finish_cuda_graph_replay(self, batch: Batch, dummy_req: Req) -> None:
-        _ = batch, dummy_req
+    def finish_cuda_graph_replay(self, batch: Batch, dummy_reqs: list[Req]) -> None:
+        _ = batch, dummy_reqs
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         _ = table_idx

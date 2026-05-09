@@ -248,3 +248,116 @@
 
 - 先把 `2/4` 做稳，最容易定位正确性与收益
 - 也更符合当前 decode 小 batch 的主要服务场景
+
+## 8. `bs=2/4` 扩展与性能对照
+
+在完成 `bs=1` 版本之后，本轮继续把 graph replay 从单 request 扩到了：
+
+- `bs=2`
+- `bs=4`
+
+### 8.1 中间遇到的问题
+
+第一次直接扩到 `bs=4` 时，服务在 capture 阶段报错：
+
+- `IndexError: index 5 is out of bounds for dimension 0 with size 5`
+
+根因是：
+
+- `page_table` 只按 `max_running_req + 1` 预留了一个 dummy slot
+- 但 `bs=4` graph capture 需要 4 个独立的 dummy request slot
+
+修复方式：
+
+1. `page_table` / `token_pool` 改成额外预留 `max_graph_bs` 个 graph dummy slots
+2. graph capture 时，为每个 batch size 单独创建稳定的 `dummy_reqs`
+3. replay 前后按：
+   - `real_req[i] <-> dummy_req[i]`
+   做 linear attention state 同步
+
+### 8.2 正确性验证
+
+修复后，服务已经能成功：
+
+- `capture [1, 2, 4]`
+
+并发请求输出验证结果：
+
+- `bs=2`
+  - `水果 -> 苹果`
+  - `动物 -> 猫`
+- `bs=4`
+  - `水果 -> 苹果`
+  - `动物 -> 猫`
+  - `城市 -> 北京`
+  - `颜色 -> 红色`
+
+当前没有观察到明显的 state 串扰。
+
+### 8.3 BF16 `graph on/off` 对照
+
+测试配置：
+
+- `bf16`
+- `--moe-backend fused`
+- `--linear-attn-backend sglang`
+- `--max-running-requests 4`
+
+#### graph on
+
+服务配置：
+
+- `--graph 4`
+
+结果：
+
+`bs=2`
+
+- `TTFT avg = 338.52 ms`
+- `TPOT avg = 16.85 ms`
+- `E2E avg = 0.8608 s`
+- `Throughput = 76.61 token/s`
+
+`bs=4`
+
+- 当前这轮没有单独留存完整日志数值
+- 但已经确认：
+  - `capture [1, 2, 4]` 成功
+  - `bs=4` 并发请求正确输出
+
+#### graph off
+
+服务配置：
+
+- `--graph 0`
+
+结果：
+
+`bs=2`
+
+- `TTFT avg = 516.24 ms`
+- `TPOT avg = 213.14 ms`
+- `E2E avg = 7.1236 s`
+- `Throughput = 4.35 token/s`
+
+`bs=4`
+
+- `TTFT avg = 798.89 ms`
+- `TPOT avg = 268.46 ms`
+- `E2E avg = 9.1212 s`
+- `Throughput = 3.40 token/s`
+
+### 8.4 当前结论更新
+
+截至当前，可以把结论更新为：
+
+1. `Qwen3.6 + fused MoE + sglang linear attention` 现在已经支持：
+   - `bs=1`
+   - `bs=2`
+   - `bs=4`
+   的 CUDA graph
+2. `bs=2` 下，开启 CUDA graph 后吞吐从约 `4.35 token/s` 提升到约 `76.61 token/s`
+3. 这说明当前 decode 小 batch 场景下，CUDA graph 对这条路径的收益非常大
+4. 下一步若继续投入，最值得做的是：
+   - 补齐 `bs=4` 的完整对照数值留档
+   - 再继续扩到 `bs=8`

@@ -723,27 +723,27 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             return False
         return True
 
-    def prepare_for_cuda_graph_replay(self, batch, dummy_req) -> None:
-        if not batch.is_decode or batch.size != 1:
+    def prepare_for_cuda_graph_replay(self, batch, dummy_reqs) -> None:
+        if not batch.is_decode:
             return
-        real_req = batch.reqs[0]
-        if real_req.table_idx == dummy_req.table_idx:
-            return
-        for layer in self.model.layers.op_list:
-            linear_attn = getattr(layer, "linear_attn", None)
-            if linear_attn is not None:
-                linear_attn.copy_state(real_req.table_idx, dummy_req.table_idx)
+        for real_req, dummy_req in zip(batch.reqs, dummy_reqs, strict=False):
+            if real_req.table_idx == dummy_req.table_idx:
+                continue
+            for layer in self.model.layers.op_list:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.copy_state(real_req.table_idx, dummy_req.table_idx)
 
-    def finish_cuda_graph_replay(self, batch, dummy_req) -> None:
-        if not batch.is_decode or batch.size != 1:
+    def finish_cuda_graph_replay(self, batch, dummy_reqs) -> None:
+        if not batch.is_decode:
             return
-        real_req = batch.reqs[0]
-        if real_req.table_idx == dummy_req.table_idx:
-            return
-        for layer in self.model.layers.op_list:
-            linear_attn = getattr(layer, "linear_attn", None)
-            if linear_attn is not None:
-                linear_attn.copy_state(dummy_req.table_idx, real_req.table_idx)
+        for real_req, dummy_req in zip(batch.reqs, dummy_reqs, strict=False):
+            if real_req.table_idx == dummy_req.table_idx:
+                continue
+            for layer in self.model.layers.op_list:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.copy_state(dummy_req.table_idx, real_req.table_idx)
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         self.model.linear_state_cache.clear(table_idx)
