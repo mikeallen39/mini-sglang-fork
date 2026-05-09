@@ -3,6 +3,22 @@ from __future__ import annotations
 import torch
 
 
+def _select_per_token_quant_config(M: int, N: int) -> tuple[int, int]:
+    if M <= 8 and N >= 1024:
+        return 1024, 8
+    if M >= 32:
+        return 256, 2
+    return 256, 4
+
+
+def _select_silu_and_mul_quant_config(M: int, N2: int) -> tuple[int, int]:
+    if M <= 8 and N2 >= 1024:
+        return 1024, 2
+    if M >= 32:
+        return 256, 8
+    return 256, 4
+
+
 def per_token_quant_int8_triton(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -22,6 +38,7 @@ def per_token_quant_int8_triton(
 
     M, N = input.shape
     grid = (M,)
+    block_n, num_warps = _select_per_token_quant_config(M, N)
 
     per_token_quant_int8_kernel[grid](
         input,
@@ -34,8 +51,8 @@ def per_token_quant_int8_triton(
         output_s.stride(0),
         M,
         N,
-        BLOCK_N=256,
-        num_warps=4,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
     )
 
 
@@ -60,7 +77,7 @@ def silu_and_mul_quant_int8_triton(
 
     M = input.shape[0]
     N2 = output_q.shape[1]
-    BLOCK_N = 256
+    block_n, num_warps = _select_silu_and_mul_quant_config(M, N2)
     grid = (M,)
 
     silu_and_mul_quant_int8_kernel[grid](
@@ -74,6 +91,6 @@ def silu_and_mul_quant_int8_triton(
         output_s.stride(0),
         M,
         N2,
-        BLOCK_N=BLOCK_N,
-        num_warps=4,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
     )

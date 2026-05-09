@@ -2,9 +2,48 @@ import functools
 from typing import Dict, Optional, Tuple
 
 import torch
+from minisgl.env import ENV
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 from minisgl.utils import div_ceil
+from minisgl.utils.logger import init_logger
+
+_FUSED_MOE_WORKSPACE: dict[tuple[int, torch.dtype], dict[str, torch.Tensor]] = {}
+_FUSED_MOE_PROFILE = {
+    "w1_ms": 0.0,
+    "stage2_ms": 0.0,
+    "w2_ms": 0.0,
+    "reduce_ms": 0.0,
+    "count": 0,
+}
+_FUSED_MOE_PROFILE_INTERVAL = 100
+logger = init_logger(__name__)
+
+
+def _workspace_key(device: torch.device, dtype: torch.dtype) -> tuple[int, torch.dtype]:
+    assert device.type == "cuda"
+    return (device.index if device.index is not None else torch.cuda.current_device(), dtype)
+
+
+def _get_workspace_tensor(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    key = _workspace_key(device, dtype)
+    bucket = _FUSED_MOE_WORKSPACE.setdefault(key, {})
+    needed_numel = 1
+    for dim in shape:
+        needed_numel *= dim
+
+    cached = bucket.get(name)
+    if cached is None or cached.numel() < needed_numel:
+        cached = torch.empty(needed_numel, device=device, dtype=dtype)
+        bucket[name] = cached
+
+    return cached[:needed_numel].view(shape)
 
 
 def fused_topk(
@@ -328,31 +367,35 @@ def fused_experts_impl(
     )
     config = get_config_func(M)
 
-    cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
+    cache = _get_workspace_tensor(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
+        name="cache",
+        shape=(M * topk_ids.shape[1] * max(N, w2.shape[1]),),
     )
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
     use_int8_stage2_fused_quant = w2.dtype == torch.int8 and activation == "silu"
     if use_int8_stage2_fused_quant:
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
+        intermediate_cache2 = _get_workspace_tensor(
             device=hidden_states.device,
             dtype=torch.int8,
+            name="stage2_q",
+            shape=(M * topk_ids.shape[1], N // 2),
         )
-        intermediate_cache2_scale = torch.empty(
-            (M * topk_ids.shape[1], 1),
+        intermediate_cache2_scale = _get_workspace_tensor(
             device=hidden_states.device,
             dtype=torch.float32,
+            name="stage2_s",
+            shape=(M * topk_ids.shape[1], 1),
         )
     else:
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
+        intermediate_cache2 = _get_workspace_tensor(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
+            name="stage2_fp",
+            shape=(M * topk_ids.shape[1], N // 2),
         )
         intermediate_cache2_scale = None
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
@@ -376,6 +419,14 @@ def fused_experts_impl(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
+    profile_enabled = ENV.PROFILE_FUSED_MOE.value
+    if profile_enabled:
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e2 = torch.cuda.Event(enable_timing=True)
+        e3 = torch.cuda.Event(enable_timing=True)
+        e4 = torch.cuda.Event(enable_timing=True)
+        e0.record()
 
     fused_moe_kernel_triton(
         curr_hidden_states,
@@ -394,6 +445,8 @@ def fused_experts_impl(
         compute_type=compute_type,
         filter_expert=filter_expert,
     )
+    if profile_enabled:
+        e1.record()
     FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
     if use_int8_stage2_fused_quant:
         silu_and_mul_quant_int8_triton(
@@ -403,6 +456,8 @@ def fused_experts_impl(
         )
     else:
         FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    if profile_enabled:
+        e2.record()
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -420,11 +475,36 @@ def fused_experts_impl(
         compute_type=compute_type,
         filter_expert=filter_expert,
     )
+    if profile_enabled:
+        e3.record()
 
     moe_sum_reduce_triton(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
     )
+    if profile_enabled:
+        e4.record()
+        e4.synchronize()
+        _FUSED_MOE_PROFILE["w1_ms"] += e0.elapsed_time(e1)
+        _FUSED_MOE_PROFILE["stage2_ms"] += e1.elapsed_time(e2)
+        _FUSED_MOE_PROFILE["w2_ms"] += e2.elapsed_time(e3)
+        _FUSED_MOE_PROFILE["reduce_ms"] += e3.elapsed_time(e4)
+        _FUSED_MOE_PROFILE["count"] += 1
+        if _FUSED_MOE_PROFILE["count"] % _FUSED_MOE_PROFILE_INTERVAL == 0:
+            count = _FUSED_MOE_PROFILE["count"]
+            logger.info_rank0(
+                "FusedMoE profile avg: w1=%.4f ms, stage2=%.4f ms, w2=%.4f ms, reduce=%.4f ms over %d calls",
+                _FUSED_MOE_PROFILE["w1_ms"] / count,
+                _FUSED_MOE_PROFILE["stage2_ms"] / count,
+                _FUSED_MOE_PROFILE["w2_ms"] / count,
+                _FUSED_MOE_PROFILE["reduce_ms"] / count,
+                count,
+            )
+            _FUSED_MOE_PROFILE["w1_ms"] = 0.0
+            _FUSED_MOE_PROFILE["stage2_ms"] = 0.0
+            _FUSED_MOE_PROFILE["w2_ms"] = 0.0
+            _FUSED_MOE_PROFILE["reduce_ms"] = 0.0
+            _FUSED_MOE_PROFILE["count"] = 0
     return out_hidden_states
 
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.env import ENV
 from minisgl.linear_attention import (
     fused_gdn_gating_sglang,
     fused_linear_attn_decode_sglang,
@@ -24,12 +25,23 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.utils import div_even, get_linear_attn_backend, local_kv_heads, nvtx_annotate
+from minisgl.utils.logger import init_logger
 
 from .base import BaseLLMModel
 from .utils import GatedMLP
 
 if TYPE_CHECKING:
     from .config import ModelConfig
+
+logger = init_logger(__name__)
+
+_SPARSE_MOE_PROFILE = {
+    "router_ms": 0.0,
+    "experts_ms": 0.0,
+    "shared_ms": 0.0,
+    "count": 0,
+}
+_SPARSE_MOE_PROFILE_INTERVAL = 100
 
 
 def _freeze_rope_scaling(scaling: dict | None) -> tuple[tuple[str, object], ...] | None:
@@ -130,12 +142,43 @@ class Qwen3_5SparseMoeBlock(BaseOP):
 
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        profile_enabled = ENV.PROFILE_SPARSE_MOE.value
+        if profile_enabled:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e2 = torch.cuda.Event(enable_timing=True)
+            e3 = torch.cuda.Event(enable_timing=True)
+            e0.record()
         router_logits = self.gate.forward(hidden_states)
+        if profile_enabled:
+            e1.record()
         output = self.experts.forward(hidden_states, router_logits)
+        if profile_enabled:
+            e2.record()
         if self.shared_expert is not None and self.shared_expert_gate is not None:
             shared_output = self.shared_expert.forward(hidden_states)
             shared_output = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_output
             output = output + shared_output
+        if profile_enabled:
+            e3.record()
+            e3.synchronize()
+            _SPARSE_MOE_PROFILE["router_ms"] += e0.elapsed_time(e1)
+            _SPARSE_MOE_PROFILE["experts_ms"] += e1.elapsed_time(e2)
+            _SPARSE_MOE_PROFILE["shared_ms"] += e2.elapsed_time(e3)
+            _SPARSE_MOE_PROFILE["count"] += 1
+            if _SPARSE_MOE_PROFILE["count"] % _SPARSE_MOE_PROFILE_INTERVAL == 0:
+                count = _SPARSE_MOE_PROFILE["count"]
+                logger.info_rank0(
+                    "SparseMoE profile avg: router=%.4f ms, experts=%.4f ms, shared=%.4f ms over %d calls",
+                    _SPARSE_MOE_PROFILE["router_ms"] / count,
+                    _SPARSE_MOE_PROFILE["experts_ms"] / count,
+                    _SPARSE_MOE_PROFILE["shared_ms"] / count,
+                    count,
+                )
+                _SPARSE_MOE_PROFILE["router_ms"] = 0.0
+                _SPARSE_MOE_PROFILE["experts_ms"] = 0.0
+                _SPARSE_MOE_PROFILE["shared_ms"] = 0.0
+                _SPARSE_MOE_PROFILE["count"] = 0
         return output
 
 
@@ -173,6 +216,8 @@ class Qwen3_5SharedExpert(BaseOP):
             config.hidden_size,
             has_bias=False,
         )
+        self.gate_up_proj.quantize_in_moe_only = True
+        self.down_proj.quantize_in_moe_only = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
@@ -518,12 +563,40 @@ class Qwen3_5DecoderLayer(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
+        profile_enabled = ENV.PROFILE_QWEN35.value
+        if profile_enabled:
+            torch.cuda.synchronize(x.device)
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t2 = torch.cuda.Event(enable_timing=True)
+            t3 = torch.cuda.Event(enable_timing=True)
+            t0.record()
         if self.layer_type == "full_attention":
             x = self.self_attn.forward(x)
         else:
             x = self.linear_attn.forward(x)
+        if profile_enabled:
+            t1.record()
         x, residual = self.post_attention_layernorm.forward(x, residual)
         x = self.mlp.forward(x)
+        if profile_enabled:
+            t2.record()
+            t3.record()
+            t3.synchronize()
+            stats = getattr(self, "_profile_stats", None)
+            if stats is None:
+                stats = self._profile_stats = {
+                    "full_attn_ms": 0.0,
+                    "linear_attn_ms": 0.0,
+                    "mlp_ms": 0.0,
+                    "count": 0,
+                }
+            if self.layer_type == "full_attention":
+                stats["full_attn_ms"] += t0.elapsed_time(t1)
+            else:
+                stats["linear_attn_ms"] += t0.elapsed_time(t1)
+            stats["mlp_ms"] += t1.elapsed_time(t2)
+            stats["count"] += 1
         return x, residual
 
 
@@ -566,6 +639,8 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        if ENV.PROFILE_QWEN35.value:
+            self._maybe_log_profile()
         return self.lm_head.forward(output)
 
     @property
@@ -578,6 +653,40 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         self.model.linear_state_cache.clear(table_idx)
+
+    def _maybe_log_profile(self) -> None:
+        counter = getattr(self, "_profile_counter", 0) + 1
+        self._profile_counter = counter
+        if counter % 10 != 0:
+            return
+
+        full_attn_ms = 0.0
+        linear_attn_ms = 0.0
+        mlp_ms = 0.0
+        count = 0
+        for layer in self.model.layers.op_list:
+            stats = getattr(layer, "_profile_stats", None)
+            if not stats:
+                continue
+            full_attn_ms += stats["full_attn_ms"]
+            linear_attn_ms += stats["linear_attn_ms"]
+            mlp_ms += stats["mlp_ms"]
+            count += stats["count"]
+            stats["full_attn_ms"] = 0.0
+            stats["linear_attn_ms"] = 0.0
+            stats["mlp_ms"] = 0.0
+            stats["count"] = 0
+
+        if count == 0:
+            return
+
+        logger.info_rank0(
+            "Qwen3.5 profile avg per layer-call: full_attn=%.4f ms, linear_attn=%.4f ms, mlp=%.4f ms over %d calls",
+            full_attn_ms / count,
+            linear_attn_ms / count,
+            mlp_ms / count,
+            count,
+        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
