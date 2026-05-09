@@ -93,6 +93,69 @@ def fused_moe_kernel_triton(
     )
 
 
+def fused_moe_w2_silu_int8_kernel_triton(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    config: Dict[str, Any],
+    compute_type: torch.dtype,
+    filter_expert: bool = False,
+) -> None:
+    import triton
+    import triton.language as tl
+
+    from .triton.fused_moe import fused_moe_w2_silu_int8_kernel
+
+    assert A.is_contiguous()
+    assert B.dtype == torch.int8
+    assert B_scale is not None
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+    )
+    K = B.shape[2]
+    even_Ks = K % config["BLOCK_SIZE_K"] == 0
+    dtype = tl.bfloat16 if compute_type == torch.bfloat16 else tl.float16
+    fused_moe_w2_silu_int8_kernel[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.shape[1],
+        K,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0),
+        B_scale.stride(1),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,  # type: ignore
+        compute_type=dtype,  # type: ignore
+        even_Ks=even_Ks,  # type: ignore
+        filter_expert=filter_expert,  # type: ignore
+        **config,
+    )
+
+
 def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
     import triton
 

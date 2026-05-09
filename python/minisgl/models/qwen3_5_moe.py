@@ -98,6 +98,22 @@ class Qwen3_5LinearStateCache:
         for layer_states in self._states.values():
             layer_states.pop(table_idx, None)
 
+    def get_existing(
+        self, layer_id: int, table_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        layer_states = self._states.get(layer_id)
+        if layer_states is None:
+            return None
+        return layer_states.get(table_idx)
+
+    def swap_states(self, layer_id: int, src_table_idx: int, dst_table_idx: int) -> None:
+        src = self.get_existing(layer_id, src_table_idx)
+        dst = self.get_existing(layer_id, dst_table_idx)
+        if src is None or dst is None:
+            return
+        dst[0].copy_(src[0])
+        dst[1].copy_(src[1])
+
 
 class Qwen3_5RMSNormGated(BaseOP):
     def __init__(self, hidden_size: int, eps: float):
@@ -434,6 +450,9 @@ class Qwen3_5LinearAttention(BaseOP):
         self._gather_idx = torch.arange(self.num_v_heads, device=self.A_log.device) // self.kv_group_size
         self._decode_state_index = torch.tensor([0], dtype=torch.int32, device=self.A_log.device)
 
+    def copy_state(self, src_table_idx: int, dst_table_idx: int) -> None:
+        self.state_cache.swap_states(self.layer_id, src_table_idx, dst_table_idx)
+
     def _forward_one_req(
         self,
         mixed_qkv: torch.Tensor,
@@ -697,7 +716,34 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
 
     @property
     def supports_cuda_graph(self) -> bool:
-        return False
+        return self._supports_cuda_graph()
+
+    def _supports_cuda_graph(self) -> bool:
+        if get_linear_attn_backend() != "sglang":
+            return False
+        return True
+
+    def prepare_for_cuda_graph_replay(self, batch, dummy_req) -> None:
+        if not batch.is_decode or batch.size != 1:
+            return
+        real_req = batch.reqs[0]
+        if real_req.table_idx == dummy_req.table_idx:
+            return
+        for layer in self.model.layers.op_list:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                linear_attn.copy_state(real_req.table_idx, dummy_req.table_idx)
+
+    def finish_cuda_graph_replay(self, batch, dummy_req) -> None:
+        if not batch.is_decode or batch.size != 1:
+            return
+        real_req = batch.reqs[0]
+        if real_req.table_idx == dummy_req.table_idx:
+            return
+        for layer in self.model.layers.op_list:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                linear_attn.copy_state(dummy_req.table_idx, real_req.table_idx)
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         self.model.linear_state_cache.clear(table_idx)

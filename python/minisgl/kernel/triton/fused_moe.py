@@ -221,3 +221,137 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
+def fused_moe_w2_silu_int8_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+    filter_expert: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    if filter_expert and off_experts == -1:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type),
+            mask=c_mask,
+        )
+        return
+
+    b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+    b_scale = tl.load(b_scale_ptrs)
+
+    gate_base_ptrs = a_ptr + offs_token[:, None] * stride_am
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    a_scale = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        curr_k = k * BLOCK_SIZE_K + offs_k
+        k_mask = curr_k < K
+        gate = tl.load(
+            gate_base_ptrs + curr_k[None, :] * stride_ak,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            gate_base_ptrs + (curr_k[None, :] + K) * stride_ak,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        silu = gate * tl.sigmoid(gate)
+        act = silu * up
+        a_scale = tl.maximum(a_scale, tl.max(tl.abs(act), axis=1))
+
+    a_scale = tl.maximum(a_scale / 127.0, 1e-10)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        curr_k = k * BLOCK_SIZE_K + offs_k
+        k_mask = curr_k < K
+        gate = tl.load(
+            gate_base_ptrs + curr_k[None, :] * stride_ak,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            gate_base_ptrs + (curr_k[None, :] + K) * stride_ak,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        silu = gate * tl.sigmoid(gate)
+        act = silu * up
+        q = tl.extra.cuda.libdevice.llrint(act / a_scale[:, None])
+        q = tl.maximum(tl.minimum(q, 127.0), -128.0).to(tl.int8)
+
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + curr_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        if even_Ks:
+            b = tl.load(b_ptrs)
+        else:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0)
+        accumulator += tl.dot(q, b)
+
+    accumulator *= a_scale[:, None] * b_scale
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)

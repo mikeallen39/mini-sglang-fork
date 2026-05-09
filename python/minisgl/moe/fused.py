@@ -17,6 +17,7 @@ _FUSED_MOE_PROFILE = {
     "count": 0,
 }
 _FUSED_MOE_PROFILE_INTERVAL = 100
+_ENABLE_FUSED_W2_SILU_INT8 = True
 logger = init_logger(__name__)
 
 
@@ -341,6 +342,7 @@ def fused_experts_impl(
 ) -> torch.Tensor:
     from minisgl.kernel import (
         fused_moe_kernel_triton,
+        fused_moe_w2_silu_int8_kernel_triton,
         moe_sum_reduce_triton,
         silu_and_mul_quant_int8_triton,
     )
@@ -376,8 +378,8 @@ def fused_experts_impl(
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    use_int8_stage2_fused_quant = w2.dtype == torch.int8 and activation == "silu"
-    if use_int8_stage2_fused_quant:
+    use_int8_stage2_int8 = w2.dtype == torch.int8 and activation == "silu"
+    if use_int8_stage2_int8:
         intermediate_cache2 = _get_workspace_tensor(
             device=hidden_states.device,
             dtype=torch.int8,
@@ -398,8 +400,11 @@ def fused_experts_impl(
             shape=(M * topk_ids.shape[1], N // 2),
         )
         intermediate_cache2_scale = None
-    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
-        (M, topk_ids.shape[1], w2.shape[1]),
+    intermediate_cache3 = _get_workspace_tensor(
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+        name="stage3_out",
+        shape=(M, topk_ids.shape[1], w2.shape[1]),
     )
     compute_type = hidden_states.dtype
 
@@ -448,7 +453,7 @@ def fused_experts_impl(
     if profile_enabled:
         e1.record()
     FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
-    if use_int8_stage2_fused_quant:
+    if use_int8_stage2_int8:
         silu_and_mul_quant_int8_triton(
             intermediate_cache1.view(-1, N),
             intermediate_cache2,
@@ -458,23 +463,40 @@ def fused_experts_impl(
         FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
     if profile_enabled:
         e2.record()
-    fused_moe_kernel_triton(
-        intermediate_cache2,
-        w2,
-        (intermediate_cache3),
-        intermediate_cache2_scale,
-        w2_scale,
-        curr_topk_weights,
-        curr_topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        not apply_router_weight_on_input,
-        1,
-        config,
-        compute_type=compute_type,
-        filter_expert=filter_expert,
-    )
+    if use_int8_stage2_int8 and _ENABLE_FUSED_W2_SILU_INT8:
+        fused_moe_w2_silu_int8_kernel_triton(
+            intermediate_cache1.view(-1, N),
+            w2,
+            intermediate_cache3,
+            w2_scale,
+            curr_topk_weights,
+            curr_topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            config,
+            compute_type=compute_type,
+            filter_expert=filter_expert,
+        )
+    else:
+        fused_moe_kernel_triton(
+            intermediate_cache2,
+            w2,
+            (intermediate_cache3),
+            intermediate_cache2_scale,
+            w2_scale,
+            curr_topk_weights,
+            curr_topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type=compute_type,
+            filter_expert=filter_expert,
+        )
     if profile_enabled:
         e3.record()
 

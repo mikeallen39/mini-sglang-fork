@@ -7,6 +7,7 @@ from minisgl.layers import BaseOP
 
 if TYPE_CHECKING:
     import torch
+    from minisgl.core import Batch, Req
 
 
 class BaseLLMModel(ABC, BaseOP):
@@ -20,6 +21,12 @@ class BaseLLMModel(ABC, BaseOP):
     @property
     def supports_cuda_graph(self) -> bool:
         return True
+
+    def prepare_for_cuda_graph_replay(self, batch: Batch, dummy_req: Req) -> None:
+        _ = batch, dummy_req
+
+    def finish_cuda_graph_replay(self, batch: Batch, dummy_req: Req) -> None:
+        _ = batch, dummy_req
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         _ = table_idx

@@ -64,7 +64,11 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    result = sorted({bs for bs in candidates if bs <= cuda_graph_max_bs})
+    if 1 not in result:
+        result.insert(0, 1)
+    return result
 
 
 def mem_GB(size: int) -> str:

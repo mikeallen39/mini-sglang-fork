@@ -251,7 +251,9 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
+                self.model.prepare_for_cuda_graph_replay(batch, self.dummy_req)
                 logits = self.graph_runner.replay(batch)
+                self.model.finish_cuda_graph_replay(batch, self.dummy_req)
             else:
                 logits = self.model.forward()
 
@@ -322,9 +324,14 @@ def _adjust_config(config: EngineConfig):
     if config.linear_attn_backend == "sglang":
         if not has_sglang_linear_attn_kernel():
             raise ValueError("linear_attn_backend='sglang' requires Triton")
-        if config.cuda_graph_max_bs != 0:
+        if config.cuda_graph_max_bs not in (0, None, 1):
             override("cuda_graph_max_bs", 0)
-            logger.warning_rank0("CUDA graph is disabled for the sglang linear attention backend")
+            logger.warning_rank0(
+                "CUDA graph is restricted to bs=1 for the sglang linear attention backend"
+            )
+        elif config.cuda_graph_max_bs is None:
+            override("cuda_graph_max_bs", 1)
+            logger.info_rank0("Enable CUDA graph with bs=1 for the sglang linear attention backend")
 
     if config.ep_info.size > 1 and config.moe_backend == "torch" and config.cuda_graph_max_bs != 0:
         override("cuda_graph_max_bs", 0)

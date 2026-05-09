@@ -51,6 +51,8 @@ def measure_one(base_url: str, model: str, prompt: str, output_len: int, tokeniz
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": output_len,
         "temperature": 0.0,
+        "top_k": 1,
+        "ignore_eos": True,
         "stream": True,
     }
     headers = {"Content-Type": "application/json", "Authorization": "Bearer dummy"}

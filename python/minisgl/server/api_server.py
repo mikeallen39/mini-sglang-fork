@@ -218,6 +218,40 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    async def collect_chat_completion(self, uid: int) -> dict:
+        first_chunk = True
+        saw_role_marker = False
+        pieces: List[str] = []
+        finish_reason = "stop"
+        async for ack in self.wait_for_ack(uid):
+            text, hit_role_marker = _strip_role_marker(ack.incremental_output)
+            if first_chunk:
+                text = text.lstrip("\n")
+                first_chunk = False
+            if text:
+                pieces.append(text)
+            if hit_role_marker:
+                saw_role_marker = True
+                break
+            if ack.finished:
+                break
+        if saw_role_marker:
+            asyncio.create_task(self.abort_user(uid))
+        content = "".join(pieces)
+        return {
+            "id": f"cmpl-{uid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.config.model_path,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         try:
             async for chunk in generator:
@@ -317,10 +351,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         )
     )
 
-    return StreamingResponse(
-        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
-        media_type="text/event-stream",
-    )
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            media_type="text/event-stream",
+        )
+
+    return await state.collect_chat_completion(uid)
 
 
 @app.get("/v1/models")
