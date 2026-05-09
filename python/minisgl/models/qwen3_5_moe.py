@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
+from minisgl.kernel import silu_and_mul_quant_int8_triton
 from minisgl.linear_attention import (
     fused_gdn_gating_sglang,
     fused_linear_attn_decode_sglang,
@@ -24,6 +25,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
     silu_and_mul,
 )
+from minisgl.quantization import apply_w8a8_int8_linear_from_prequantized
 from minisgl.utils import div_even, get_linear_attn_backend, local_kv_heads, nvtx_annotate
 from minisgl.utils.logger import init_logger
 
@@ -220,6 +222,31 @@ class Qwen3_5SharedExpert(BaseOP):
         self.down_proj.quantize_in_moe_only = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.gate_up_proj.weight.dtype == torch.int8
+            and self.gate_up_proj.weight_scale is not None
+            and self.down_proj.weight.dtype == torch.int8
+            and self.down_proj.weight_scale is not None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.is_contiguous()
+        ):
+            gate_up = self.gate_up_proj.forward(x)
+            inter_q = torch.empty(
+                (gate_up.shape[0], gate_up.shape[1] // 2),
+                device=gate_up.device,
+                dtype=torch.int8,
+            )
+            inter_s = torch.empty((gate_up.shape[0], 1), device=gate_up.device, dtype=torch.float32)
+            silu_and_mul_quant_int8_triton(gate_up, inter_q, inter_s)
+            return apply_w8a8_int8_linear_from_prequantized(
+                inter_q,
+                inter_s,
+                self.down_proj.weight,
+                self.down_proj.weight_scale,
+                out_dtype=x.dtype,
+                bias=self.down_proj.bias,
+            )
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
@@ -314,24 +341,14 @@ class Qwen3_5LinearAttention(BaseOP):
         )
         from minisgl.layers import LinearColParallelMerged
 
-        self.in_proj_qkv = LinearColParallelMerged(
+        self.in_proj_qkvz = LinearColParallelMerged(
             config.hidden_size,
-            [self.key_dim, self.key_dim, self.value_dim],
+            [self.key_dim, self.key_dim, self.value_dim, self.value_dim],
             has_bias=False,
         )
-        self.in_proj_z = LinearColParallelMerged(
+        self.in_proj_ba = LinearColParallelMerged(
             config.hidden_size,
-            [self.value_dim],
-            has_bias=False,
-        )
-        self.in_proj_b = LinearColParallelMerged(
-            config.hidden_size,
-            [config.linear_num_value_heads],
-            has_bias=False,
-        )
-        self.in_proj_a = LinearColParallelMerged(
-            config.hidden_size,
-            [config.linear_num_value_heads],
+            [config.linear_num_value_heads, config.linear_num_value_heads],
             has_bias=False,
         )
         self.norm = Qwen3_5RMSNormGated(config.linear_value_head_dim, eps=config.rms_norm_eps)
@@ -343,6 +360,10 @@ class Qwen3_5LinearAttention(BaseOP):
         self.A_log = torch.empty(self.num_v_heads)
         self.dt_bias = torch.empty(self.num_v_heads)
         self.backend = get_linear_attn_backend()
+        self._gather_idx: torch.Tensor | None = None
+        self._decode_state_index: torch.Tensor | None = None
+        self._A_log_fp32: torch.Tensor | None = None
+        self._dt_bias_fp32: torch.Tensor | None = None
 
         assert self.num_v_heads % self.num_k_heads == 0, "Expected grouped value heads."
         self.kv_group_size = self.num_v_heads // self.num_k_heads
@@ -382,10 +403,36 @@ class Qwen3_5LinearAttention(BaseOP):
         key = key.view(-1, self.num_k_heads, self.head_k_dim)
         value = value.view(-1, self.num_v_heads, self.head_v_dim)
         z = z.view(-1, self.num_v_heads, self.head_v_dim)
-        gather_idx = torch.arange(self.num_v_heads, device=query.device) // self.kv_group_size
+        gather_idx = self._get_gather_idx(query.device)
         query = query[:, gather_idx, :]
         key = key[:, gather_idx, :]
         return query, key, value, z
+
+    def _get_gather_idx(self, device: torch.device) -> torch.Tensor:
+        if self._gather_idx is None or self._gather_idx.device != device:
+            self._gather_idx = torch.arange(self.num_v_heads, device=device) // self.kv_group_size
+        return self._gather_idx
+
+    def _get_decode_state_index(self, device: torch.device) -> torch.Tensor:
+        if self._decode_state_index is None or self._decode_state_index.device != device:
+            self._decode_state_index = torch.tensor([0], dtype=torch.int32, device=device)
+        return self._decode_state_index
+
+    def _get_A_log_fp32(self) -> torch.Tensor:
+        if self._A_log_fp32 is None or self._A_log_fp32.device != self.A_log.device:
+            self._A_log_fp32 = self.A_log.float().contiguous()
+        return self._A_log_fp32
+
+    def _get_dt_bias_fp32(self) -> torch.Tensor:
+        if self._dt_bias_fp32 is None or self._dt_bias_fp32.device != self.dt_bias.device:
+            self._dt_bias_fp32 = self.dt_bias.float().contiguous()
+        return self._dt_bias_fp32
+
+    def process_weights_after_loading(self) -> None:
+        self._A_log_fp32 = self.A_log.float().contiguous()
+        self._dt_bias_fp32 = self.dt_bias.float().contiguous()
+        self._gather_idx = torch.arange(self.num_v_heads, device=self.A_log.device) // self.kv_group_size
+        self._decode_state_index = torch.tensor([0], dtype=torch.int32, device=self.A_log.device)
 
     def _forward_one_req(
         self,
@@ -453,17 +500,17 @@ class Qwen3_5LinearAttention(BaseOP):
 
         a = a.float().contiguous()
         b = b.float().contiguous()
-        A_log = self.A_log.float().contiguous()
-        dt_bias = self.dt_bias.float().contiguous()
+        A_log = self._get_A_log_fp32()
+        dt_bias = self._get_dt_bias_fp32()
         if is_decode:
             if mixed_qkv.shape[0] != 1:
                 raise ValueError(
                     "Decode batches must have exactly one extend token per request for linear attention"
                 )
-            state = ssm_state.unsqueeze(0).contiguous()
-            state_indices = torch.tensor([0], dtype=torch.int32, device=mixed_qkv.device)
+            state = ssm_state.unsqueeze(0)
+            state_indices = self._get_decode_state_index(mixed_qkv.device)
             outputs = fused_linear_attn_decode_sglang(
-                mixed_qkv.contiguous(),
+                mixed_qkv,
                 a,
                 b,
                 A_log,
@@ -472,7 +519,6 @@ class Qwen3_5LinearAttention(BaseOP):
                 state_indices,
                 self.scale,
             )
-            ssm_state.copy_(state.squeeze(0))
         else:
             query, key, value, _ = self._reshape_qkv(mixed_qkv, z)
             gate, beta = fused_gdn_gating_sglang(A_log, a, b, dt_bias)
@@ -490,10 +536,12 @@ class Qwen3_5LinearAttention(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
-        mixed_qkv = self.in_proj_qkv.forward(x)
-        z = self.in_proj_z.forward(x)
-        b = self.in_proj_b.forward(x)
-        a = self.in_proj_a.forward(x)
+        mixed_qkvz = self.in_proj_qkvz.forward(x)
+        mixed_ba = self.in_proj_ba.forward(x)
+        mixed_qkv, z = mixed_qkvz.split(
+            [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
+        )
+        b, a = mixed_ba.split([self.num_v_heads, self.num_v_heads], dim=-1)
 
         outputs = []
         offset = 0

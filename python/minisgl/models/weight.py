@@ -250,6 +250,77 @@ def _stream_qwen3_5_local_qkv(
     return _set_module_tensor(module_dict, fused_key, fused)
 
 
+def _stream_qwen3_5_linear_attn_proj(
+    config,
+    model,
+    module_dict,
+    raw_name: str,
+    tensor: torch.Tensor,
+    device: torch.device,
+) -> bool:
+    if config.architectures[0] not in {"Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"}:
+        return False
+    if ".linear_attn." not in raw_name:
+        return False
+
+    base_name = raw_name
+    if base_name.startswith("model.language_model."):
+        base_name = f"model.{base_name.removeprefix('model.language_model.')}"
+    elif base_name.startswith("language_model."):
+        base_name = f"model.{base_name.removeprefix('language_model.')}"
+    if base_name.startswith("model.layers."):
+        parts = base_name.split(".")
+        if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) >= config.num_layers:
+            return False
+
+    if base_name.endswith(".in_proj_qkv.weight"):
+        fused_key = base_name.replace(".in_proj_qkv.weight", ".in_proj_qkvz.weight")
+        slot = "qkv"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".in_proj_z.weight"):
+        fused_key = base_name.replace(".in_proj_z.weight", ".in_proj_qkvz.weight")
+        slot = "z"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".in_proj_b.weight"):
+        fused_key = base_name.replace(".in_proj_b.weight", ".in_proj_ba.weight")
+        slot = "b"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".in_proj_a.weight"):
+        fused_key = base_name.replace(".in_proj_a.weight", ".in_proj_ba.weight")
+        slot = "a"
+        expected_type = "LinearColParallelMerged"
+    else:
+        return False
+
+    if fused_key not in module_dict:
+        return False
+
+    module, attr_name = module_dict[fused_key]
+    if attr_name != "weight" or type(module).__name__ != expected_type:
+        return False
+
+    if not hasattr(module, "_stacked_params"):
+        module._stacked_params = {}
+    module._stacked_params[slot] = tensor
+
+    if slot in {"qkv", "z"}:
+        if "qkv" not in module._stacked_params or "z" not in module._stacked_params:
+            return True
+        fused = torch.cat(
+            [module._stacked_params.pop("qkv"), module._stacked_params.pop("z")],
+            dim=0,
+        ).to(device=device)
+        return _set_module_tensor(module_dict, fused_key, fused)
+
+    if "b" not in module._stacked_params or "a" not in module._stacked_params:
+        return True
+    fused = torch.cat(
+        [module._stacked_params.pop("b"), module._stacked_params.pop("a")],
+        dim=0,
+    ).to(device=device)
+    return _set_module_tensor(module_dict, fused_key, fused)
+
+
 def _get_local_expert_layout(num_experts: int) -> tuple[int, int, int]:
     ep_info = get_ep_info()
     if ep_info.size == 1:
@@ -402,6 +473,15 @@ def load_weight_to_model(
                     )
 
                     if _stream_qwen3_5_local_qkv(
+                        config,
+                        model,
+                        module_dict,
+                        raw_name,
+                        tensor,
+                        device,
+                    ):
+                        continue
+                    if _stream_qwen3_5_linear_attn_proj(
                         config,
                         model,
                         module_dict,

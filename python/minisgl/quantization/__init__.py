@@ -56,22 +56,30 @@ def quantize_activation_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, t
     if x.ndim < 2:
         raise ValueError(f"Expected an input with ndim >= 2, got ndim={x.ndim}")
     x = x.contiguous()
+    if x.is_cuda and x.ndim == 2:
+        try:
+            from minisgl.kernel.activation_quant import per_token_quant_int8_triton
+
+            x_q = torch.empty_like(x, dtype=torch.int8)
+            scales = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
+            per_token_quant_int8_triton(x, x_q, scales)
+            return x_q, scales
+        except Exception:
+            pass
     x_fp32 = x.to(torch.float32)
     scales = x_fp32.abs().amax(dim=-1, keepdim=True).clamp_min_(1e-10) / 127.0
     x_q = torch.round(x_fp32 / scales).clamp_(-128, 127).to(torch.int8)
     return x_q, scales.contiguous()
 
 
-def apply_w8a8_int8_linear(
-    x: torch.Tensor,
+def _apply_int8_scaled_mm(
+    x_q_2d: torch.Tensor,
+    x_scale_2d: torch.Tensor,
     qweight_t: torch.Tensor,
     weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    x_q, x_scale = quantize_activation_per_token_int8(x)
-    x_q_2d = x_q.view(-1, x_q.shape[-1])
-    x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-
     int8_scaled_mm = None
     try:
         from .int8_cuda_ext import int8_scaled_mm as _int8_scaled_mm
@@ -86,11 +94,11 @@ def apply_w8a8_int8_linear(
             qweight_t,
             x_scale_2d,
             weight_scale,
-            out_dtype=x.dtype,
+            out_dtype=out_dtype,
             bias=bias,
         )
         if output is not None:
-            return output.view(*x.shape[:-1], qweight_t.shape[1])
+            return output
 
     try:
         from sgl_kernel import int8_scaled_mm as _int8_scaled_mm
@@ -108,56 +116,88 @@ def apply_w8a8_int8_linear(
             int8_scaled_mm = None
 
     if int8_scaled_mm is not None:
-        output = int8_scaled_mm(
+        return int8_scaled_mm(
             x_q_2d,
             qweight_t,
             x_scale_2d,
             weight_scale,
-            out_dtype=x.dtype,
+            out_dtype=out_dtype,
             bias=bias,
         )
-    else:
-        # Prefer PyTorch's int8 GEMM when the dedicated sgl_kernel op is
-        # unavailable. torch._int_mm requires M > 16 on CUDA, so pad decode-size
-        # batches to keep the fast path available for small token counts.
-        use_torch_int_mm = (
-            x_q_2d.is_cuda
-            and hasattr(torch, "_int_mm")
-            and x_q_2d.shape[1] % 16 == 0
-            and qweight_t.shape[0] % 16 == 0
-            and qweight_t.shape[1] > 0
-            and qweight_t.shape[1] % 8 == 0
-        )
-        if use_torch_int_mm:
-            try:
-                padded_m = max(x_q_2d.shape[0], 17)
-                if padded_m != x_q_2d.shape[0]:
-                    padded_x_q = torch.zeros(
-                        (padded_m, x_q_2d.shape[1]),
-                        dtype=x_q_2d.dtype,
-                        device=x_q_2d.device,
-                    )
-                    padded_x_q[: x_q_2d.shape[0]] = x_q_2d
-                    output = torch._int_mm(padded_x_q, qweight_t)[: x_q_2d.shape[0]]
-                else:
-                    output = torch._int_mm(x_q_2d, qweight_t)
-                output = output.to(torch.float32)
-            except Exception:
-                output = torch.matmul(
-                    x_q_2d.to(torch.float32), qweight_t.to(torch.float32)
-                )
-        else:
-            # Conservative fallback for environments without CUDA int8 GEMM.
-            output = torch.matmul(
-                x_q_2d.to(torch.float32), qweight_t.to(torch.float32)
-            )
-        output = output * x_scale_2d.to(torch.float32)
-        output = output * weight_scale.view(1, -1).to(torch.float32)
-        if bias is not None:
-            output = output + bias.to(torch.float32)
-        output = output.to(x.dtype)
 
-    return output.view(*x.shape[:-1], qweight_t.shape[1])
+    # Prefer PyTorch's int8 GEMM when the dedicated sgl_kernel op is
+    # unavailable. torch._int_mm requires M > 16 on CUDA, so pad decode-size
+    # batches to keep the fast path available for small token counts.
+    use_torch_int_mm = (
+        x_q_2d.is_cuda
+        and hasattr(torch, "_int_mm")
+        and x_q_2d.shape[1] % 16 == 0
+        and qweight_t.shape[0] % 16 == 0
+        and qweight_t.shape[1] > 0
+        and qweight_t.shape[1] % 8 == 0
+    )
+    if use_torch_int_mm:
+        try:
+            padded_m = max(x_q_2d.shape[0], 17)
+            if padded_m != x_q_2d.shape[0]:
+                padded_x_q = torch.zeros(
+                    (padded_m, x_q_2d.shape[1]),
+                    dtype=x_q_2d.dtype,
+                    device=x_q_2d.device,
+                )
+                padded_x_q[: x_q_2d.shape[0]] = x_q_2d
+                output = torch._int_mm(padded_x_q, qweight_t)[: x_q_2d.shape[0]]
+            else:
+                output = torch._int_mm(x_q_2d, qweight_t)
+            output = output.to(torch.float32)
+        except Exception:
+            output = torch.matmul(x_q_2d.to(torch.float32), qweight_t.to(torch.float32))
+    else:
+        # Conservative fallback for environments without CUDA int8 GEMM.
+        output = torch.matmul(x_q_2d.to(torch.float32), qweight_t.to(torch.float32))
+    output = output * x_scale_2d.to(torch.float32)
+    output = output * weight_scale.view(1, -1).to(torch.float32)
+    if bias is not None:
+        output = output + bias.to(torch.float32)
+    return output.to(out_dtype)
+
+
+def apply_w8a8_int8_linear_from_prequantized(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    qweight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    x_q_2d = x_q.view(-1, x_q.shape[-1])
+    x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+    output = _apply_int8_scaled_mm(
+        x_q_2d,
+        x_scale_2d,
+        qweight_t,
+        weight_scale,
+        out_dtype,
+        bias,
+    )
+    return output.view(*x_q.shape[:-1], qweight_t.shape[1])
+
+
+def apply_w8a8_int8_linear(
+    x: torch.Tensor,
+    qweight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    x_q, x_scale = quantize_activation_per_token_int8(x)
+    return apply_w8a8_int8_linear_from_prequantized(
+        x_q,
+        x_scale,
+        qweight_t,
+        weight_scale,
+        out_dtype=x.dtype,
+        bias=bias,
+    )
 
 
 def process_weights_after_loading(root: object) -> None:
