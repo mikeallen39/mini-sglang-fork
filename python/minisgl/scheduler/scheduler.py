@@ -1,9 +1,8 @@
 from __future__ import annotations
-
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from minisgl.core import Batch, Req
+from minisgl.core import Batch, Req, SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
     AbortBackendMsg,
@@ -46,6 +45,7 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
+        self.config = config
         self.engine = Engine(config)
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -90,6 +90,7 @@ class Scheduler(SchedulerIOMixin):
         self.page_size = config.page_size
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self._run_startup_prewarm()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -247,6 +248,53 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+
+    def _run_startup_prewarm(self) -> None:
+        if not self.tp_info.is_primary() or self.tp_info.size != 1:
+            return
+        if self.config.quantization != "w8a8_int8_moe_only":
+            return
+        if self.config.moe_backend != "fused":
+            return
+        if self.config.linear_attn_backend != "sglang":
+            return
+
+        prewarm_lengths = [64, 256]
+        logger.info_rank0(f"Start Triton prewarm for prefill lengths: {prewarm_lengths}")
+        with self.engine_stream_ctx:
+            self.engine.stream.wait_stream(self.stream)
+            for length in prewarm_lengths:
+                self._run_prefill_prewarm_once(length)
+            torch.cuda.synchronize(self.device)
+        logger.info_rank0("Triton prewarm finished.")
+
+    def _run_prefill_prewarm_once(self, input_len: int) -> None:
+        table_idx = self.table_manager.allocate()
+        cache_handle = self.cache_manager.manager.match_prefix(
+            torch.empty(0, dtype=torch.int32)
+        )[0]
+        self.cache_manager.lock(cache_handle)
+        sampling_params = SamplingParams(max_tokens=1)
+        req = Req(
+            input_ids=torch.zeros(input_len, dtype=torch.int32),
+            table_idx=table_idx,
+            cached_len=0,
+            output_len=1,
+            uid=-1000 - input_len,
+            sampling_params=sampling_params,
+            cache_handle=cache_handle,
+        )
+        self.token_pool[table_idx][:input_len].zero_()
+
+        try:
+            batch = Batch(reqs=[req], phase="prefill")
+            forward_input = self._prepare_batch(batch)
+            _, next_tokens_cpu, copy_done = self._forward(forward_input)
+            copy_done.synchronize()
+            del next_tokens_cpu
+        finally:
+            with self.cache_manager.lazy_free_region():
+                self._free_req_resources(req)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

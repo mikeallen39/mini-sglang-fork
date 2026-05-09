@@ -25,6 +25,7 @@ def fused_moe_kernel_triton(
 
     from .triton.fused_moe import fused_moe_kernel
     from minisgl.quantization import quantize_activation_per_token_int8
+    from .activation_quant import per_token_quant_int8_triton
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -35,7 +36,13 @@ def fused_moe_kernel_triton(
         if B_scale is None:
             raise ValueError("B_scale must be provided for int8 fused MoE")
         if A_scale is None:
-            A, A_scale = quantize_activation_per_token_int8(A)
+            if A.is_cuda and A.ndim == 2 and A.is_contiguous():
+                q = torch.empty_like(A, dtype=torch.int8)
+                s = torch.empty((A.shape[0], 1), device=A.device, dtype=torch.float32)
+                per_token_quant_int8_triton(A, q, s)
+                A, A_scale = q, s
+            else:
+                A, A_scale = quantize_activation_per_token_int8(A)
         else:
             A = A.contiguous()
     A_scale_arg = A if A_scale is None else A_scale

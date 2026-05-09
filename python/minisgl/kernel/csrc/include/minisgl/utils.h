@@ -10,7 +10,41 @@
 
 namespace minisgl_compat {
 
-#if defined(__has_include)
+// nvcc + libstdc++11's <source_location> is still fragile in CUDA translation
+// units on this host even with C++20 enabled, so CUDA code always uses the
+// lightweight local compatibility type instead.
+#if defined(__CUDACC__)
+struct source_location {
+  static constexpr auto current(const char *file = __builtin_FILE(),
+                                const char *function = __builtin_FUNCTION(),
+                                std::uint_least32_t line = __builtin_LINE(),
+                                std::uint_least32_t column = 0) noexcept
+      -> source_location {
+    return source_location(file, function, line, column);
+  }
+
+  constexpr source_location(const char *file = "unknown",
+                            const char *function = "",
+                            std::uint_least32_t line = 0,
+                            std::uint_least32_t column = 0) noexcept
+      : m_file(file), m_function(function), m_line(line), m_column(column) {}
+
+  constexpr auto file_name() const noexcept -> const char * { return m_file; }
+  constexpr auto function_name() const noexcept -> const char * {
+    return m_function;
+  }
+  constexpr auto line() const noexcept -> std::uint_least32_t { return m_line; }
+  constexpr auto column() const noexcept -> std::uint_least32_t {
+    return m_column;
+  }
+
+private:
+  const char *m_file;
+  const char *m_function;
+  std::uint_least32_t m_line;
+  std::uint_least32_t m_column;
+};
+#elif defined(__has_include)
 #if __has_include(<source_location>)
 #include <source_location>
 using source_location = std::source_location;

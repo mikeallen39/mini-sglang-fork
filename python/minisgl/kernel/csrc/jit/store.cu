@@ -18,7 +18,8 @@ struct StoreKernelParams {
   const void *__restrict__ k;
   const void *__restrict__ v;
   std::size_t kv_cache_stride;
-  std::size_t kv_input_stride;
+  std::size_t k_input_stride;
+  std::size_t v_input_stride;
   std::size_t length;
 };
 
@@ -32,8 +33,8 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
       static_cast<unsigned>(kNumThreads / kWarpThreads);
   static_assert(kNumThreads % kWarpThreads == 0);
 
-  const auto &[k_cache, v_cache, indices, k, v, kv_cache_stride,
-               kv_input_stride, length] = params;
+  const auto &[k_cache, v_cache, indices, k, v, kv_cache_stride, k_input_stride,
+               v_input_stride, length] = params;
   const auto warp_id =
       (threadIdx.x / kWarpThreads) + blockIdx.x * kWarpPerBlock;
   PDL::wait<kUsePDL>();
@@ -42,10 +43,10 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
   if (warp_id < length) {
     const auto pos = static_cast<const T *>(indices)[warp_id];
     const auto dst_k = pointer::offset(k_cache, pos * kv_cache_stride);
-    const auto src_k = pointer::offset(k, warp_id * kv_input_stride);
+    const auto src_k = pointer::offset(k, warp_id * k_input_stride);
     warp::copy<kElementSize>(dst_k, src_k);
     const auto dst_v = pointer::offset(v_cache, pos * kv_cache_stride);
-    const auto src_v = pointer::offset(v, warp_id * kv_input_stride);
+    const auto src_v = pointer::offset(v, warp_id * v_input_stride);
     warp::copy<kElementSize>(dst_v, src_v);
   }
 
@@ -65,7 +66,8 @@ struct StoreKernel {
     auto D = SymbolicSize{"D"}; // element size
     auto L = SymbolicSize{"L"}; // length
     auto X = SymbolicSize{"X"}; // stride kv cache
-    auto Y = SymbolicSize{"Y"}; // stride kv input
+    auto Yk = SymbolicSize{"Yk"}; // stride k input
+    auto Yv = SymbolicSize{"Yv"}; // stride v input
     auto indices_dtype_ = SymbolicDType{};
     auto dtype_ = SymbolicDType{};
     auto device_ = SymbolicDevice{};
@@ -77,10 +79,14 @@ struct StoreKernel {
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
-        .with_strides({Y, 1})
+        .with_strides({Yk, 1})
         .with_device<kDLCUDA>(device_)
         .with_dtype(dtype_)
-        .verify(k)
+        .verify(k);
+    TensorMatcher({L, D}) //
+        .with_strides({Yv, 1})
+        .with_device<kDLCUDA>(device_)
+        .with_dtype(dtype_)
         .verify(v);
     TensorMatcher({L}) //
         .with_device<kDLCUDA>(device_)
@@ -94,7 +100,8 @@ struct StoreKernel {
     const auto use_int32 = indices_dtype_.unwrap().bits == 32;
     const auto length = static_cast<std::size_t>(L.unwrap());
     const auto kv_cache_stride = X.unwrap() * dtype_size;
-    const auto kv_input_stride = Y.unwrap() * dtype_size;
+    const auto k_input_stride = Yk.unwrap() * dtype_size;
+    const auto v_input_stride = Yv.unwrap() * dtype_size;
 
     const auto params = StoreKernelParams{
         .k_cache = k_cache.data_ptr(),
@@ -103,7 +110,8 @@ struct StoreKernel {
         .k = k.data_ptr(),
         .v = v.data_ptr(),
         .kv_cache_stride = kv_cache_stride,
-        .kv_input_stride = kv_input_stride,
+        .k_input_stride = k_input_stride,
+        .v_input_stride = v_input_stride,
         .length = length,
     };
 

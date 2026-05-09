@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.quantization import (
     apply_w8a8_int8_linear,
-    is_w8a8_int8_enabled,
+    is_w8a8_int8_full_linear_enabled,
     quantize_weight_per_channel_int8,
 )
 from minisgl.utils import div_even
@@ -69,7 +69,7 @@ class _LinearTPImpl(BaseOP):
         return F.linear(x, self.weight, self.bias)
 
     def process_weights_after_loading(self) -> None:
-        if not is_w8a8_int8_enabled() or self.weight.dtype == torch.int8:
+        if not is_w8a8_int8_full_linear_enabled() or self.weight.dtype == torch.int8:
             return
         self.weight, self.weight_scale = quantize_weight_per_channel_int8(self.weight)
 

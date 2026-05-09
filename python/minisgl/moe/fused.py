@@ -193,24 +193,63 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
-    sgl_moe_align_block_size(
-        topk_ids,
-        num_experts + 1,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        cumsum_buffer,
-        True,
+
+    try:
+        from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+        cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
+    except Exception:
+        pass
+
+    return _moe_align_block_size_torch(topk_ids, block_size, num_experts)
+
+
+def _moe_align_block_size_torch(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat_topk = topk_ids.reshape(-1).to(torch.int32)
+    sentinel_token = flat_topk.numel()
+
+    max_num_tokens_padded = flat_topk.numel() + (num_experts + 1) * (block_size - 1)
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,),
+        sentinel_token,
+        dtype=torch.int32,
+        device=topk_ids.device,
     )
+    max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
+    expert_ids = torch.full((max_num_m_blocks,), -1, dtype=torch.int32, device=topk_ids.device)
+
+    write_offset = 0
+    for expert in range(-1, num_experts):
+        token_positions = torch.nonzero(flat_topk == expert, as_tuple=False).flatten().to(torch.int32)
+        count = token_positions.numel()
+        if count == 0:
+            continue
+
+        padded_count = div_ceil(count, block_size) * block_size
+        end_offset = write_offset + padded_count
+        sorted_ids[write_offset : write_offset + count] = token_positions
+        expert_ids[write_offset // block_size : end_offset // block_size] = expert
+        write_offset = end_offset
+
+    num_tokens_post_pad = torch.tensor([write_offset], dtype=torch.int32, device=topk_ids.device)
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
@@ -261,7 +300,11 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     filter_expert: bool = False,
 ) -> torch.Tensor:
-    from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
+    from minisgl.kernel import (
+        fused_moe_kernel_triton,
+        moe_sum_reduce_triton,
+        silu_and_mul_quant_int8_triton,
+    )
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
     padded_size = 0
@@ -293,11 +336,25 @@ def fused_experts_impl(
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    use_int8_stage2_fused_quant = w2.dtype == torch.int8 and activation == "silu"
+    if use_int8_stage2_fused_quant:
+        intermediate_cache2 = torch.empty(
+            (M * topk_ids.shape[1], N // 2),
+            device=hidden_states.device,
+            dtype=torch.int8,
+        )
+        intermediate_cache2_scale = torch.empty(
+            (M * topk_ids.shape[1], 1),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+    else:
+        intermediate_cache2 = torch.empty(
+            (M * topk_ids.shape[1], N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        intermediate_cache2_scale = None
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
@@ -338,12 +395,19 @@ def fused_experts_impl(
         filter_expert=filter_expert,
     )
     FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
-    FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    if use_int8_stage2_fused_quant:
+        silu_and_mul_quant_int8_triton(
+            intermediate_cache1.view(-1, N),
+            intermediate_cache2,
+            intermediate_cache2_scale,
+        )
+    else:
+        FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
         (intermediate_cache3),
-        None,
+        intermediate_cache2_scale,
         w2_scale,
         curr_topk_weights,
         curr_topk_ids,

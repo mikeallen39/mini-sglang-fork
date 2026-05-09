@@ -8,10 +8,10 @@ if TYPE_CHECKING:
 
 KERNEL_PATH = pathlib.Path(__file__).parent / "csrc"
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
-# nvcc 11.x on this host does not support -std=c++20 for CUDA compilation.
-# Use c++17 for runtime JIT kernels to keep the generated code compatible.
-DEFAULT_CFLAGS = ["-std=c++17", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++17", "-O3", "--expt-relaxed-constexpr"]
+# Runtime JIT kernels now use C++20-only constructs such as std::integral and
+# std::source_location, so the compilation standard must match.
+DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 

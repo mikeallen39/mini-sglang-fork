@@ -4,7 +4,7 @@ from typing import Iterable
 
 import torch
 
-SUPPORTED_QUANTIZATION = {None, "w8a8_int8"}
+SUPPORTED_QUANTIZATION = {None, "w8a8_int8", "w8a8_int8_moe_only"}
 
 _CURRENT_QUANTIZATION: str | None = None
 
@@ -21,7 +21,15 @@ def get_quantization() -> str | None:
 
 
 def is_w8a8_int8_enabled() -> bool:
+    return _CURRENT_QUANTIZATION in {"w8a8_int8", "w8a8_int8_moe_only"}
+
+
+def is_w8a8_int8_full_linear_enabled() -> bool:
     return _CURRENT_QUANTIZATION == "w8a8_int8"
+
+
+def is_w8a8_int8_moe_only_enabled() -> bool:
+    return _CURRENT_QUANTIZATION == "w8a8_int8_moe_only"
 
 
 def quantize_weight_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -60,19 +68,95 @@ def apply_w8a8_int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    from sgl_kernel import int8_scaled_mm
-
     x_q, x_scale = quantize_activation_per_token_int8(x)
     x_q_2d = x_q.view(-1, x_q.shape[-1])
     x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-    output = int8_scaled_mm(
-        x_q_2d,
-        qweight_t,
-        x_scale_2d,
-        weight_scale,
-        out_dtype=x.dtype,
-        bias=bias,
-    )
+
+    int8_scaled_mm = None
+    try:
+        from .int8_cuda_ext import int8_scaled_mm as _int8_scaled_mm
+
+        int8_scaled_mm = _int8_scaled_mm
+    except ImportError:
+        int8_scaled_mm = None
+
+    if int8_scaled_mm is not None:
+        output = int8_scaled_mm(
+            x_q_2d,
+            qweight_t,
+            x_scale_2d,
+            weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
+        )
+        if output is not None:
+            return output.view(*x.shape[:-1], qweight_t.shape[1])
+
+    try:
+        from sgl_kernel import int8_scaled_mm as _int8_scaled_mm
+
+        int8_scaled_mm = _int8_scaled_mm
+    except ImportError:
+        try:
+            from sgl_kernel.gemm import int8_scaled_mm as _int8_scaled_mm
+
+            if hasattr(torch.ops.sgl_kernel, "int8_scaled_mm"):
+                int8_scaled_mm = _int8_scaled_mm
+            else:
+                int8_scaled_mm = None
+        except ImportError:
+            int8_scaled_mm = None
+
+    if int8_scaled_mm is not None:
+        output = int8_scaled_mm(
+            x_q_2d,
+            qweight_t,
+            x_scale_2d,
+            weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
+        )
+    else:
+        # Prefer PyTorch's int8 GEMM when the dedicated sgl_kernel op is
+        # unavailable. torch._int_mm requires M > 16 on CUDA, so pad decode-size
+        # batches to keep the fast path available for small token counts.
+        use_torch_int_mm = (
+            x_q_2d.is_cuda
+            and hasattr(torch, "_int_mm")
+            and x_q_2d.shape[1] % 16 == 0
+            and qweight_t.shape[0] % 16 == 0
+            and qweight_t.shape[1] > 0
+            and qweight_t.shape[1] % 8 == 0
+        )
+        if use_torch_int_mm:
+            try:
+                padded_m = max(x_q_2d.shape[0], 17)
+                if padded_m != x_q_2d.shape[0]:
+                    padded_x_q = torch.zeros(
+                        (padded_m, x_q_2d.shape[1]),
+                        dtype=x_q_2d.dtype,
+                        device=x_q_2d.device,
+                    )
+                    padded_x_q[: x_q_2d.shape[0]] = x_q_2d
+                    output = torch._int_mm(padded_x_q, qweight_t)[: x_q_2d.shape[0]]
+                else:
+                    output = torch._int_mm(x_q_2d, qweight_t)
+                output = output.to(torch.float32)
+            except Exception:
+                output = torch.matmul(
+                    x_q_2d.to(torch.float32), qweight_t.to(torch.float32)
+                )
+        else:
+            # Conservative fallback for environments without CUDA int8 GEMM.
+            output = torch.matmul(
+                x_q_2d.to(torch.float32), qweight_t.to(torch.float32)
+            )
+        output = output * x_scale_2d.to(torch.float32)
+        output = output * weight_scale.view(1, -1).to(torch.float32)
+        if bias is not None:
+            output = output + bias.to(torch.float32)
+        output = output.to(x.dtype)
+
     return output.view(*x.shape[:-1], qweight_t.shape[1])
 
 
