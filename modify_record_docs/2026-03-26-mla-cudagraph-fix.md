@@ -2,56 +2,56 @@
 
 ## Summary
 
-This update fixed the remaining graph-only failure for GLM-4.7-Flash when using the
-MLA attention backend.
+这次更新修复了 GLM-4.7-Flash 在使用 MLA attention backend 时，剩余的
+仅在 graph 模式下出现的失败问题。
 
-Before this fix:
+修复前：
 
-- `graph off` was already correct
-- `graph on` failed in real end-to-end runs
-  - `tp=2, ep=2` produced garbled text
-  - `tp=2, ep=1` also produced garbled text
-  - `tp=1, ep=1` hit `CUDA error: an illegal memory access was encountered`
+- `graph off` 已经是正确的
+- `graph on` 在真实端到端运行中会失败
+  - `tp=2, ep=2` 会产生乱码
+  - `tp=2, ep=1` 也会产生乱码
+  - `tp=1, ep=1` 会触发 `CUDA error: an illegal memory access was encountered`
 
-This showed the remaining bug was not EP-specific and not TP-specific. The common
-factor was the MLA CUDA-graph path.
+这说明剩余问题既不是 EP 特有的，也不是 TP 特有的。共同因素是
+MLA CUDA-graph 路径。
 
 ## Root Cause
 
-`python/minisgl/attention/mla_backend.py` created normal
-`flashinfer.mla.BatchMLAPagedAttentionWrapper` instances for graph capture/replay.
+`python/minisgl/attention/mla_backend.py` 在 graph capture/replay 场景中，
+创建的是普通的 `flashinfer.mla.BatchMLAPagedAttentionWrapper` 实例。
 
-That meant the MLA graph path was missing the replay-safe static buffers required by
-FlashInfer when `use_cuda_graph=True`, especially:
+这意味着 MLA graph 路径缺少了 FlashInfer 在 `use_cuda_graph=True` 时，
+为 replay-safe 所必需的静态缓冲区，尤其是：
 
 - `qo_indptr`
 - `kv_indptr`
 - `kv_indices`
 - `kv_len_arr`
 
-In other words, the code was replaying an eager-style MLA wrapper instead of a real
-CUDA-graph-aware MLA wrapper.
+换句话说，代码回放的是 eager 风格的 MLA wrapper，而不是真正支持
+CUDA graph 的 MLA wrapper。
 
 ## Fix
 
-Updated:
+已更新：
 
 - `python/minisgl/attention/mla_backend.py`
 
-Change made in `MLABackend.init_capture_graph()`:
+在 `MLABackend.init_capture_graph()` 中做出的改动：
 
-- graph wrappers are now constructed with `use_cuda_graph=True`
-- replay buffers are explicitly bound from the preallocated capture storage:
+- 现在 graph wrappers 会以 `use_cuda_graph=True` 构造
+- 显式从预分配的 capture storage 绑定 replay buffers：
   - `capture.cu_seqlens_q`
   - `capture.cu_seqlens_k`
   - `capture.page_table`
   - `capture.seq_lens`
 
-This makes the FlashInfer MLA wrapper state replay-safe under CUDA graph execution.
+这样就使 FlashInfer 的 MLA wrapper 在 CUDA graph 执行下具备 replay-safe 状态。
 
 ## Real GPU Validation
 
-Environment:
+环境：
 
 - model:
   - `/mnt/82_store/LLM-weights/ZhipuAI/GLM-4.7-Flash`
@@ -62,64 +62,62 @@ Environment:
 - moe backend:
   - `fused`
 
-Validated with real `hi` requests through `/v1/chat/completions`.
+通过 `/v1/chat/completions` 的真实 `hi` 请求完成验证。
 
 ### 1. `tp=1, ep=1, graph on`
 
-Command shape:
+命令形态：
 
 - `CUDA_VISIBLE_DEVICES=6 python -m minisgl --model-path ... --tp 1 --ep 1 --attention-backend mla --moe-backend fused --port 30242`
 
-Observed result:
+观察结果：
 
-- request returned normal text
-- response:
+- 请求返回了正常文本
+- 响应：
   - `Hello! How can I assist you today?`
 
 ### 2. `tp=2, ep=1, graph on`
 
-Command shape:
+命令形态：
 
 - `CUDA_VISIBLE_DEVICES=5,6 python -m minisgl --model-path ... --tp 2 --ep 1 --attention-backend mla --moe-backend fused --port 30241`
 
-Observed result:
+观察结果：
 
-- request returned normal text
-- response:
+- 请求返回了正常文本
+- 响应：
   - `Hello! How can I assist you today?`
 
 ### 3. `tp=2, ep=2, graph on`
 
-Command shape:
+命令形态：
 
 - `CUDA_VISIBLE_DEVICES=5,6 python -m minisgl --model-path ... --tp 2 --ep 2 --attention-backend mla --moe-backend fused --port 30231`
 
-Observed result:
+观察结果：
 
-- request returned normal text
-- response:
+- 请求返回了正常文本
+- 响应：
   - `Hello! How can I assist you today?`
 
 ## Regression Check
 
-Local tests still pass:
+本地测试仍然通过：
 
 - `tests/misc/test_glm4_config.py`
 - `tests/misc/test_moe_dispatch.py`
 
-Result:
+结果：
 
 - `10 passed`
 
 ## Remaining Issue
 
-`tp=2, ep=2` weight loading is still much slower than the other validated launch
-configurations.
+`tp=2, ep=2` 的权重加载速度仍然明显慢于其他已经验证过的启动配置。
 
-Observed rough comparison in this session:
+本次会话中观察到的粗略对比：
 
-- `tp=2, ep=1`: around 16 seconds to load weights
-- `tp=2, ep=2`: around 9.5 minutes to load weights
+- `tp=2, ep=1`：加载权重大约 `16` 秒
+- `tp=2, ep=2`：加载权重大约 `9.5` 分钟
 
-So the MLA graph correctness issue appears fixed, but the EP load path still needs
-separate optimization work.
+因此，MLA graph 正确性问题看起来已经修复，但 EP 的加载路径仍然需要单独做优化。

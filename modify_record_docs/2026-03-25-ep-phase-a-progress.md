@@ -2,43 +2,43 @@
 
 ## Scope
 
-This note records the first implementation step for EP planning in `mini-sglang`.
+本文记录了 `mini-sglang` 中 EP 规划的第一步实现。
 
-This phase does not implement expert dispatch yet.
-It only adds the minimum config and distributed-state plumbing needed so later EP work
-does not stay coupled to TP-only assumptions.
+这一阶段还没有实现 expert dispatch。
+它只加入了最小化的配置和分布式状态传递所需的基础设施，
+这样后续的 EP 工作就不会继续绑定在仅支持 TP 的假设上。
 
 ## Changes
 
-- Added `--expert-parallel-size` / `--ep-size` in server args.
-- Added explicit `ep_info` to engine/server config.
-- Added EP state helpers in `python/minisgl/distributed/info.py`:
+- 在 server args 中新增了 `--expert-parallel-size` / `--ep-size`。
+- 在 engine/server config 中显式加入了 `ep_info`。
+- 在 `python/minisgl/distributed/info.py` 中新增了 EP 状态辅助函数：
   - `set_ep_info`
   - `get_ep_info`
   - `try_get_ep_info`
   - `build_ep_info`
-- Propagated `ep_info` through:
-  - argument parsing
-  - multi-process launch
-  - engine initialization
-  - offline `LLM` entry
+- 将 `ep_info` 贯穿传递到以下路径：
+  - 参数解析
+  - 多进程启动
+  - engine 初始化
+  - 离线 `LLM` 入口
 
 ## Current Validation Rules
 
-Phase A intentionally keeps the supported space small:
+Phase A 有意将支持范围保持得很小：
 
 - `ep_size >= 1`
 - `ep_size in {1, tp_size}`
-- `ep_size > 1` only allowed for MoE models
-- routed expert count must be divisible by `ep_size`
+- `ep_size > 1` 只允许用于 MoE 模型
+- routed expert 的数量必须能被 `ep_size` 整除
 
 ## Why This Shape
 
-Current `mini-sglang` still has TP as the only real distributed execution dimension.
-So the right first step is to make EP explicit in config/state, while still rejecting
-unsupported layouts clearly.
+当前的 `mini-sglang` 里，TP 仍然是唯一真正的分布式执行维度。
+因此，正确的第一步是先让 EP 在配置和状态中显式存在，同时仍然清晰地拒绝
+不受支持的布局。
 
-That prevents future EP work from encoding more TP-only assumptions in:
+这样可以避免未来的 EP 工作继续把更多仅适用于 TP 的假设编码进以下位置：
 
 - engine init
 - worker launch
@@ -47,243 +47,243 @@ That prevents future EP work from encoding more TP-only assumptions in:
 
 ## Not Included Yet
 
-- EP process groups distinct from TP groups
-- EP communication primitives such as `all_to_all`
-- EP-aware MoE dispatcher
-- local-only expert weight loading
-- runtime topk global-to-local expert remapping
+- 区别于 TP group 的独立 EP process groups
+- `all_to_all` 等 EP 通信原语
+- 支持 EP 的 MoE dispatcher
+- 仅加载本地 expert 权重
+- 运行时 topk 的 global-to-local expert 重映射
 
 ## Phase B Follow-up
 
-After Phase A config plumbing, the next step was implemented for the constrained path
-`ep_size == tp_size`.
+在完成 Phase A 的配置打通后，下一步实现了受约束路径
+`ep_size == tp_size`。
 
-This is still a correctness-first EP path, not the final dispatcher-based design.
+这仍然是一条以正确性优先的 EP 路径，而不是最终基于 dispatcher 的设计。
 
 ### Added
 
-- local expert ownership helper:
-  - contiguous global expert range per EP rank
-- local MoE TP view:
+- 本地 expert 归属辅助逻辑：
+  - 每个 EP rank 拥有连续的 global expert 区间
+- 本地 MoE TP 视图：
   - `moe_tp_size = tp_size / ep_size`
-  - for `ep_size == tp_size`, local experts are no longer additionally TP-sharded
-- EP-aware MoE execution changes:
-  - routed expert weights are allocated only for local experts
-  - global expert ids are remapped to local expert slots before local expert compute
-  - existing output `all_reduce` remains the correctness combine path
+  - 对于 `ep_size == tp_size`，本地 experts 不再额外进行 TP 切分
+- 支持 EP 的 MoE 执行改动：
+  - routed expert 权重只为本地 experts 分配
+  - 在本地 expert 计算前，会先把 global expert id 重映射为本地 expert slot
+  - 现有的输出 `all_reduce` 仍然保留，作为正确性优先的合并路径
 
 ### Weight Loading Speed Fixes
 
-The first EP loader version was functionally correct but too slow because it still loaded
-remote expert tensors from `safetensors` before discarding them.
+第一版 EP loader 在功能上是正确的，但速度太慢，因为它仍然会先从
+`safetensors` 加载远端 expert tensor，然后再将其丢弃。
 
-That path was fixed by:
+这个路径通过以下方式修复：
 
-- filtering non-local expert tensors before `f.get_tensor(...)`
-- stacking only local routed experts
-- using `moe_tp` instead of dense-layer `tp` for expert weight sharding
+- 在 `f.get_tensor(...)` 之前先过滤掉非本地 expert tensor
+- 只堆叠本地 routed experts
+- 对 expert 权重切分使用 `moe_tp`，而不是 dense-layer 的 `tp`
 
-This was required both for correctness and for fast validation loops.
+这对正确性和快速验证循环都必不可少。
 
 ### CUDA Graph Limitation
 
-The current constrained EP path is not CUDA-graph-safe yet.
+当前这个受约束的 EP 路径还不具备 CUDA-graph-safe 特性。
 
-Reason:
+原因：
 
-- the GLM routed-expert path still uses dynamic PyTorch ops such as `torch.where`
-  during local expert selection
-- that fails under stream capture
+- GLM 的 routed-expert 路径在本地 expert 选择时，仍然使用了 `torch.where`
+  这类动态 PyTorch 操作
+- 这些操作会在 stream capture 下失败
 
-Current temporary behavior:
+当前的临时行为：
 
-- automatically disable CUDA graph when `ep_size > 1`
+- 当 `ep_size > 1` 时自动禁用 CUDA graph
 
-This keeps inference usable while avoiding capture failures.
+这样可以在避免 capture 失败的同时，保持推理可用。
 
 ## Validation
 
 ### Lightweight tests
 
-Executed:
+已执行：
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ... python -m pytest -o addopts='' -q tests/misc/test_glm4_config.py`
 
-Result:
+结果：
 
 - `5 passed`
 
-Coverage of these tests includes:
+这些测试覆盖了：
 
-- GLM MLA auto-detection unchanged
-- EP config parsing
-- EP rejection on dense models
-- auto-disable CUDA graph for EP
+- GLM MLA 自动检测行为未发生变化
+- EP 配置解析
+- 在 dense model 上拒绝 EP
+- 为 EP 自动禁用 CUDA graph
 
 ### Real GPU validation
 
-Model:
+模型：
 
 - `/mnt/82_store/LLM-weights/ZhipuAI/GLM-4.7-Flash`
 
-Validated configuration:
+已验证配置：
 
 - `tp=2`
 - `ep=2`
 - attention backend `mla`
 - MoE backend `fused`
 
-Observed behavior after the fixes:
+修复后的观察结果：
 
-- model loads successfully
-- service starts successfully with CUDA graph disabled
-- OpenAI-compatible chat request with prompt `hi` returns:
+- 模型加载成功
+- 在禁用 CUDA graph 的情况下服务启动成功
+- 使用 prompt `hi` 发送 OpenAI-compatible chat request，返回：
   - `Hello! How can I assist you today?`
 
-This confirms that `fusedmoe + ep_size == tp_size` is working in the current
-correctness-first design.
+这确认了在当前以正确性优先的设计下，`fusedmoe + ep_size == tp_size`
+已经可以工作。
 
 ### Notes On Loading Time
 
-On the validated `tp=2, ep=2` path, loading was reduced from the earlier multi-minute
-regression to about:
+在已验证的 `tp=2, ep=2` 路径上，加载时间已从之前回归出的多分钟降低到大约：
 
-- roughly 20-90 seconds depending on which idle GPU pair was selected and their transient load
+- 约 20-90 秒，具体取决于选中的空闲 GPU 对以及它们的瞬时负载
 
-The critical regression that was removed was:
+被消除的关键性能回归是：
 
-- reading remote expert tensors from checkpoint and only discarding them after GPU materialization
+- 从 checkpoint 中读取远端 expert tensor，等到 GPU 实体化之后才将其丢弃
 
 ## Dispatcher Refactor Follow-up
 
-After the correctness-first EP path was validated, the local expert remap logic was
-refactored into a shared minimal dispatcher/mapping utility:
+在正确性优先的 EP 路径验证完成后，本地 expert 重映射逻辑被重构为一个共享的
+最小 dispatcher/mapping 工具：
 
 - `python/minisgl/moe/dispatch.py`
 
-Current purpose:
+当前目的：
 
-- unify `global expert id -> local expert slot` remap logic
-- keep GLM custom MoE path and generic fused/torch MoE backends on the same semantics
-- reduce the amount of EP-specific logic duplicated across model code
+- 统一 `global expert id -> local expert slot` 的重映射逻辑
+- 让 GLM 自定义 MoE 路径与通用 fused/torch MoE backend 保持一致语义
+- 减少模型代码中重复出现的 EP 专用逻辑
 
-Updated call sites:
+已更新的调用点：
 
 - `python/minisgl/moe/fused.py`
 - `python/minisgl/moe/torch_backend.py`
 - `python/minisgl/models/glm4_moe_lite.py`
 
-Validation:
+验证：
 
-- added `tests/misc/test_moe_dispatch.py`
-- reran:
+- 新增了 `tests/misc/test_moe_dispatch.py`
+- 重新运行了：
   - `tests/misc/test_glm4_config.py`
   - `tests/misc/test_moe_dispatch.py`
-- real GPU regression check repeated on:
+- 在真实 GPU 上重复进行了回归检查，配置为：
   - `tp=2`
   - `ep=2`
   - `attention_backend=mla`
-  - OpenAI-style HTTP request with prompt `hi`
-- result remained correct:
+  - 使用 prompt `hi` 的 OpenAI-style HTTP request
+- 结果仍然正确：
   - `Hello! How can I assist you today?`
 
 ## Divisor EP Follow-up
 
-The EP grouping logic was then extended from:
+随后，EP 分组逻辑从：
 
 - `ep_size in {1, tp_size}`
 
-to:
+扩展为：
 
-- `ep_size` is any positive divisor of `tp_size`
+- `ep_size` 可以是 `tp_size` 的任意正因子
 
-Current grouping policy is contiguous:
+当前分组策略是连续分段：
 
 - `ep_rank = tp_rank // moe_tp_size`
 - `moe_tp_size = tp_size / ep_size`
 - `moe_tp_rank = tp_rank % moe_tp_size`
 
-This keeps the current correctness-first EP path compatible with:
+这使得当前以正确性优先的 EP 路径可以兼容：
 
-- local expert ownership
-- local-only expert loading
-- expert weight sharding by `moe_tp`
-- full-TP `all_reduce` as the current combine path
+- 本地 expert 归属
+- 仅本地 expert 加载
+- 按 `moe_tp` 进行 expert 权重切分
+- 将全 TP 的 `all_reduce` 作为当前的合并路径
 
 ### Validation
 
-Local validation:
+本地验证：
 
-- added unit coverage for divisor EP grouping in `tests/misc/test_glm4_config.py`
-- reran:
+- 在 `tests/misc/test_glm4_config.py` 中新增了 divisor EP grouping 的单元覆盖
+- 重新运行了：
   - `tests/misc/test_glm4_config.py`
   - `tests/misc/test_moe_dispatch.py`
-- result:
+- 结果：
   - `9 passed`
 
-Real GPU validation status:
+真实 GPU 验证状态：
 
-- attempted `tp=4, ep=2` with small `--num-pages` to tolerate memory imbalance
-- launch and grouping logic were accepted
-- loading began successfully
-- did not complete end-to-end generation in that run because the available 4-GPU set was under heavy external load and checkpoint loading degraded to roughly 9 seconds per file
+- 尝试了 `tp=4, ep=2`，并使用较小的 `--num-pages` 以容忍显存不均衡
+- 启动和分组逻辑被接受
+- 加载成功开始
+- 但那次运行没有完成端到端生成，因为可用的 4-GPU 集合当时外部负载较重，
+  checkpoint 加载速度下降到了每个文件大约 9 秒
 
-So the current status for divisor EP is:
+因此，divisor EP 当前状态是：
 
-- code path implemented
-- local tests passed
-- real multi-GPU launch reached loading successfully
-- a clean end-to-end `tp=4, ep=2` generation run still needs a less contended 4-GPU window
+- 代码路径已实现
+- 本地测试已通过
+- 真实多 GPU 启动已成功进入加载阶段
+- 但要完成一次干净的 `tp=4, ep=2` 端到端生成运行，仍需要一个竞争更少的 4-GPU 时间窗口
 
 ## 2026-03-26 Fused EP Graph-Safety Follow-up
 
-This round focused on making the GLM routed-expert path graph-safe without giving up
-the fused MoE backend.
+这一轮工作的重点是在不放弃 fused MoE backend 的前提下，让 GLM routed-expert
+路径具备 graph-safe 特性。
 
 ### Changes
 
-- removed the GLM-specific dynamic local expert loop from:
+- 从以下文件中移除了 GLM 专用的动态本地 expert 循环：
   - `python/minisgl/models/glm4_moe_lite.py`
-- routed GLM MoE execution through the shared MoE backend path
-- kept CUDA graph enabled for:
+- 将 GLM 的 MoE 执行接入共享的 MoE backend 路径
+- 对以下场景继续启用 CUDA graph：
   - `moe_backend=fused`
   - `ep_size > 1`
-- kept CUDA graph disabled only for:
+- 仅对以下场景继续禁用 CUDA graph：
   - `moe_backend=torch`
   - `ep_size > 1`
-- changed EP local expert remap semantics in:
+- 在以下文件中修改了 EP 本地 expert 重映射语义：
   - `python/minisgl/moe/dispatch.py`
-  from a positive sentinel local id to:
+  从正数哨兵 local id 改为：
   - `-1`
-- extended the Triton fused MoE kernel path to treat filtered expert blocks as zero-output
-  blocks instead of indexing a fake expert slot
+- 扩展了 Triton fused MoE kernel 路径，使其将被过滤的 expert block 视为零输出 block，
+  而不是索引一个伪造的 expert slot
 
 ### What Was Validated
 
-Local tests:
+本地测试：
 
-- reran:
+- 重新运行了：
   - `tests/misc/test_glm4_config.py`
   - `tests/misc/test_moe_dispatch.py`
-- current result:
+- 当前结果：
   - `10 passed`
 
-Targeted correctness checks on a single GPU:
+单卡上的定向正确性检查：
 
-- fused local MoE vs torch local MoE:
-  - matched for non-EP and EP-partitioned cases
-- simulated EP split-and-sum vs full 32-expert reference:
-  - matched for both torch and fused paths
-- observed error scale:
-  - max diff about `1.22e-4`
-  - mean diff about `7.9e-6`
+- fused local MoE 与 torch local MoE：
+  - 在非 EP 和 EP 分区两种情况下都一致
+- 模拟的 EP split-and-sum 与完整 32-expert 参考实现：
+  - 在 torch 和 fused 两条路径上都一致
+- 观测到的误差量级：
+  - max diff 约为 `1.22e-4`
+  - mean diff 约为 `7.9e-6`
 
-These checks confirm that the current fused EP local routing and zero-filtered expert
-handling are numerically aligned with the torch reference at the operator level.
+这些检查确认，当前 fused EP 本地路由和零过滤 expert 处理，在算子层面与
+torch 参考实现保持数值一致。
 
 ### Real GPU GLM Validation
 
-Validated launch configuration:
+已验证的启动配置：
 
 - model:
   - `/mnt/82_store/LLM-weights/ZhipuAI/GLM-4.7-Flash`
@@ -293,40 +293,40 @@ Validated launch configuration:
   - `mla`
 - MoE backend:
   - `fused`
-- temporary paths moved off `/tmp`:
+- 临时路径已移出 `/tmp`：
   - `TRITON_CACHE_DIR=/mnt/42_store/zxz/.triton-cache-mini-sglang`
   - `TMPDIR=/mnt/42_store/zxz/tmp-mini-sglang`
 
-Observed behavior:
+观察到的行为：
 
-- model loading completed successfully
-- CUDA graph capture completed successfully
-- scheduler and OpenAI-compatible API server became ready successfully
+- 模型加载成功完成
+- CUDA graph capture 成功完成
+- scheduler 和 OpenAI-compatible API server 成功进入 ready 状态
 
-This confirms that the earlier blockers were resolved:
+这确认此前的阻塞问题已经解决：
 
-- graph-unsafe GLM local expert loop
-- Triton cache failure on full root filesystem
-- EP filtered-expert crash during graph capture
+- 不具备 graph-safe 特性的 GLM 本地 expert 循环
+- 根文件系统已满时的 Triton cache 失败
+- graph capture 期间 EP filtered-expert 崩溃
 
 ### Remaining Issue
 
-Although the server now starts and captures graphs correctly, real generation quality is
-still not acceptable in this configuration.
+虽然服务器现在可以正确启动并完成 graph capture，但在该配置下，真实生成质量
+仍然不能接受。
 
-Observed symptom:
+观察到的症状：
 
-- OpenAI-style chat requests such as `hi` returned garbled text rather than a normal reply
+- 使用 `hi` 之类的 OpenAI-style chat request 时，返回的是乱码，而不是正常回复
 
-Current conclusion:
+当前结论：
 
-- startup correctness is now much better
-- operator-level EP correctness checks pass
-- but real-model end-to-end behavior for this exact `tp=2, ep=2, mla, fused` GLM path is
-  still not fully validated as correct
+- 启动正确性现在已经明显改善
+- 算子级 EP 正确性检查已通过
+- 但对于这个精确配置 `tp=2, ep=2, mla, fused` 的 GLM 路径，真实模型的端到端行为
+  仍未被完全验证为正确
 
-So this configuration should currently be treated as:
+因此，这个配置目前应被视为：
 
-- launchable
-- graph-capturable
-- not yet fully behavior-validated for user-visible generation quality
+- 可以启动
+- 可以进行 graph capture
+- 但用户可见的生成质量尚未完成行为层面的正确性验证
