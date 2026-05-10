@@ -41,6 +41,37 @@ _STREAM_SLOT_NAMES = {
 _STREAM_EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
+def _is_packed_routed_expert_key(key: str) -> bool:
+    return ".mlp.experts." in key and _STREAM_EXPERT_PATTERN.match(key) is None
+
+
+def _stream_shard_packed_routed_expert_tensor(
+    key: str,
+    value: torch.Tensor,
+    moe_tp_rank: int,
+    moe_tp_size: int,
+) -> torch.Tensor:
+    ep_info = get_ep_info()
+
+    if ep_info.size > 1:
+        if value.shape[0] % ep_info.size != 0:
+            raise ValueError(
+                f"Packed routed expert tensor {key} has {value.shape[0]} experts, "
+                f"which is not divisible by ep_size={ep_info.size}"
+            )
+        value = value.chunk(ep_info.size, dim=0)[ep_info.rank].contiguous()
+
+    if moe_tp_size == 1:
+        return value.clone()
+
+    if ".gate_up_proj" in key or ".gate_proj" in key or ".up_proj" in key:
+        return value.chunk(moe_tp_size, dim=1)[moe_tp_rank].contiguous()
+    if ".down_proj" in key:
+        return value.chunk(moe_tp_size, dim=2)[moe_tp_rank].contiguous()
+
+    return value.clone()
+
+
 def _get_safetensors_files(model_path: str) -> Tuple[str, list]:
     """Get model folder and sorted safetensors files.
 
@@ -121,6 +152,14 @@ def _stream_shard_tensor(
     moe_tp_size: int,
     num_kv_heads: int,
 ) -> torch.Tensor:
+    if _is_packed_routed_expert_key(key):
+        return _stream_shard_packed_routed_expert_tensor(
+            key,
+            value,
+            moe_tp_rank,
+            moe_tp_size,
+        )
+
     shard_rank = moe_tp_rank if ".experts." in key else tp_rank
     shard_size = moe_tp_size if ".experts." in key else tp_size
     if any(key.count(sub) for sub in _STREAM_SPLIT_DIM_0):

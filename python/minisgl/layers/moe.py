@@ -7,6 +7,7 @@ from minisgl.distributed import (
     get_local_expert_range,
     get_moe_tp_info,
     get_tp_info,
+    get_world_info,
 )
 from minisgl.quantization import (
     is_w8a8_int8_enabled,
@@ -40,7 +41,8 @@ class MoELayer(BaseOP):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self._comm = DistributedCommunicator()
+        self._comm = DistributedCommunicator(kind="world")
+        self.world_size = get_world_info().size
 
         tp_info = get_tp_info()
         self.tp_size = tp_size = tp_info.size
@@ -102,7 +104,7 @@ class MoELayer(BaseOP):
             num_global_experts=self.num_experts,
             num_dispatch_experts=self.num_local_experts,
         )
-        if self.tp_size > 1:
+        if self.world_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states
 

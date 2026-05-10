@@ -10,6 +10,7 @@ from minisgl.distributed import (
     get_local_expert_range,
     get_moe_tp_info,
     get_tp_info,
+    get_world_info,
 )
 from minisgl.layers import (
     BaseOP,
@@ -236,8 +237,8 @@ class Glm4MoeLiteExperts(BaseOP):
             config.hidden_size,
             intermediate_size,
         )
-        self._tp_size = tp_info.size
-        self._comm = DistributedCommunicator()
+        self._world_size = get_world_info().size
+        self._comm = DistributedCommunicator(kind="world")
 
     def forward(
         self,
@@ -269,7 +270,7 @@ class Glm4MoeLiteExperts(BaseOP):
             num_global_experts=self.num_experts,
             num_dispatch_experts=self.num_local_experts,
         )
-        if self._tp_size > 1:
+        if self._world_size > 1:
             output = self._comm.all_reduce(output)
         return output
 

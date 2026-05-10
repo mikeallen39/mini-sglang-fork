@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import sys
+import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from minisgl.distributed import DistributedInfo, build_ep_info
+from minisgl.distributed import build_parallel_infos
 from minisgl.utils import init_logger
 
 if TYPE_CHECKING:
@@ -17,24 +18,33 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     import torch
     from minisgl.scheduler import Scheduler
 
-    with torch.inference_mode():
-        scheduler = Scheduler(args)
-        scheduler.sync_all_ranks()
+    logger = init_logger(__name__, f"scheduler_rank{args.world_info.rank}")
+    scheduler = None
+    try:
+        with torch.inference_mode():
+            scheduler = Scheduler(args)
+            scheduler.sync_all_ranks()
 
-        if args.tp_info.is_primary():
-            ack_queue.put("Scheduler is ready")
+            if args.world_info.is_primary():
+                ack_queue.put("Scheduler is ready")
 
-        if args.silent_output:
-            logging.disable(logging.INFO)
+            if args.silent_output:
+                logging.disable(logging.INFO)
 
-        try:
             scheduler.run_forever()
-        except KeyboardInterrupt:
-            logger = init_logger(__name__)
-            if scheduler.tp_info.is_primary():
-                print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
+    except KeyboardInterrupt:
+        if scheduler is not None and scheduler.world_info.is_primary():
+            print()  # for a clean newline after ^C
+            logger.info("Scheduler exiting gracefully...")
+        if scheduler is not None:
             scheduler.shutdown()
+    except Exception:
+        logger.error(
+            "Scheduler rank %s crashed:\n%s",
+            args.world_info.rank,
+            traceback.format_exc(),
+        )
+        raise
 
 
 def launch_server(run_shell: bool = False) -> None:
@@ -51,22 +61,27 @@ def launch_server(run_shell: bool = False) -> None:
 
         mp.set_start_method("spawn", force=True)
 
-        world_size = server_args.tp_info.size
+        world_size = server_args.world_info.size
         # a multiprocessing queue to receive ack from subprocesses
         # so that we can guarantee all subprocesses are ready
         ack_queue: mp.Queue[str] = mp.Queue()
 
         for i in range(world_size):
+            world_info, tp_info, ep_info = build_parallel_infos(
+                i, server_args.tp_info.size, server_args.ep_info.size
+            )
             new_args = replace(
                 server_args,
-                tp_info=DistributedInfo(i, world_size),
-                ep_info=build_ep_info(i, world_size, server_args.ep_info.size),
+                world_info=world_info,
+                tp_info=tp_info,
+                ep_info=ep_info,
+                device_id=i,
             )
             mp.Process(
                 target=_run_scheduler,
                 args=(new_args, ack_queue),
                 daemon=False,
-                name=f"minisgl-TP{i}-scheduler",
+                name=f"minisgl-rank{i}-scheduler",
             ).start()
 
         num_tokenizers = server_args.num_tokenizer
