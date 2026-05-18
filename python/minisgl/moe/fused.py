@@ -21,6 +21,18 @@ _ENABLE_FUSED_W2_SILU_INT8 = True
 logger = init_logger(__name__)
 
 
+def reset_fused_moe_profile() -> None:
+    _FUSED_MOE_PROFILE["w1_ms"] = 0.0
+    _FUSED_MOE_PROFILE["stage2_ms"] = 0.0
+    _FUSED_MOE_PROFILE["w2_ms"] = 0.0
+    _FUSED_MOE_PROFILE["reduce_ms"] = 0.0
+    _FUSED_MOE_PROFILE["count"] = 0
+
+
+def get_fused_moe_profile() -> dict[str, float | int]:
+    return dict(_FUSED_MOE_PROFILE)
+
+
 def _workspace_key(device: torch.device, dtype: torch.dtype) -> tuple[int, torch.dtype]:
     assert device.type == "cuda"
     return (device.index if device.index is not None else torch.cuda.current_device(), dtype)
