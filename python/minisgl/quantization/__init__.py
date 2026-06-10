@@ -200,6 +200,26 @@ def apply_w8a8_int8_linear(
     )
 
 
+def apply_w8a8_int8_linear_with_prequantized_fallback(
+    x: torch.Tensor,
+    x_q: torch.Tensor | None,
+    x_scale: torch.Tensor | None,
+    qweight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    if x_q is None or x_scale is None:
+        return apply_w8a8_int8_linear(x, qweight_t, weight_scale, bias)
+    return apply_w8a8_int8_linear_from_prequantized(
+        x_q,
+        x_scale,
+        qweight_t,
+        weight_scale,
+        out_dtype=x.dtype,
+        bias=bias,
+    )
+
+
 def process_weights_after_loading(root: object) -> None:
     for module in _iter_ops(root, visited=set()):
         fn = getattr(module, "process_weights_after_loading", None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from minisgl.layers import (
     AttentionLayer,
     BaseOP,
@@ -16,10 +17,11 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.models import ModelConfig
+from minisgl.quantization import quantize_activation_per_token_int8
 from minisgl.utils import nvtx_annotate
 
 if TYPE_CHECKING:
-    import torch
+    pass
 
 
 class GatedMLP(BaseOP):
@@ -43,7 +45,11 @@ class GatedMLP(BaseOP):
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj.forward(x)
+        x_q = None
+        x_scale = None
+        if getattr(self.gate_up_proj, "weight", None) is not None and self.gate_up_proj.weight.dtype == torch.int8:
+            x_q, x_scale = quantize_activation_per_token_int8(x)
+        gate_up = self.gate_up_proj.forward_prequantized(x, x_q, x_scale)
         del x
         y = self.act_fn(gate_up)
         del gate_up

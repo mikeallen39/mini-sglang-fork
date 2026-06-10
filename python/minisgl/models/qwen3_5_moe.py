@@ -25,7 +25,10 @@ from minisgl.layers import (
     VocabParallelEmbedding,
     silu_and_mul,
 )
-from minisgl.quantization import apply_w8a8_int8_linear_from_prequantized
+from minisgl.quantization import (
+    apply_w8a8_int8_linear_from_prequantized,
+    quantize_activation_per_token_int8,
+)
 from minisgl.utils import div_even, get_linear_attn_backend, local_kv_heads, nvtx_annotate
 from minisgl.utils.logger import init_logger
 
@@ -167,15 +170,36 @@ class Qwen3_5SparseMoeBlock(BaseOP):
             e2 = torch.cuda.Event(enable_timing=True)
             e3 = torch.cuda.Event(enable_timing=True)
             e0.record()
-        router_logits = self.gate.forward(hidden_states)
+        hidden_states_q = None
+        hidden_states_scale = None
+        if (
+            self.gate.weight.dtype == torch.int8
+            or (self.shared_expert is not None and self.shared_expert.gate_up_proj.weight.dtype == torch.int8)
+            or (
+                self.shared_expert_gate is not None
+                and self.shared_expert_gate.weight.dtype == torch.int8
+            )
+        ):
+            hidden_states_q, hidden_states_scale = quantize_activation_per_token_int8(hidden_states)
+
+        router_logits = self.gate.forward_prequantized(
+            hidden_states, hidden_states_q, hidden_states_scale
+        )
         if profile_enabled:
             e1.record()
         output = self.experts.forward(hidden_states, router_logits)
         if profile_enabled:
             e2.record()
         if self.shared_expert is not None and self.shared_expert_gate is not None:
-            shared_output = self.shared_expert.forward(hidden_states)
-            shared_output = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_output
+            shared_output = self.shared_expert.forward(
+                hidden_states,
+                hidden_states_q=hidden_states_q,
+                hidden_states_scale=hidden_states_scale,
+            )
+            shared_gate = self.shared_expert_gate.forward_prequantized(
+                hidden_states, hidden_states_q, hidden_states_scale
+            )
+            shared_output = torch.sigmoid(shared_gate) * shared_output
             output = output + shared_output
         if profile_enabled:
             e3.record()
@@ -237,7 +261,13 @@ class Qwen3_5SharedExpert(BaseOP):
         self.gate_up_proj.quantize_in_moe_only = True
         self.down_proj.quantize_in_moe_only = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        hidden_states_q: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if (
             self.gate_up_proj.weight.dtype == torch.int8
             and self.gate_up_proj.weight_scale is not None
@@ -247,7 +277,7 @@ class Qwen3_5SharedExpert(BaseOP):
             and x.ndim == 2
             and x.is_contiguous()
         ):
-            gate_up = self.gate_up_proj.forward(x)
+            gate_up = self.gate_up_proj.forward_prequantized(x, hidden_states_q, hidden_states_scale)
             inter_q = torch.empty(
                 (gate_up.shape[0], gate_up.shape[1] // 2),
                 device=gate_up.device,
@@ -263,7 +293,8 @@ class Qwen3_5SharedExpert(BaseOP):
                 out_dtype=x.dtype,
                 bias=self.down_proj.bias,
             )
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        gate_up = self.gate_up_proj.forward_prequantized(x, hidden_states_q, hidden_states_scale)
+        return self.down_proj.forward(silu_and_mul(gate_up))
 
 
 class Qwen3_5FullAttention(BaseOP):
@@ -555,8 +586,12 @@ class Qwen3_5LinearAttention(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
-        mixed_qkvz = self.in_proj_qkvz.forward(x)
-        mixed_ba = self.in_proj_ba.forward(x)
+        x_q = None
+        x_scale = None
+        if self.in_proj_qkvz.weight.dtype == torch.int8 or self.in_proj_ba.weight.dtype == torch.int8:
+            x_q, x_scale = quantize_activation_per_token_int8(x)
+        mixed_qkvz = self.in_proj_qkvz.forward_prequantized(x, x_q, x_scale)
+        mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
         mixed_qkv, z = mixed_qkvz.split(
             [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
         )
