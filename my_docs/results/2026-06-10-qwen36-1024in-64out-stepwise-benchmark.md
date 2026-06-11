@@ -100,6 +100,8 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | Fused MoE + SGLang Linear Attention | 236.11 ms | 4.1506 s | 15.18 tok/s | 65.88 ms | 63.00 | 67369 MiB |
 | Fused MoE + SGLang Linear Attention + CUDA Graph | 195.07 ms | 0.9342 s | 67.44 tok/s | 14.83 ms | 63.00 | 67453 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 229.50 ms | 0.9583 s | 65.74 tok/s | 15.21 ms | 63.00 | 35713 MiB |
+| W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
+| W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 
 ### 3.1 Baseline
 
@@ -341,3 +343,112 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - `TTFT` 变慢约 `17.6%`
   - `E2E` 变慢约 `2.6%`
   - `output_tps` 下降约 `2.5%`
+
+### 3.6 Then Try Expert Parallel (EP=2 / EP=4)
+
+- 配置：
+  - `moe-backend=fused`
+  - `linear-attn-backend=sglang`
+  - `dtype=bfloat16`
+  - `graph=1`
+  - `tp=1`
+  - `quantization=w8a8_int8`
+  - `attention-backend=fi`
+  - `cache-type=naive`
+  - `num-pages=4096`
+- 启动注意事项：
+  - 当前 `EP` 路径必须加 `--disable-pynccl`
+  - 原因：默认 `pynccl` 扩展会报 `undefined symbol: ncclCommWindowRegister`
+  - 在当前 NFS 环境下，多进程 `spawn + import` 很慢，`ep=2/4` 启动明显慢于 `ep=1`
+  - 但只要继续等待，服务可以正常进入 `Scheduler is ready`
+- attention 并行方式说明：
+  - 本组固定 `tp=1`
+  - 因此 attention 没有被 tensor parallel 切分
+  - attention / norm / 非 MoE dense 会在每个 EP rank 上各保留一份完整副本
+  - 真正被 `EP` 切分的是 experts
+
+#### 3.6.1 EP=2
+
+- 配置：
+  - `ep=2`
+  - `CUDA_VISIBLE_DEVICES=1,2`
+- 服务显存：
+  - `GPU1 ≈ 20775 MiB`
+  - `GPU2 ≈ 20775 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/w8a8_int8_ep2_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 1005.18 ms | 1.8068 s | 63 |
+| run2 | 208.19 ms | 1.0119 s | 63 |
+| run3 | 208.54 ms | 1.0107 s | 63 |
+| run4 | 208.40 ms | 1.0119 s | 63 |
+| run5 | 208.65 ms | 1.0099 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 208.44 ms |
+| run2-run5 avg E2E | 1.0111 s |
+| run2-run5 output_tps | 62.31 tok/s |
+| avg_ms_per_output_token | 16.05 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `ep=1`：
+  - `TTFT` 提升约 `9.2%`
+  - `E2E` 变慢约 `5.5%`
+  - `output_tps` 下降约 `5.2%`
+
+#### 3.6.2 EP=4
+
+- 配置：
+  - `ep=4`
+  - `CUDA_VISIBLE_DEVICES=1,2,3,4`
+- 服务显存：
+  - `GPU1 ≈ 13001 MiB`
+  - `GPU2 ≈ 13025 MiB`
+  - `GPU3 ≈ 13001 MiB`
+  - `GPU4 ≈ 12977 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/w8a8_int8_ep4_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 221.02 ms | 1.0391 s | 63 |
+| run2 | 207.70 ms | 1.0268 s | 63 |
+| run3 | 204.09 ms | 1.0225 s | 63 |
+| run4 | 205.37 ms | 1.0252 s | 63 |
+| run5 | 204.31 ms | 1.0231 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 205.37 ms |
+| run2-run5 avg E2E | 1.0244 s |
+| run2-run5 output_tps | 61.50 tok/s |
+| avg_ms_per_output_token | 16.26 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `ep=1`：
+  - `TTFT` 提升约 `10.5%`
+  - `E2E` 变慢约 `6.9%`
+  - `output_tps` 下降约 `6.4%`
+
+#### 3.6.3 EP 小结
+
+- 在当前单请求、单并发口径下，`EP` 的效果是：
+  - `TTFT` 有小幅改善
+  - 但 `E2E` 和 `output_tps` 都没有提升，反而略差
+- 这说明当前收益主要来自：
+  - expert 侧局部减负
+- 但整体又被这些成本抵消：
+  - attention 仍然在每个 EP rank 上复制执行
+  - expert 通信与聚合成本增加
+  - 单并发下并行收益不容易完全兑现
