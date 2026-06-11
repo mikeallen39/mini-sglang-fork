@@ -17,6 +17,7 @@ class DistributedInfo:  # should not export from here
 
 _TP_INFO: DistributedInfo | None = None
 _EP_INFO: DistributedInfo | None = None
+_WORLD_INFO: DistributedInfo | None = None
 
 
 def set_tp_info(rank: int, size: int) -> None:
@@ -33,6 +34,13 @@ def set_ep_info(rank: int, size: int) -> None:
     _EP_INFO = DistributedInfo(rank, size)
 
 
+def set_world_info(rank: int, size: int) -> None:
+    global _WORLD_INFO
+    if _WORLD_INFO is not None:
+        raise RuntimeError("World info has been set")
+    _WORLD_INFO = DistributedInfo(rank, size)
+
+
 def get_tp_info() -> DistributedInfo:
     if _TP_INFO is None:
         raise RuntimeError("TP info has not been set")
@@ -45,6 +53,12 @@ def get_ep_info() -> DistributedInfo:
     return _EP_INFO
 
 
+def get_world_info() -> DistributedInfo:
+    if _WORLD_INFO is None:
+        raise RuntimeError("World info has not been set")
+    return _WORLD_INFO
+
+
 def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
@@ -53,21 +67,36 @@ def try_get_ep_info() -> DistributedInfo | None:
     return _EP_INFO
 
 
+def try_get_world_info() -> DistributedInfo | None:
+    return _WORLD_INFO
+
+
+def build_parallel_infos(
+    world_rank: int,
+    tp_size: int,
+    ep_size: int,
+) -> tuple[DistributedInfo, DistributedInfo, DistributedInfo]:
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    world_size = tp_size * ep_size
+    if not 0 <= world_rank < world_size:
+        raise ValueError(
+            f"world_rank must be in [0, {world_size}), got world_rank={world_rank}"
+        )
+    tp_rank = world_rank % tp_size
+    ep_rank = world_rank // tp_size
+    return (
+        DistributedInfo(rank=world_rank, size=world_size),
+        DistributedInfo(rank=tp_rank, size=tp_size),
+        DistributedInfo(rank=ep_rank, size=ep_size),
+    )
+
+
 def build_ep_info(tp_rank: int, tp_size: int, ep_size: int) -> DistributedInfo:
-    if ep_size == 1:
-        return DistributedInfo(rank=0, size=1)
-    if ep_size <= 0 or ep_size > tp_size or tp_size % ep_size != 0:
-        raise ValueError(
-            "Current EP support requires ep_size to be a positive divisor of tp_size, "
-            f"got ep_size={ep_size}, tp_size={tp_size}"
-        )
-    moe_tp_size = tp_size // ep_size
-    ep_rank = tp_rank // moe_tp_size
-    if ep_rank >= ep_size:
-        raise ValueError(
-            f"Computed invalid ep_rank={ep_rank} from tp_rank={tp_rank}, tp_size={tp_size}, ep_size={ep_size}"
-        )
-    return DistributedInfo(rank=ep_rank, size=ep_size)
+    _, _, ep_info = build_parallel_infos(tp_rank, tp_size, ep_size)
+    return ep_info
 
 
 def get_local_expert_range(
@@ -90,24 +119,22 @@ def get_moe_tp_info(
     ep_info: DistributedInfo | None = None,
 ) -> DistributedInfo:
     tp_info = get_tp_info() if tp_info is None else tp_info
-    ep_info = get_ep_info() if ep_info is None else ep_info
-    if tp_info.size % ep_info.size != 0:
-        raise ValueError(
-            f"tp_size ({tp_info.size}) must be divisible by ep_size ({ep_info.size})"
-        )
-    moe_tp_size = tp_info.size // ep_info.size
-    moe_tp_rank = tp_info.rank % moe_tp_size
-    return DistributedInfo(rank=moe_tp_rank, size=moe_tp_size)
+    _ = get_ep_info() if ep_info is None else ep_info
+    return tp_info
 
 
 __all__ = [
     "DistributedInfo",
     "set_tp_info",
     "set_ep_info",
+    "set_world_info",
     "get_tp_info",
     "get_ep_info",
+    "get_world_info",
     "try_get_tp_info",
     "try_get_ep_info",
+    "try_get_world_info",
+    "build_parallel_infos",
     "build_ep_info",
     "get_local_expert_range",
     "get_moe_tp_info",

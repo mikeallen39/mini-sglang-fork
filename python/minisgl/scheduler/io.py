@@ -24,15 +24,15 @@ class SchedulerIOMixin:
         sync_all_ranks: Function to synchronize all ranks on CPU side.
     """
 
-    def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
-        tp_info = config.tp_info
-        self.tp_cpu_group: Final = tp_cpu_group
+    def __init__(self, config: SchedulerConfig, world_cpu_group: torch.distributed.ProcessGroup):
+        world_info = config.world_info
+        self.world_cpu_group: Final = world_cpu_group
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
             return  # early exit
 
-        if tp_info.is_primary():
+        if world_info.is_primary():
             self._recv_from_tokenizer: Final = ZmqPullQueue(
                 config.zmq_backend_addr,
                 create=True,
@@ -46,8 +46,8 @@ class SchedulerIOMixin:
 
         recv = self._recv_msg_single_rank
         send = self._reply_tokenizer_rank0
-        if tp_info.size > 1:
-            if tp_info.is_primary():
+        if world_info.size > 1:
+            if world_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 self._send_into_ranks: Final = ZmqPubQueue(
                     config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
@@ -74,7 +74,7 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
-        self.tp_cpu_group.barrier().wait()
+        self.world_cpu_group.barrier().wait()
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
@@ -99,7 +99,7 @@ class SchedulerIOMixin:
 
         # broadcast the number of raw messages to all ranks
         src_tensor = torch.tensor(len(pending_raw_msgs))
-        self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
+        self.world_cpu_group.broadcast(src_tensor, root=0).wait()
 
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
@@ -114,7 +114,7 @@ class SchedulerIOMixin:
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)
-        self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
+        self.world_cpu_group.broadcast(dst_tensor, root=0).wait()
         dst_length = int(dst_tensor.item())
 
         for _ in range(dst_length):

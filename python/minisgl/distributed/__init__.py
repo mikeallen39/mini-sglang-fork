@@ -1,29 +1,43 @@
-from .impl import DistributedCommunicator, destroy_distributed, enable_pynccl_distributed
+from .impl import (
+    DistributedCommunicator,
+    configure_torch_distributed,
+    destroy_distributed,
+    enable_pynccl_distributed,
+)
 from .info import (
     DistributedInfo,
+    build_parallel_infos,
     build_ep_info,
     get_ep_info,
     get_local_expert_range,
     get_moe_tp_info,
     get_tp_info,
+    get_world_info,
     set_ep_info,
     set_tp_info,
+    set_world_info,
     try_get_ep_info,
     try_get_tp_info,
+    try_get_world_info,
 )
 
 __all__ = [
     "DistributedInfo",
+    "build_parallel_infos",
     "build_ep_info",
     "get_ep_info",
     "get_local_expert_range",
     "get_moe_tp_info",
     "get_tp_info",
+    "get_world_info",
     "set_ep_info",
     "set_tp_info",
+    "set_world_info",
+    "configure_torch_distributed",
     "enable_pynccl_distributed",
     "DistributedCommunicator",
     "try_get_ep_info",
     "try_get_tp_info",
+    "try_get_world_info",
     "destroy_distributed",
 ]

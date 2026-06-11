@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
-from minisgl.distributed import DistributedInfo, build_ep_info
+from minisgl.distributed import DistributedInfo, build_parallel_infos
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import has_sglang_linear_attn_kernel, init_logger
 
@@ -54,11 +54,8 @@ class ServerArgs(SchedulerConfig):
 def _validate_parallelism(tp_size: int, ep_size: int, model_config) -> None:
     if ep_size < 1:
         raise ValueError(f"ep_size must be >= 1, got {ep_size}")
-    if ep_size > tp_size or tp_size % ep_size != 0:
-        raise ValueError(
-            "Current EP support requires ep_size to be a positive divisor of tp_size, "
-            f"got ep_size={ep_size}, tp_size={tp_size}"
-        )
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be >= 1, got {tp_size}")
     if ep_size == 1:
         return
     if not model_config.is_moe:
@@ -117,7 +114,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--ep-size",
         type=int,
         default=ServerArgs.ep_info.size,
-        help="The expert parallelism size. Current support requires ep_size to divide tp_size.",
+        help="The expert parallelism size.",
     )
 
     parser.add_argument(
@@ -329,8 +326,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     ep_size = kwargs["expert_parallel_size"]
     _validate_parallelism(tp_size, ep_size, ModelConfig.from_hf(hf_config))
 
-    kwargs["tp_info"] = DistributedInfo(0, tp_size)
-    kwargs["ep_info"] = build_ep_info(0, tp_size, ep_size)
+    world_info, tp_info, ep_info = build_parallel_infos(0, tp_size, ep_size)
+    kwargs["world_info"] = world_info
+    kwargs["tp_info"] = tp_info
+    kwargs["ep_info"] = ep_info
+    kwargs["device_id"] = 0
     del kwargs["tensor_parallel_size"]
     del kwargs["expert_parallel_size"]
     kwargs["quantization"] = None if kwargs["quantization"] == "none" else kwargs["quantization"]

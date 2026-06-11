@@ -18,6 +18,8 @@ class EngineConfig:
     tp_info: DistributedInfo
     dtype: torch.dtype
     ep_info: DistributedInfo = DistributedInfo(0, 1)
+    world_info: DistributedInfo = DistributedInfo(0, 1)
+    device_id: int = 0
     quantization: str | None = None
     linear_attn_backend: str = "torch"
     max_running_req: int = 256

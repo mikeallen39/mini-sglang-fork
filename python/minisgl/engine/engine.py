@@ -7,10 +7,12 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import (
+    configure_torch_distributed,
     destroy_distributed,
     enable_pynccl_distributed,
     set_ep_info,
     set_tp_info,
+    set_world_info,
 )
 from minisgl.kvcache import create_kvcache
 from minisgl.layers import set_rope_device
@@ -44,13 +46,14 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        set_world_info(rank=config.world_info.rank, size=config.world_info.size)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_ep_info(rank=config.ep_info.rank, size=config.ep_info.size)
         _adjust_config(config)
         set_quantization(config.quantization)
         set_linear_attn_backend(config.linear_attn_backend)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        self.device = torch.device(f"cuda:{config.device_id}")
         torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -60,7 +63,7 @@ class Engine:
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
+        self.tp_cpu_group, self.world_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -147,32 +150,66 @@ class Engine:
             dummy_req=self.dummy_req,
         )
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+    def _init_communication(
+        self, config: EngineConfig
+    ) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
+        tp_ranks = [
+            config.ep_info.rank * config.tp_info.size + i for i in range(config.tp_info.size)
+        ]
+        if config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
+                rank=config.world_info.rank,
+                world_size=config.world_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.group.WORLD
+            world_cpu_group = torch.distributed.group.WORLD
+            assert world_cpu_group is not None
+            tp_cpu_group = (
+                world_cpu_group
+                if config.tp_info.size == config.world_info.size
+                else torch.distributed.new_group(ranks=tp_ranks, backend="gloo")
+            )
             assert tp_cpu_group is not None
+            configure_torch_distributed(tp_group=tp_cpu_group, world_group=world_cpu_group)
             max_bytes = (
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
             )
-            enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+            enable_pynccl_distributed(
+                config.tp_info,
+                tp_cpu_group,
+                max_bytes,
+                world_info=config.world_info,
+                world_cpu_group=world_cpu_group,
+            )
         else:
             torch.distributed.init_process_group(
                 backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
+                rank=config.world_info.rank,
+                world_size=config.world_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            world_cpu_group = torch.distributed.new_group(
+                ranks=list(range(config.world_info.size)), backend="gloo"
+            )
+            assert world_cpu_group is not None
+            tp_cpu_group = (
+                world_cpu_group
+                if config.tp_info.size == config.world_info.size
+                else torch.distributed.new_group(ranks=tp_ranks, backend="gloo")
+            )
             assert tp_cpu_group is not None
-        return tp_cpu_group
+            tp_gpu_group = (
+                torch.distributed.group.WORLD
+                if config.tp_info.size == config.world_info.size
+                else torch.distributed.new_group(ranks=tp_ranks, backend="nccl")
+            )
+            assert tp_gpu_group is not None
+            world_gpu_group = torch.distributed.group.WORLD
+            configure_torch_distributed(tp_group=tp_gpu_group, world_group=world_gpu_group)
+        return tp_cpu_group, world_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         if config.use_dummy_weight:
@@ -283,11 +320,6 @@ def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
-    if config.ep_info.size > config.tp_info.size or config.tp_info.size % config.ep_info.size != 0:
-        raise ValueError(
-            "Current EP support requires ep_size to be a positive divisor of tp_size, "
-            f"got ep_size={config.ep_info.size}, tp_size={config.tp_info.size}"
-        )
     if config.ep_info.size > 1:
         if not config.model_config.is_moe:
             raise ValueError("ep_size > 1 is only supported for MoE models")
@@ -320,9 +352,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 f"w8a8_int8 only supports float16/bfloat16 activations, got dtype={config.dtype}"
             )
-        if config.cuda_graph_max_bs != 0:
-            override("cuda_graph_max_bs", 0)
-            logger.warning_rank0("CUDA graph is disabled for w8a8_int8 quantization")
 
     if config.linear_attn_backend == "sglang":
         if not has_sglang_linear_attn_kernel():

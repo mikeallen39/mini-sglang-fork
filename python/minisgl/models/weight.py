@@ -23,6 +23,10 @@ _STREAM_SPLIT_DIM_0 = [
     ".kv_b_proj",
     ".conv1d.weight",
 ]
+_STREAM_SPLIT_LINEAR_ATTN_HEAD_PARAMS = [
+    ".A_log",
+    ".dt_bias",
+]
 _STREAM_SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 _STREAM_MERGE_GROUPS = {
     ".q_proj": (".qkv_proj", ("q", "k", "v")),
@@ -169,6 +173,8 @@ def _stream_shard_tensor(
             head_idx = shard_rank * num_kv_heads // shard_size
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
         return value.chunk(shard_size, dim=0)[shard_rank].clone()
+    if any(key.count(sub) for sub in _STREAM_SPLIT_LINEAR_ATTN_HEAD_PARAMS):
+        return value.chunk(tp_size, dim=0)[tp_rank].clone()
     if any(key.count(sub) for sub in _STREAM_SPLIT_DIM_1):
         return value.chunk(shard_size, dim=1)[shard_rank].clone()
     if key.count("lm_head") or key.count("embed_tokens"):
@@ -269,22 +275,11 @@ def _stream_qwen3_5_local_qkv(
     if len(module._stacked_params) < 3:
         return True
 
-    tp_info = get_tp_info()
-    q = module._stacked_params.pop("q")
-    k = module._stacked_params.pop("k")
-    v = module._stacked_params.pop("v")
-    q = q.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
-    if config.num_kv_heads >= tp_info.size:
-        k = k.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
-        v = v.chunk(tp_info.size, dim=0)[tp_info.rank].contiguous()
-    else:
-        kv_group = tp_info.size // config.num_kv_heads
-        kv_rank = tp_info.rank // kv_group
-        kv_chunk = k.shape[0] // config.num_kv_heads
-        start = kv_rank * kv_chunk
-        end = start + kv_chunk
-        k = k[start:end].contiguous()
-        v = v[start:end].contiguous()
+    # load_weight_to_model() already shards Q/K/V via _stream_shard_tensor().
+    # Re-sharding here would halve the local projection size again under TP>1.
+    q = module._stacked_params.pop("q").contiguous()
+    k = module._stacked_params.pop("k").contiguous()
+    v = module._stacked_params.pop("v").contiguous()
     fused = torch.cat([q, k, v], dim=0).to(device=device)
     return _set_module_tensor(module_dict, fused_key, fused)
 
@@ -600,6 +595,7 @@ def _shard_state_dict(
     # MLA: q_b_proj and kv_b_proj are column parallel
     MLA_SPLIT_DIM_0_LIST = [".q_b_proj", ".kv_b_proj"]
     SPLIT_DIM_1_LIST = [".o_proj", ".down_proj"]
+    LINEAR_ATTN_HEAD_PARAM_LIST = [".A_log", ".dt_bias"]
 
     for key, value in state_dict.items():
         # Check if MLA replicated
@@ -614,6 +610,8 @@ def _shard_state_dict(
 
         # Standard sharding
         if any(sub in key for sub in SPLIT_DIM_0_LIST):
+            shard_state_dict[key] = value.chunk(n, dim=0)[r]
+        elif any(sub in key for sub in LINEAR_ATTN_HEAD_PARAM_LIST):
             shard_state_dict[key] = value.chunk(n, dim=0)[r]
         elif any(sub in key for sub in SPLIT_DIM_1_LIST):
             shard_state_dict[key] = value.chunk(n, dim=1)[r]

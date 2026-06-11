@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+    from minisgl.runtime_compat import prepare_runtime_compat
+
+    prepare_runtime_compat()
+
     import torch
     from minisgl.scheduler import Scheduler
 

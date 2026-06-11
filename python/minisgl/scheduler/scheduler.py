@@ -48,7 +48,7 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self.engine = Engine(config)
         # Initialize the I/O mixin
-        super().__init__(config, self.engine.tp_cpu_group)
+        super().__init__(config, self.engine.world_cpu_group)
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -71,6 +71,7 @@ class Scheduler(SchedulerIOMixin):
 
         # some alias for easy access
         self.tp_info = config.tp_info
+        self.world_info = config.world_info
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         eos_token_id = self.tokenizer.eos_token_id
@@ -264,7 +265,20 @@ class Scheduler(SchedulerIOMixin):
         with self.engine_stream_ctx:
             self.engine.stream.wait_stream(self.stream)
             for length in prewarm_lengths:
-                self._run_prefill_prewarm_once(length)
+                try:
+                    self._run_prefill_prewarm_once(length)
+                except NotImplementedError as exc:
+                    logger.warning_rank0(
+                        "Skip Triton prewarm for input_len=%d because cache manager cannot evict: %s",
+                        length,
+                        exc,
+                    )
+                except RuntimeError as exc:
+                    logger.warning_rank0(
+                        "Skip Triton prewarm for input_len=%d due to runtime error: %s",
+                        length,
+                        exc,
+                    )
             torch.cuda.synchronize(self.device)
         logger.info_rank0("Triton prewarm finished.")
 
