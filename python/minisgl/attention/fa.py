@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
+import os
+import site
+import sys
+import types
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -32,6 +38,16 @@ class FAMetadata(BaseAttnMetadata):
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
+
+
+_WARNED_FALLBACKS: set[str] = set()
+
+
+def _warn_fallback_once(key: str, msg: str, *args) -> None:
+    if key in _WARNED_FALLBACKS:
+        return
+    _WARNED_FALLBACKS.add(key)
+    logger.warning_rank0(msg, *args)
 
 
 class FlashAttentionBackend(BaseAttnBackend):
@@ -157,10 +173,12 @@ def _fa_sgl_impl(
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache
     except ImportError as e:
-        raise ImportError(
-            "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
-            "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
-        ) from e
+        _warn_fallback_once(
+            "flash_attn_binary_fallback",
+            "Importing sgl_kernel.flash_attn failed; falling back to manual binary loader: %s",
+            e,
+        )
+        flash_attn_with_kvcache = _load_sgl_kernel_flash_attn_fallback()
 
     return flash_attn_with_kvcache(  # type: ignore
         q=q,
@@ -180,3 +198,74 @@ def _fa_sgl_impl(
         causal=causal,
         ver=version,  # TODO: support FA4 on blackwell
     )
+
+
+def _load_module_from_path(module_name: str, module_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create module spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_sgl_kernel_flash_attn_fallback():
+    pkg_dir = _find_binary_sgl_kernel_dir()
+    pkg_name = "sgl_kernel"
+    pkg = sys.modules.get(pkg_name)
+    if pkg is None:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__file__ = str(pkg_dir / "__init__.py")
+        pkg.__path__ = [str(pkg_dir)]
+        pkg.__package__ = pkg_name
+        sys.modules[pkg_name] = pkg
+
+    flash_ops = sys.modules.get(f"{pkg_name}.flash_ops")
+    if flash_ops is None:
+        flash_ops_path = next(pkg_dir.glob("flash_ops.*"), None)
+        if flash_ops_path is None:
+            raise ImportError("sgl_kernel.flash_ops is not available")
+        flash_ops = _load_module_from_path(f"{pkg_name}.flash_ops", flash_ops_path)
+        setattr(pkg, "flash_ops", flash_ops)
+
+    fa4_interface = sys.modules.get(f"{pkg_name}._fa4_interface")
+    if fa4_interface is None:
+        fa4_path = pkg_dir / "_fa4_interface.py"
+        if fa4_path.exists():
+            fa4_interface = _load_module_from_path(f"{pkg_name}._fa4_interface", fa4_path)
+            setattr(pkg, "_fa4_interface", fa4_interface)
+
+    flash_attn = sys.modules.get(f"{pkg_name}.flash_attn")
+    if flash_attn is None:
+        flash_attn = _load_module_from_path(f"{pkg_name}.flash_attn", pkg_dir / "flash_attn.py")
+        setattr(pkg, "flash_attn", flash_attn)
+
+    if not hasattr(flash_attn, "flash_attn_with_kvcache"):
+        raise ImportError("sgl_kernel.flash_attn does not expose flash_attn_with_kvcache")
+    return flash_attn.flash_attn_with_kvcache
+
+
+def _find_binary_sgl_kernel_dir() -> Path:
+    candidates: list[Path] = []
+
+    spec = importlib.util.find_spec("sgl_kernel")
+    if spec is not None and spec.origin is not None:
+        candidates.append(Path(spec.origin).resolve().parent)
+
+    for root in site.getsitepackages():
+        candidates.append(Path(root) / "sgl_kernel")
+
+    user_site = site.getusersitepackages()
+    if user_site:
+        candidates.append(Path(user_site) / "sgl_kernel")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen or not candidate.exists():
+            continue
+        seen.add(candidate)
+        if any(candidate.glob("flash_ops.*")):
+            return candidate
+
+    raise ImportError("Could not locate binary sgl_kernel installation with flash_ops")

@@ -4,8 +4,11 @@ import os
 from typing import Any
 
 from huggingface_hub import snapshot_download
+from minisgl.utils.logger import init_logger
 from tqdm.asyncio import tqdm
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
+
+logger = init_logger(__name__)
 
 
 class DisabledTqdm(tqdm):
@@ -43,7 +46,12 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 def _load_hf_config(model_path: str) -> Any:
     try:
         return AutoConfig.from_pretrained(model_path)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "AutoConfig.from_pretrained failed for %s; falling back to local config.json parsing: %s",
+            model_path,
+            exc,
+        )
         # Fallback for model types unknown to the installed transformers version
         # (e.g. glm4_moe_lite on older releases).
         config_file = os.path.join(model_path, "config.json")

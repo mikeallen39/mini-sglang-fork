@@ -76,12 +76,11 @@ def fused_topk(
         topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
         if renormalize:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
-    except Exception:
-        scores = torch.softmax(gating_output.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)
-        if renormalize:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
-        topk_ids = topk_ids.to(torch.int32)
+    except Exception as exc:
+        raise RuntimeError(
+            "sgl_kernel.topk_softmax failed in fused_topk; refusing to fall back "
+            "to torch.softmax/topk on the performance-critical fused MoE path"
+        ) from exc
 
     if num_token_non_padded is not None:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)

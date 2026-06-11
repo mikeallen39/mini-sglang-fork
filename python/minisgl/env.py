@@ -4,6 +4,10 @@ import os
 from functools import partial
 from typing import Callable, Generic, TypeVar
 
+from minisgl.utils.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class BaseEnv:
     def _init(self, name: str) -> None:
@@ -24,8 +28,14 @@ class EnvVar(BaseEnv, Generic[T]):
         if env_value is not None:
             try:
                 self.value = self.fn(env_value)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Invalid environment variable %s=%r; keeping default value %r: %s",
+                    name,
+                    env_value,
+                    self.value,
+                    exc,
+                )
 
     def __bool__(self):
         return self.value
@@ -72,6 +82,7 @@ class EnvClassSingleton:
     PROFILE_QWEN35 = EnvBool(False)
     PROFILE_FUSED_MOE = EnvBool(False)
     PROFILE_SPARSE_MOE = EnvBool(False)
+    PROFILE_INT8_DENSE = EnvBool(False)
 
     def __new__(cls):
         # single instance

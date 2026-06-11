@@ -3,10 +3,20 @@ from __future__ import annotations
 from typing import Iterable
 
 import torch
+from minisgl.env import ENV
+from minisgl.utils.logger import init_logger
 
 SUPPORTED_QUANTIZATION = {None, "w8a8_int8", "w8a8_int8_moe_only"}
 
 _CURRENT_QUANTIZATION: str | None = None
+logger = init_logger(__name__)
+_INT8_DENSE_PROFILE_INTERVAL = 100
+_INT8_DENSE_PROFILE = {
+    "activation_quant_ms": 0.0,
+    "int8_gemm_ms": 0.0,
+    "count_quant": 0,
+    "count_gemm": 0,
+}
 
 
 def set_quantization(quantization: str | None) -> None:
@@ -56,6 +66,12 @@ def quantize_activation_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, t
     if x.ndim < 2:
         raise ValueError(f"Expected an input with ndim >= 2, got ndim={x.ndim}")
     x = x.contiguous()
+    profile = ENV.PROFILE_INT8_DENSE.value and x.is_cuda
+    e0 = e1 = None
+    if profile:
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
     if x.is_cuda and x.ndim == 2:
         try:
             from minisgl.kernel.activation_quant import per_token_quant_int8_triton
@@ -63,12 +79,25 @@ def quantize_activation_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, t
             x_q = torch.empty_like(x, dtype=torch.int8)
             scales = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
             per_token_quant_int8_triton(x, x_q, scales)
+            if profile:
+                assert e0 is not None and e1 is not None
+                e1.record()
+                e1.synchronize()
+                _record_int8_dense_profile("activation_quant_ms", e0.elapsed_time(e1), "count_quant")
             return x_q, scales
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                "per_token_quant_int8_triton failed; refusing to fall back to the "
+                "slow torch activation quantization path for W8A8"
+            ) from exc
     x_fp32 = x.to(torch.float32)
     scales = x_fp32.abs().amax(dim=-1, keepdim=True).clamp_min_(1e-10) / 127.0
     x_q = torch.round(x_fp32 / scales).clamp_(-128, 127).to(torch.int8)
+    if profile:
+        assert e0 is not None and e1 is not None
+        e1.record()
+        e1.synchronize()
+        _record_int8_dense_profile("activation_quant_ms", e0.elapsed_time(e1), "count_quant")
     return x_q, scales.contiguous()
 
 
@@ -80,6 +109,12 @@ def _apply_int8_scaled_mm(
     out_dtype: torch.dtype,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    profile = ENV.PROFILE_INT8_DENSE.value and x_q_2d.is_cuda
+    e0 = e1 = None
+    if profile:
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
     int8_scaled_mm = None
     try:
         from .int8_cuda_ext import int8_scaled_mm as _int8_scaled_mm
@@ -116,7 +151,7 @@ def _apply_int8_scaled_mm(
             int8_scaled_mm = None
 
     if int8_scaled_mm is not None:
-        return int8_scaled_mm(
+        output = int8_scaled_mm(
             x_q_2d,
             qweight_t,
             x_scale_2d,
@@ -124,6 +159,12 @@ def _apply_int8_scaled_mm(
             out_dtype=out_dtype,
             bias=bias,
         )
+        if profile:
+            assert e0 is not None and e1 is not None
+            e1.record()
+            e1.synchronize()
+            _record_int8_dense_profile("int8_gemm_ms", e0.elapsed_time(e1), "count_gemm")
+        return output
 
     # Prefer PyTorch's int8 GEMM when the dedicated sgl_kernel op is
     # unavailable. torch._int_mm requires M > 16 on CUDA, so pad decode-size
@@ -150,8 +191,11 @@ def _apply_int8_scaled_mm(
             else:
                 output = torch._int_mm(x_q_2d, qweight_t)
             output = output.to(torch.float32)
-        except Exception:
-            output = torch.matmul(x_q_2d.to(torch.float32), qweight_t.to(torch.float32))
+        except Exception as exc:
+            raise RuntimeError(
+                "torch._int_mm failed; refusing to fall back to float32 matmul on "
+                "the performance-critical int8 linear path"
+            ) from exc
     else:
         # Conservative fallback for environments without CUDA int8 GEMM.
         output = torch.matmul(x_q_2d.to(torch.float32), qweight_t.to(torch.float32))
@@ -159,7 +203,34 @@ def _apply_int8_scaled_mm(
     output = output * weight_scale.view(1, -1).to(torch.float32)
     if bias is not None:
         output = output + bias.to(torch.float32)
-    return output.to(out_dtype)
+    output = output.to(out_dtype)
+    if profile:
+        assert e0 is not None and e1 is not None
+        e1.record()
+        e1.synchronize()
+        _record_int8_dense_profile("int8_gemm_ms", e0.elapsed_time(e1), "count_gemm")
+    return output
+
+
+def _record_int8_dense_profile(key: str, value_ms: float, count_key: str) -> None:
+    _INT8_DENSE_PROFILE[key] += value_ms
+    _INT8_DENSE_PROFILE[count_key] += 1
+    count = _INT8_DENSE_PROFILE[count_key]
+    if count % _INT8_DENSE_PROFILE_INTERVAL != 0:
+        return
+    quant_count = max(_INT8_DENSE_PROFILE["count_quant"], 1)
+    gemm_count = max(_INT8_DENSE_PROFILE["count_gemm"], 1)
+    logger.info_rank0(
+        "Int8Dense profile avg: activation_quant=%.4f ms over %d calls, int8_gemm=%.4f ms over %d calls",
+        _INT8_DENSE_PROFILE["activation_quant_ms"] / quant_count,
+        quant_count,
+        _INT8_DENSE_PROFILE["int8_gemm_ms"] / gemm_count,
+        gemm_count,
+    )
+    _INT8_DENSE_PROFILE["activation_quant_ms"] = 0.0
+    _INT8_DENSE_PROFILE["int8_gemm_ms"] = 0.0
+    _INT8_DENSE_PROFILE["count_quant"] = 0
+    _INT8_DENSE_PROFILE["count_gemm"] = 0
 
 
 def apply_w8a8_int8_linear_from_prequantized(
