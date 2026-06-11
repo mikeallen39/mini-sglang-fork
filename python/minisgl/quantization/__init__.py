@@ -42,13 +42,25 @@ def is_w8a8_int8_moe_only_enabled() -> bool:
     return _CURRENT_QUANTIZATION == "w8a8_int8_moe_only"
 
 
+def supports_sgl_kernel_int8_linear(input_size: int, output_size: int) -> bool:
+    # The environment sgl_kernel int8 GEMM requires:
+    # - K % 16 == 0
+    # - N % 8 == 0
+    # It also expects the quantized weight to be fed as a column-major [K, N]
+    # tensor. We keep the shape check here and let runtime fall back if a
+    # particular backend rejects the layout for other reasons.
+    return input_size % 16 == 0 and output_size % 8 == 0
+
+
 def quantize_weight_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.ndim != 2:
         raise ValueError(f"Expected a 2D weight matrix, got shape={tuple(weight.shape)}")
     weight_fp32 = weight.to(torch.float32)
     scales = weight_fp32.abs().amax(dim=1, keepdim=True).clamp_min_(1e-10) / 127.0
     qweight = torch.round(weight_fp32 / scales).clamp_(-128, 127).to(torch.int8)
-    return qweight.t().contiguous(), scales.contiguous()
+    # sgl_kernel.int8_scaled_mm expects mat_b to be a column-major [K, N]
+    # tensor, i.e. stride(0) == 1 after transpose.
+    return qweight.t().contiguous().t().contiguous().t(), scales.contiguous()
 
 
 def quantize_weight_per_channel_int8_row_major(
@@ -115,16 +127,54 @@ def _apply_int8_scaled_mm(
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
-    int8_scaled_mm = None
+    sgl_kernel_int8_scaled_mm = None
+    try:
+        from sgl_kernel import int8_scaled_mm as _int8_scaled_mm
+
+        sgl_kernel_int8_scaled_mm = _int8_scaled_mm
+    except ImportError:
+        try:
+            from sgl_kernel.gemm import int8_scaled_mm as _int8_scaled_mm
+
+            if hasattr(torch.ops.sgl_kernel, "int8_scaled_mm"):
+                sgl_kernel_int8_scaled_mm = _int8_scaled_mm
+            else:
+                sgl_kernel_int8_scaled_mm = None
+        except ImportError:
+            sgl_kernel_int8_scaled_mm = None
+
+    if sgl_kernel_int8_scaled_mm is not None:
+        try:
+            output = sgl_kernel_int8_scaled_mm(
+                x_q_2d,
+                qweight_t,
+                x_scale_2d,
+                weight_scale,
+                out_dtype=out_dtype,
+                bias=bias,
+            )
+            if profile:
+                assert e0 is not None and e1 is not None
+                e1.record()
+                e1.synchronize()
+                _record_int8_dense_profile("int8_gemm_ms", e0.elapsed_time(e1), "count_gemm")
+            return output
+        except Exception as exc:
+            logger.warning(
+                "sgl_kernel.int8_scaled_mm failed; falling back to alternate int8 GEMM path: %s",
+                exc,
+            )
+
+    int8_cuda_ext = None
     try:
         from .int8_cuda_ext import int8_scaled_mm as _int8_scaled_mm
 
-        int8_scaled_mm = _int8_scaled_mm
+        int8_cuda_ext = _int8_scaled_mm
     except ImportError:
-        int8_scaled_mm = None
+        int8_cuda_ext = None
 
-    if int8_scaled_mm is not None:
-        output = int8_scaled_mm(
+    if int8_cuda_ext is not None:
+        output = int8_cuda_ext(
             x_q_2d,
             qweight_t,
             x_scale_2d,
@@ -133,38 +183,15 @@ def _apply_int8_scaled_mm(
             bias=bias,
         )
         if output is not None:
+            if profile:
+                assert e0 is not None and e1 is not None
+                e1.record()
+                e1.synchronize()
+                _record_int8_dense_profile("int8_gemm_ms", e0.elapsed_time(e1), "count_gemm")
+            logger.warning(
+                "Falling back from sgl_kernel.int8_scaled_mm to local int8_cuda_ext for this linear."
+            )
             return output
-
-    try:
-        from sgl_kernel import int8_scaled_mm as _int8_scaled_mm
-
-        int8_scaled_mm = _int8_scaled_mm
-    except ImportError:
-        try:
-            from sgl_kernel.gemm import int8_scaled_mm as _int8_scaled_mm
-
-            if hasattr(torch.ops.sgl_kernel, "int8_scaled_mm"):
-                int8_scaled_mm = _int8_scaled_mm
-            else:
-                int8_scaled_mm = None
-        except ImportError:
-            int8_scaled_mm = None
-
-    if int8_scaled_mm is not None:
-        output = int8_scaled_mm(
-            x_q_2d,
-            qweight_t,
-            x_scale_2d,
-            weight_scale,
-            out_dtype=out_dtype,
-            bias=bias,
-        )
-        if profile:
-            assert e0 is not None and e1 is not None
-            e1.record()
-            e1.synchronize()
-            _record_int8_dense_profile("int8_gemm_ms", e0.elapsed_time(e1), "count_gemm")
-        return output
 
     # Prefer PyTorch's int8 GEMM when the dedicated sgl_kernel op is
     # unavailable. torch._int_mm requires M > 16 on CUDA, so pad decode-size
@@ -191,6 +218,9 @@ def _apply_int8_scaled_mm(
             else:
                 output = torch._int_mm(x_q_2d, qweight_t)
             output = output.to(torch.float32)
+            logger.warning(
+                "Falling back from sgl_kernel.int8_scaled_mm to torch._int_mm for this linear."
+            )
         except Exception as exc:
             raise RuntimeError(
                 "torch._int_mm failed; refusing to fall back to float32 matmul on "

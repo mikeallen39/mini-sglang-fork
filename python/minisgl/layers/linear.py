@@ -11,6 +11,7 @@ from minisgl.quantization import (
     is_w8a8_int8_full_linear_enabled,
     is_w8a8_int8_moe_only_enabled,
     quantize_weight_per_channel_int8,
+    supports_sgl_kernel_int8_linear,
 )
 from minisgl.utils import div_even
 
@@ -94,6 +95,11 @@ class _LinearTPImpl(BaseOP):
             self.quantize_in_moe_only and is_w8a8_int8_moe_only_enabled()
         )
         if not should_quantize or self.weight.dtype == torch.int8:
+            return
+        if not supports_sgl_kernel_int8_linear(
+            self.local_input_size,
+            self.local_output_size,
+        ):
             return
         self.weight, self.weight_scale = quantize_weight_per_channel_int8(self.weight)
 
