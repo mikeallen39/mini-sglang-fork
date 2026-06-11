@@ -251,25 +251,20 @@ def moe_align_block_size(
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    try:
-        from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-        cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
-        sgl_moe_align_block_size(
-            topk_ids,
-            num_experts + 1,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            cumsum_buffer,
-            True,
-        )
-        return sorted_ids, expert_ids, num_tokens_post_pad
-    except Exception:
-        pass
-
-    return _moe_align_block_size_torch(topk_ids, block_size, num_experts)
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
+    sgl_moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def _moe_align_block_size_torch(
