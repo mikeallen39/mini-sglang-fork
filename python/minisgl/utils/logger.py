@@ -46,7 +46,7 @@ def init_logger(
         pid = os.getpid()
         suffix = f"|pid={pid}{suffix}"
 
-    tp_info = None
+    rank_info = None
 
     # Color formatter class
     class ColorFormatter(logging.Formatter):
@@ -64,14 +64,14 @@ def init_logger(
         BOLD = "\033[1m"
 
         def format(self, record):
-            from minisgl.distributed import try_get_tp_info
+            from minisgl.distributed import try_get_tp_info, try_get_world_info
 
             # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
-            nonlocal tp_info
-            tp_info = tp_info or try_get_tp_info()
-            if tp_info is not None and use_tp_rank is not False:
-                real_suffix = f"{suffix}|core|rank={tp_info.rank}"
+            nonlocal rank_info
+            rank_info = rank_info or try_get_world_info() or try_get_tp_info()
+            if rank_info is not None and use_tp_rank is not False:
+                real_suffix = f"{suffix}|core|rank={rank_info.rank}"
             else:
                 real_suffix = suffix
             timestamp = timestamp.format(suffix=real_suffix)
@@ -101,12 +101,12 @@ def init_logger(
     logger.propagate = False
 
     def _call_rank0(msg, *args, _which, **kwargs):
-        from minisgl.distributed import get_tp_info
+        from minisgl.distributed import get_tp_info, try_get_world_info
 
-        nonlocal tp_info
-        tp_info = tp_info or get_tp_info()
-        assert tp_info is not None, "TP info not set yet"
-        if tp_info.is_primary():
+        nonlocal rank_info
+        rank_info = rank_info or try_get_world_info() or get_tp_info()
+        assert rank_info is not None, "rank info not set yet"
+        if rank_info.is_primary():
             getattr(logger, _which)(msg, *args, **kwargs)
 
     if TYPE_CHECKING:

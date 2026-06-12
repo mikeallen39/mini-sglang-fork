@@ -4,8 +4,17 @@ import os
 from typing import Tuple
 
 import torch
+from minisgl.env import ENV
+from minisgl.utils.logger import init_logger
 
 from .base import BaseOP
+
+logger = init_logger(__name__)
+_INT8_DENSE_PROFILE_INTERVAL = 100
+_GEMMA_RMSNORM_PROFILE = {
+    "gemma_rmsnorm_ms": 0.0,
+    "count": 0,
+}
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -83,7 +92,26 @@ class GemmaRMSNorm(BaseOP):
         self.weight = torch.empty(size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _torch_gemma_rmsnorm(x, self.weight, self.eps)
+        if not ENV.PROFILE_INT8_DENSE.value or not x.is_cuda:
+            return _torch_gemma_rmsnorm(x, self.weight, self.eps)
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        y = _torch_gemma_rmsnorm(x, self.weight, self.eps)
+        e1.record()
+        e1.synchronize()
+        _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] += e0.elapsed_time(e1)
+        _GEMMA_RMSNORM_PROFILE["count"] += 1
+        if _GEMMA_RMSNORM_PROFILE["count"] % _INT8_DENSE_PROFILE_INTERVAL == 0:
+            count = _GEMMA_RMSNORM_PROFILE["count"]
+            logger.info_rank0(
+                "Int8Dense profile avg: gemma_rmsnorm=%.4f ms over %d calls",
+                _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] / count,
+                count,
+            )
+            _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] = 0.0
+            _GEMMA_RMSNORM_PROFILE["count"] = 0
+        return y
 
     def forward_inplace(self, x: torch.Tensor) -> None:
         x.copy_(_torch_gemma_rmsnorm(x, self.weight, self.eps))
@@ -98,8 +126,46 @@ class GemmaRMSNormFused(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            return _torch_gemma_rmsnorm(x, self.weight, self.eps), x
+            if not ENV.PROFILE_INT8_DENSE.value or not x.is_cuda:
+                return _torch_gemma_rmsnorm(x, self.weight, self.eps), x
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            y = _torch_gemma_rmsnorm(x, self.weight, self.eps)
+            e1.record()
+            e1.synchronize()
+            _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] += e0.elapsed_time(e1)
+            _GEMMA_RMSNORM_PROFILE["count"] += 1
+            if _GEMMA_RMSNORM_PROFILE["count"] % _INT8_DENSE_PROFILE_INTERVAL == 0:
+                count = _GEMMA_RMSNORM_PROFILE["count"]
+                logger.info_rank0(
+                    "Int8Dense profile avg: gemma_rmsnorm=%.4f ms over %d calls",
+                    _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] / count,
+                    count,
+                )
+                _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] = 0.0
+                _GEMMA_RMSNORM_PROFILE["count"] = 0
+            return y, x
 
         merged = x + residual
+        if not ENV.PROFILE_INT8_DENSE.value or not merged.is_cuda:
+            normalized = _torch_gemma_rmsnorm(merged, self.weight, self.eps)
+            return normalized, merged
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
         normalized = _torch_gemma_rmsnorm(merged, self.weight, self.eps)
+        e1.record()
+        e1.synchronize()
+        _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] += e0.elapsed_time(e1)
+        _GEMMA_RMSNORM_PROFILE["count"] += 1
+        if _GEMMA_RMSNORM_PROFILE["count"] % _INT8_DENSE_PROFILE_INTERVAL == 0:
+            count = _GEMMA_RMSNORM_PROFILE["count"]
+            logger.info_rank0(
+                "Int8Dense profile avg: gemma_rmsnorm=%.4f ms over %d calls",
+                _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] / count,
+                count,
+            )
+            _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] = 0.0
+            _GEMMA_RMSNORM_PROFILE["count"] = 0
         return normalized, merged
