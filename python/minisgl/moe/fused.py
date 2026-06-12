@@ -462,18 +462,9 @@ def fused_experts_impl(
     )
     if profile_enabled:
         e1.record()
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
-    if use_int8_stage2_int8:
-        silu_and_mul_quant_int8_triton(
-            intermediate_cache1.view(-1, N),
-            intermediate_cache2,
-            intermediate_cache2_scale,
-        )
-    else:
-        FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
-    if profile_enabled:
-        e2.record()
     if use_int8_stage2_int8 and _ENABLE_FUSED_W2_SILU_INT8:
+        if profile_enabled:
+            e2.record()
         fused_moe_w2_silu_int8_kernel_triton(
             intermediate_cache1.view(-1, N),
             w2,
@@ -490,6 +481,17 @@ def fused_experts_impl(
             filter_expert=filter_expert,
         )
     else:
+        FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
+        if use_int8_stage2_int8:
+            silu_and_mul_quant_int8_triton(
+                intermediate_cache1.view(-1, N),
+                intermediate_cache2,
+                intermediate_cache2_scale,
+            )
+        else:
+            FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+        if profile_enabled:
+            e2.record()
         fused_moe_kernel_triton(
             intermediate_cache2,
             w2,

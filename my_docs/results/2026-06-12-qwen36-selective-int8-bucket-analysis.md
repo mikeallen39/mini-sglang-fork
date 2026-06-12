@@ -199,6 +199,57 @@ Routed experts 需要单独看，因为它们走的是 `fused MoE` 整体路径�
 | --- | ---: | ---: | --- |
 | `1024` | `1.2542` | `0.9998` | `int8` 明显反超 |
 
+### 对退化原因的进一步排查
+
+最开始怀疑的一点是：
+
+- `fused_moe_w2_silu_int8_kernel_triton` 之前仍然先执行了一次
+  - `silu_and_mul_quant_int8_triton(...)`
+- 而特化 `w2` kernel 内部又会自己重新做一遍 `silu + mul + quant`
+- 这会导致明显的重复 `stage2` 计算
+
+这部分问题已经修掉，并重新测了开/关特化 kernel 的对比：
+
+| tokens | 特化 kernel | total ms | w1 ms | stage2 ms | w2 ms | reduce ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `1` | 开 | `0.3815` | `0.1503` | `0.0097` | `0.0988` | `0.0500` |
+| `1` | 关 | `0.4209` | `0.1492` | `0.0651` | `0.0829` | `0.0622` |
+| `1024` | 开 | `1.9212` | `0.7472` | `0.0030` | `1.2537` | `0.0288` |
+| `1024` | 关 | `1.0014` | `0.7505` | `0.0430` | `0.2995` | `0.0292` |
+
+这说明：
+
+1. 重复 `stage2` 确实是个真实问题
+   - 修复后 `stage2_ms` 明显下降
+   - 例如 `tokens=1024` 时从 `~0.043` 降到 `~0.003`
+
+2. 但它不是 prefill 退化的主因
+   - 因为即使修掉重复 `stage2`
+   - `tokens=1024` 下特化 kernel 的 `w2_ms` 仍然高达 `~1.25 ms`
+   - 而关闭特化 kernel 时只有 `~0.30 ms`
+
+所以当前更准确的结论是：
+
+- 重复 `stage2` 是次要问题，已经修掉
+- prefill 大 token 场景下，真正的主因仍然是
+  - `fused_moe_w2_silu_int8_kernel_triton`
+  - 这条特化 `w2` kernel 本身在当前 Qwen3.6 routed expert shape 上退化
+
+同时它也不是“永远都慢”：
+
+- `tokens=1` 时，修复重复 `stage2` 后，特化 kernel 反而略快
+
+这说明这条 kernel 更像是：
+
+- decode 小 batch 场景有利
+- prefill 大 token 场景不利
+
+后续如果继续优化，最自然的方向不是简单永久开/关，而是：
+
+- 做一版基于 `tokens_num / M` 的 shape-aware heuristic
+- 小 batch decode 允许走特化 kernel
+- 大 token prefill 禁用它
+
 这说明：
 
 - routed experts 的主要问题已经不是 `w1`
