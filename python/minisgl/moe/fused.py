@@ -17,7 +17,11 @@ _FUSED_MOE_PROFILE = {
     "count": 0,
 }
 _FUSED_MOE_PROFILE_INTERVAL = 100
-_ENABLE_FUSED_W2_SILU_INT8 = True
+# The specialized fused w2+silu int8 kernel regressed badly on the current
+# Qwen3.6 routed-expert shapes, especially for prefill-sized token counts.
+# Keep it disabled by default until a shape-aware heuristic or a fixed kernel
+# is available.
+_ENABLE_FUSED_W2_SILU_INT8 = False
 logger = init_logger(__name__)
 
 

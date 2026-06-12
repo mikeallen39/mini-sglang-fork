@@ -2,32 +2,72 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import torch
 import torch.nn.functional as F
 
 from minisgl.benchmark.perf import perf_cuda
-from minisgl.quantization import quantize_activation_per_token_int8
+from minisgl.quantization import (
+    quantize_activation_per_token_int8,
+    quantize_weight_per_channel_int8,
+    supports_sgl_kernel_int8_linear,
+)
 
 
-def _run_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return quantize_activation_per_token_int8(x)
+def _require_sgl_kernel() -> None:
+    os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "sgl_kernel is required for this breakdown benchmark because it is meant to "
+            "measure the real online int8 path."
+        ) from exc
+
+    if not hasattr(torch.ops, "sgl_kernel") or not hasattr(torch.ops.sgl_kernel, "int8_scaled_mm"):
+        raise RuntimeError("torch.ops.sgl_kernel.int8_scaled_mm is not available")
 
 
-def _run_int8_acc_only(x_q: torch.Tensor, qweight_t: torch.Tensor) -> torch.Tensor:
+def _sgl_kernel_int8_scaled_mm(
+    x_q: torch.Tensor,
+    qweight_t_col_major: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.int8_scaled_mm.default(
+        x_q,
+        qweight_t_col_major,
+        x_scale,
+        weight_scale,
+        out_dtype,
+        None,
+    )
+
+
+def _torch_int_mm_path(
+    x_q: torch.Tensor,
+    qweight_t_row_major: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
     x_q_2d = x_q.view(-1, x_q.shape[-1]).contiguous()
-    qweight_t = qweight_t.contiguous()
     original_m = x_q_2d.shape[0]
     if original_m < 17:
         padded = torch.zeros((17, x_q_2d.shape[1]), dtype=x_q_2d.dtype, device=x_q_2d.device)
         padded[:original_m] = x_q_2d
-        acc = torch._int_mm(padded, qweight_t)[:original_m].contiguous()
+        acc = torch._int_mm(padded, qweight_t_row_major)[:original_m].contiguous()
     else:
-        acc = torch._int_mm(x_q_2d, qweight_t)
-    return acc
+        acc = torch._int_mm(x_q_2d, qweight_t_row_major)
+    out = acc.to(torch.float32)
+    out = out * x_scale.view(-1, 1).to(torch.float32)
+    out = out * weight_scale.view(1, -1).to(torch.float32)
+    return out.to(out_dtype)
 
 
-def _run_epilogue(
+def _epilogue_only(
     acc: torch.Tensor,
     x_scale: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -39,7 +79,7 @@ def _run_epilogue(
     return out.to(out_dtype)
 
 
-def bench_bucket(
+def _bench_bucket(
     *,
     name: str,
     tokens: int,
@@ -48,45 +88,15 @@ def bench_bucket(
     dtype: torch.dtype,
     repetitions: int,
 ) -> dict:
-    if input_size % 16 != 0 or output_size % 8 != 0:
-        return {
-            "bucket": name,
-            "tokens": tokens,
-            "input_size": input_size,
-            "output_size": output_size,
-            "supported_by_sgl_kernel_int8": False,
-        }
-
     x = torch.randn(tokens, input_size, device="cuda", dtype=dtype)
     w = torch.randn(output_size, input_size, device="cuda", dtype=dtype)
 
-    w_fp32 = w.to(torch.float32)
-    weight_scale = w_fp32.abs().amax(dim=1, keepdim=True).clamp_min_(1e-10) / 127.0
-    qweight_t = torch.round(w_fp32 / weight_scale).clamp_(-128, 127).to(torch.int8).t().contiguous()
-
     quant_ms = perf_cuda(
-        lambda: _run_quant(x),
+        lambda: quantize_activation_per_token_int8(x),
         repetitions=repetitions,
         cuda_graph_repetitions=None,
     )
-
-    x_q, x_scale = _run_quant(x)
-    x_scale_2d = x_scale.view(-1, 1).contiguous()
-    weight_scale_1d = weight_scale.view(-1).contiguous()
-
-    int8_acc_ms = perf_cuda(
-        lambda: _run_int8_acc_only(x_q, qweight_t),
-        repetitions=repetitions,
-        cuda_graph_repetitions=None,
-    )
-
-    acc = _run_int8_acc_only(x_q, qweight_t)
-
-    epilogue_ms = perf_cuda(
-        lambda: _run_epilogue(acc, x_scale_2d, weight_scale_1d, dtype),
-        repetitions=repetitions,
-        cuda_graph_repetitions=None,
-    )
+    x_q, x_scale = quantize_activation_per_token_int8(x)
 
     bf16_linear_ms = perf_cuda(
         lambda: F.linear(x, w),
@@ -94,11 +104,84 @@ def bench_bucket(
         cuda_graph_repetitions=None,
     )
 
-    int8_total_ms = perf_cuda(
-        lambda: _run_epilogue(_run_int8_acc_only(x_q, qweight_t), x_scale_2d, weight_scale_1d, dtype),
+    supported = supports_sgl_kernel_int8_linear(input_size, output_size)
+    if not supported:
+        return {
+            "bucket": name,
+            "tokens": tokens,
+            "input_size": input_size,
+            "output_size": output_size,
+            "supported_by_sgl_kernel_int8": False,
+            "bf16_linear_ms": bf16_linear_ms,
+            "quant_ms": quant_ms,
+        }
+
+    qweight_t_col_major, weight_scale = quantize_weight_per_channel_int8(w)
+    qweight_t_row_major = qweight_t_col_major.contiguous()
+
+    sgl_int8_total_ms = perf_cuda(
+        lambda: _sgl_kernel_int8_scaled_mm(
+            x_q,
+            qweight_t_col_major,
+            x_scale,
+            weight_scale,
+            dtype,
+        ),
         repetitions=repetitions,
         cuda_graph_repetitions=None,
-    ) + quant_ms
+    )
+
+    torch_int8_total_ms = perf_cuda(
+        lambda: _torch_int_mm_path(
+            x_q,
+            qweight_t_row_major,
+            x_scale,
+            weight_scale,
+            dtype,
+        ),
+        repetitions=repetitions,
+        cuda_graph_repetitions=None,
+    )
+
+    x_q_2d = x_q.view(-1, x_q.shape[-1]).contiguous()
+    x_scale_2d = x_scale.view(-1, x_scale.shape[-1]).contiguous()
+    weight_scale_1d = weight_scale.view(-1).contiguous()
+    original_m = x_q_2d.shape[0]
+    if original_m < 17:
+        padded = torch.zeros((17, x_q_2d.shape[1]), dtype=x_q_2d.dtype, device=x_q_2d.device)
+        padded[:original_m] = x_q_2d
+        acc = torch._int_mm(padded, qweight_t_row_major)[:original_m].contiguous()
+    else:
+        acc = torch._int_mm(x_q_2d, qweight_t_row_major)
+
+    torch_int8_acc_ms = perf_cuda(
+        lambda: (
+            torch._int_mm(
+                torch.cat(
+                    [
+                        x_q_2d,
+                        torch.zeros(
+                            (max(17 - original_m, 0), x_q_2d.shape[1]),
+                            dtype=x_q_2d.dtype,
+                            device=x_q_2d.device,
+                        ),
+                    ],
+                    dim=0,
+                )[: max(original_m, 17)],
+                qweight_t_row_major,
+            )[:original_m].contiguous()
+            if original_m < 17
+            else torch._int_mm(x_q_2d, qweight_t_row_major)
+        ),
+        repetitions=repetitions,
+        cuda_graph_repetitions=None,
+    )
+
+    epilogue_ms = perf_cuda(
+        lambda: _epilogue_only(acc, x_scale_2d, weight_scale_1d, dtype),
+        repetitions=repetitions,
+        cuda_graph_repetitions=None,
+    )
 
     return {
         "bucket": name,
@@ -106,24 +189,38 @@ def bench_bucket(
         "input_size": input_size,
         "output_size": output_size,
         "supported_by_sgl_kernel_int8": True,
-        "quant_ms": quant_ms,
-        "int8_acc_ms": int8_acc_ms,
-        "epilogue_ms": epilogue_ms,
         "bf16_linear_ms": bf16_linear_ms,
-        "int8_total_ms": int8_total_ms,
-        "int8_acc_speedup_vs_bf16": bf16_linear_ms / int8_acc_ms if int8_acc_ms > 0 else None,
-        "int8_total_speedup_vs_bf16": bf16_linear_ms / int8_total_ms if int8_total_ms > 0 else None,
-        "quant_share_of_total": quant_ms / int8_total_ms if int8_total_ms > 0 else None,
-        "epilogue_share_of_total": epilogue_ms / int8_total_ms if int8_total_ms > 0 else None,
-        "gemm_share_of_total": int8_acc_ms / int8_total_ms if int8_total_ms > 0 else None,
+        "quant_ms": quant_ms,
+        "sgl_int8_total_ms": sgl_int8_total_ms,
+        "torch_int8_total_ms": torch_int8_total_ms,
+        "torch_int8_acc_ms": torch_int8_acc_ms,
+        "epilogue_ms_proxy": epilogue_ms,
+        "sgl_int8_speedup_vs_bf16": bf16_linear_ms / sgl_int8_total_ms if sgl_int8_total_ms > 0 else None,
+        "torch_int8_speedup_vs_bf16": bf16_linear_ms / torch_int8_total_ms if torch_int8_total_ms > 0 else None,
+        "quant_share_vs_sgl_total": quant_ms / sgl_int8_total_ms if sgl_int8_total_ms > 0 else None,
+        "epilogue_proxy_share_vs_torch_total": epilogue_ms / torch_int8_total_ms if torch_int8_total_ms > 0 else None,
+        "notes": (
+            "sgl_int8_total_ms is the real online fused kernel path. "
+            "epilogue_ms_proxy is measured from the torch._int_mm reference path and is only "
+            "a proxy for dequant/scale/cast cost; it is not a precise internal phase split of "
+            "sgl_kernel.int8_scaled_mm."
+        ),
     }
 
 
 def main() -> None:
+    _require_sgl_kernel()
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", type=int, nargs="+", default=[1024])
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[1, 1024],
+        help="Token counts to benchmark. Use 1 for decode-like and 1024 for prefill-like.",
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"])
-    parser.add_argument("--repetitions", type=int, default=30)
+    parser.add_argument("--repetitions", type=int, default=50)
     args = parser.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -153,12 +250,22 @@ def main() -> None:
         ("dense_down_proj", 512, hidden),
     ]
 
-    print(json.dumps({"device": "cuda", "dtype": args.dtype, "repetitions": args.repetitions}))
+    print(
+        json.dumps(
+            {
+                "device": "cuda",
+                "dtype": args.dtype,
+                "repetitions": args.repetitions,
+                "tokens": args.tokens,
+                "measurement_note": "sgl_int8_total_ms measures the real online fused int8 path. quant_ms is measured separately. epilogue_ms_proxy comes from the torch._int_mm reference path.",
+            }
+        )
+    )
     for tokens in args.tokens:
         for name, input_size, output_size in buckets:
             print(
                 json.dumps(
-                    bench_bucket(
+                    _bench_bucket(
                         name=name,
                         tokens=tokens,
                         input_size=input_size,

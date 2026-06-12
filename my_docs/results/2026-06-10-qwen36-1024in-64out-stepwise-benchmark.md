@@ -99,7 +99,7 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | Fused MoE | 4477.62 ms | 8.8629 s | 7.11 tok/s | 140.68 ms | 63.00 | 67405 MiB |
 | Fused MoE + SGLang Linear Attention | 236.11 ms | 4.1506 s | 15.18 tok/s | 65.88 ms | 63.00 | 67369 MiB |
 | Fused MoE + SGLang Linear Attention + CUDA Graph | 195.07 ms | 0.9342 s | 67.44 tok/s | 14.83 ms | 63.00 | 67453 MiB |
-| W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 229.50 ms | 0.9583 s | 65.74 tok/s | 15.21 ms | 63.00 | 35713 MiB |
+| W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 189.04 ms | 0.8867 s | 71.05 tok/s | 14.07 ms | 63.00 | 35713 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 
@@ -303,6 +303,10 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - 进一步修复了 `w8a8` dense int8 接入：
     - `_apply_int8_scaled_mm()` 改为优先使用环境版 `sgl_kernel.int8_scaled_mm`
     - 权重量化布局改为 `sgl_kernel` 所需的列主序 `mat_b`
+  - 进一步修复了 routed experts 的 int8 路径：
+    - routed experts 本身早已量化，但 `fused_moe_w2_silu_int8` 这条特化 `w2` kernel 在 Qwen3.6 当前 shape 上明显退化
+    - 关闭该特化 kernel 后，routed experts 的 `fused int8` microbench 从约 `1.96 ms` 降到约 `1.00 ms`
+    - 修复后端到端 `W8A8` 已经超过当前 `bf16` 最优路径
   - 旧的 `25.91 tok/s` 结果来自接入修复前的过时服务，不再作为最终结论
 - 接入修复前的历史结果（保留作为经验记录）：
   - `run1_output_file = my_docs/results/w8a8_int8_run1_output.txt`
@@ -322,27 +326,27 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 
 | 项目 | TTFT | E2E | output_tokens |
 | --- | ---: | ---: | ---: |
-| run1 | 237.72 ms | 0.9667 s | 63 |
-| run2 | 229.21 ms | 0.9577 s | 63 |
-| run3 | 229.26 ms | 0.9585 s | 63 |
-| run4 | 229.68 ms | 0.9582 s | 63 |
-| run5 | 229.86 ms | 0.9587 s | 63 |
+| run1 | 197.08 ms | 0.8944 s | 63 |
+| run2 | 189.21 ms | 0.8866 s | 63 |
+| run3 | 188.68 ms | 0.8864 s | 63 |
+| run4 | 189.17 ms | 0.8868 s | 63 |
+| run5 | 189.13 ms | 0.8869 s | 63 |
 
 | 稳态统计 | 数值 |
 | --- | ---: |
-| run2-run5 avg TTFT | 229.50 ms |
-| run2-run5 avg E2E | 0.9583 s |
-| run2-run5 output_tps | 65.74 tok/s |
-| avg_ms_per_output_token | 15.21 ms |
+| run2-run5 avg TTFT | 189.04 ms |
+| run2-run5 avg E2E | 0.8867 s |
+| run2-run5 output_tps | 71.05 tok/s |
+| avg_ms_per_output_token | 14.07 ms |
 | avg_output_tokens | 63.00 |
 - 相对 baseline：
-  - `TTFT` 提升约 `96.4%`
-  - `E2E` 提升约 `97.5%`
-  - `output_tps` 提升约 `3908.5%`
+  - `TTFT` 提升约 `97.1%`
+  - `E2E` 提升约 `97.7%`
+  - `output_tps` 提升约 `4232%`
 - 相对 `fused MoE + sglang linear attention + CUDA graph`：
-  - `TTFT` 变慢约 `17.6%`
-  - `E2E` 变慢约 `2.6%`
-  - `output_tps` 下降约 `2.5%`
+  - `TTFT` 更快约 `2.7%`
+  - `E2E` 更快约 `5.1%`
+  - `output_tps` 更高约 `5.4%`
 
 ### 3.6 Then Try Expert Parallel (EP=2 / EP=4)
 
