@@ -19,6 +19,14 @@ _INT8_DENSE_PROFILE = {
 }
 
 
+def _can_profile_int8_dense(x: torch.Tensor) -> bool:
+    return (
+        ENV.PROFILE_INT8_DENSE.value
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
 def set_quantization(quantization: str | None) -> None:
     if quantization not in SUPPORTED_QUANTIZATION:
         raise ValueError(f"Unsupported quantization mode: {quantization}")
@@ -78,7 +86,7 @@ def quantize_activation_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, t
     if x.ndim < 2:
         raise ValueError(f"Expected an input with ndim >= 2, got ndim={x.ndim}")
     x = x.contiguous()
-    profile = ENV.PROFILE_INT8_DENSE.value and x.is_cuda
+    profile = _can_profile_int8_dense(x)
     e0 = e1 = None
     if profile:
         e0 = torch.cuda.Event(enable_timing=True)
@@ -121,7 +129,7 @@ def _apply_int8_scaled_mm(
     out_dtype: torch.dtype,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    profile = ENV.PROFILE_INT8_DENSE.value and x_q_2d.is_cuda
+    profile = _can_profile_int8_dense(x_q_2d)
     e0 = e1 = None
     if profile:
         e0 = torch.cuda.Event(enable_timing=True)

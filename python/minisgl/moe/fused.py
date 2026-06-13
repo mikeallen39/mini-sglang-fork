@@ -434,7 +434,11 @@ def fused_experts_impl(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
-    profile_enabled = ENV.PROFILE_FUSED_MOE.value
+    profile_enabled = (
+        ENV.PROFILE_FUSED_MOE.value
+        and curr_hidden_states.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    )
     if profile_enabled:
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)

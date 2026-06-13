@@ -47,6 +47,33 @@ _SPARSE_MOE_PROFILE = {
     "count": 0,
 }
 _SPARSE_MOE_PROFILE_INTERVAL = 100
+_LINEAR_ATTN_PROFILE = {
+    "prefill": {
+        "quant_ms": 0.0,
+        "qkvz_ms": 0.0,
+        "ba_ms": 0.0,
+        "conv_ms": 0.0,
+        "kernel_ms": 0.0,
+        "norm_ms": 0.0,
+        "out_proj_ms": 0.0,
+        "count": 0,
+    },
+    "decode": {
+        "quant_ms": 0.0,
+        "qkvz_ms": 0.0,
+        "ba_ms": 0.0,
+        "conv_ms": 0.0,
+        "kernel_ms": 0.0,
+        "norm_ms": 0.0,
+        "out_proj_ms": 0.0,
+        "count": 0,
+    },
+}
+_LINEAR_ATTN_PROFILE_INTERVAL = 100
+
+
+def _can_profile_cuda_events(x: torch.Tensor) -> bool:
+    return x.is_cuda and not torch.cuda.is_current_stream_capturing()
 
 
 def _freeze_rope_scaling(scaling: dict | None) -> tuple[tuple[str, object], ...] | None:
@@ -151,6 +178,7 @@ class Qwen3_5SparseMoeBlock(BaseOP):
             config.num_experts,
             has_bias=False,
         )
+        self.gate.disable_int8_quantization = True
         self.shared_expert = None
         self.shared_expert_gate = None
         if config.shared_expert_intermediate_size > 0:
@@ -160,10 +188,11 @@ class Qwen3_5SparseMoeBlock(BaseOP):
                 1,
                 has_bias=False,
             )
+            self.shared_expert_gate.disable_int8_quantization = True
 
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        profile_enabled = ENV.PROFILE_SPARSE_MOE.value
+        profile_enabled = ENV.PROFILE_SPARSE_MOE.value and _can_profile_cuda_events(hidden_states)
         if profile_enabled:
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
@@ -398,6 +427,7 @@ class Qwen3_5LinearAttention(BaseOP):
             [config.linear_num_value_heads, config.linear_num_value_heads],
             has_bias=False,
         )
+        self.in_proj_ba.disable_int8_quantization = True
         self.norm = Qwen3_5RMSNormGated(config.linear_value_head_dim, eps=config.rms_norm_eps)
         self.out_proj = LinearRowParallel(
             self.value_dim,
@@ -534,6 +564,7 @@ class Qwen3_5LinearAttention(BaseOP):
         table_idx: int,
         *,
         is_decode: bool,
+        profile_events: tuple[torch.cuda.Event, ...] | None = None,
     ) -> torch.Tensor:
         conv_state, ssm_state = self.state_cache.get(
             self.layer_id,
@@ -545,8 +576,13 @@ class Qwen3_5LinearAttention(BaseOP):
             head_v_dim=self.head_v_dim,
             device=mixed_qkv.device,
         )
+        if profile_events is not None:
+            conv_start, conv_end, kernel_end, norm_end, out_end = profile_events
+            conv_start.record()
         mixed_qkv, next_conv_state = self._run_depthwise_conv(mixed_qkv, conv_state)
         conv_state.copy_(next_conv_state)
+        if profile_events is not None:
+            conv_end.record()
 
         a = a.float().contiguous()
         b = b.float().contiguous()
@@ -571,27 +607,69 @@ class Qwen3_5LinearAttention(BaseOP):
             )
         else:
             query, key, value, _ = self._reshape_qkv(mixed_qkv, z)
+            query = F.normalize(query.float(), dim=-1, eps=1e-6).to(query.dtype).contiguous()
+            key = F.normalize(key.float(), dim=-1, eps=1e-6).to(key.dtype).contiguous()
             gate, beta = fused_gdn_gating_sglang(A_log, a, b, dt_bias)
             outputs = fused_linear_attn_prefill_sglang(
-                query.contiguous(),
-                key.contiguous(),
+                query,
+                key,
                 value.float().contiguous(),
                 gate.contiguous(),
                 beta.contiguous(),
                 ssm_state,
                 self.scale,
+                use_qk_l2norm_in_kernel=False,
             )
+        if profile_events is not None:
+            kernel_end.record()
         outputs = self.norm.forward(outputs, z)
-        return self.out_proj.forward(outputs.reshape(outputs.shape[0], -1).contiguous())
+        if profile_events is not None:
+            norm_end.record()
+        outputs = self.out_proj.forward(outputs.reshape(outputs.shape[0], -1).contiguous())
+        if profile_events is not None:
+            out_end.record()
+        return outputs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
+        profile_enabled = ENV.PROFILE_QWEN35.value and _can_profile_cuda_events(x)
+        profile_bucket = "decode" if batch.is_decode else "prefill"
+        quant_events = proj_events = req_events = None
+        if profile_enabled:
+            quant_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            proj_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            req_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
         x_q = None
         x_scale = None
         if self.in_proj_qkvz.weight.dtype == torch.int8 or self.in_proj_ba.weight.dtype == torch.int8:
+            if profile_enabled:
+                assert quant_events is not None
+                quant_events[0].record()
             x_q, x_scale = quantize_activation_per_token_int8(x)
+            if profile_enabled:
+                quant_events[1].record()
+        if profile_enabled:
+            assert proj_events is not None
+            proj_events[0].record()
         mixed_qkvz = self.in_proj_qkvz.forward_prequantized(x, x_q, x_scale)
+        if profile_enabled:
+            proj_events[1].record()
         mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
+        if profile_enabled:
+            proj_events[2].record()
         mixed_qkv, z = mixed_qkvz.split(
             [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
         )
@@ -621,11 +699,47 @@ class Qwen3_5LinearAttention(BaseOP):
                         b[req_slice],
                         req.table_idx,
                         is_decode=batch.is_decode,
+                        profile_events=req_events if offset == 0 and profile_enabled else None,
                     )
                 )
             else:
                 raise ValueError(f"Unsupported linear attention backend: {self.backend}")
             offset += length
+        if profile_enabled:
+            assert proj_events is not None and req_events is not None
+            req_events[-1].synchronize()
+            bucket = _LINEAR_ATTN_PROFILE[profile_bucket]
+            if quant_events is not None:
+                bucket["quant_ms"] += quant_events[0].elapsed_time(quant_events[1])
+            bucket["qkvz_ms"] += proj_events[0].elapsed_time(proj_events[1])
+            bucket["ba_ms"] += proj_events[1].elapsed_time(proj_events[2])
+            bucket["conv_ms"] += req_events[0].elapsed_time(req_events[1])
+            bucket["kernel_ms"] += req_events[1].elapsed_time(req_events[2])
+            bucket["norm_ms"] += req_events[2].elapsed_time(req_events[3])
+            bucket["out_proj_ms"] += req_events[3].elapsed_time(req_events[4])
+            bucket["count"] += 1
+            if bucket["count"] % _LINEAR_ATTN_PROFILE_INTERVAL == 0:
+                count = bucket["count"]
+                logger.info_rank0(
+                    "LinearAttn %s profile avg: quant=%.4f ms, qkvz=%.4f ms, ba=%.4f ms, conv=%.4f ms, kernel=%.4f ms, norm=%.4f ms, out_proj=%.4f ms over %d calls",
+                    profile_bucket,
+                    bucket["quant_ms"] / count,
+                    bucket["qkvz_ms"] / count,
+                    bucket["ba_ms"] / count,
+                    bucket["conv_ms"] / count,
+                    bucket["kernel_ms"] / count,
+                    bucket["norm_ms"] / count,
+                    bucket["out_proj_ms"] / count,
+                    count,
+                )
+                bucket["quant_ms"] = 0.0
+                bucket["qkvz_ms"] = 0.0
+                bucket["ba_ms"] = 0.0
+                bucket["conv_ms"] = 0.0
+                bucket["kernel_ms"] = 0.0
+                bucket["norm_ms"] = 0.0
+                bucket["out_proj_ms"] = 0.0
+                bucket["count"] = 0
         return torch.cat(outputs, dim=0)
 
 
@@ -665,9 +779,8 @@ class Qwen3_5DecoderLayer(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
-        profile_enabled = ENV.PROFILE_QWEN35.value
+        profile_enabled = ENV.PROFILE_QWEN35.value and _can_profile_cuda_events(x)
         if profile_enabled:
-            torch.cuda.synchronize(x.device)
             t0 = torch.cuda.Event(enable_timing=True)
             t1 = torch.cuda.Event(enable_timing=True)
             t2 = torch.cuda.Event(enable_timing=True)

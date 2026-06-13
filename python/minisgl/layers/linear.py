@@ -37,6 +37,7 @@ class _LinearTPImpl(BaseOP):
         self.bias = torch.empty(local_osize) if has_bias else None
         self.weight_scale: torch.Tensor | None = None
         self.quantize_in_moe_only = False
+        self.disable_int8_quantization = False
         # For stacked params loading (qkv_proj, gate_up_proj)
         self._stacked_params = {}
 
@@ -94,6 +95,8 @@ class _LinearTPImpl(BaseOP):
         should_quantize = is_w8a8_int8_full_linear_enabled() or (
             self.quantize_in_moe_only and is_w8a8_int8_moe_only_enabled()
         )
+        if self.disable_int8_quantization:
+            return
         if not should_quantize or self.weight.dtype == torch.int8:
             return
         if not supports_sgl_kernel_int8_linear(

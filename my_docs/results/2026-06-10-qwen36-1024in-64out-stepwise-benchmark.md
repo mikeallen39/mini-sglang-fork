@@ -100,6 +100,9 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | Fused MoE + SGLang Linear Attention | 236.11 ms | 4.1506 s | 15.18 tok/s | 65.88 ms | 63.00 | 67369 MiB |
 | Fused MoE + SGLang Linear Attention + CUDA Graph | 195.07 ms | 0.9342 s | 67.44 tok/s | 14.83 ms | 63.00 | 67453 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 189.04 ms | 0.8867 s | 71.05 tok/s | 14.07 ms | 63.00 | 35713 MiB |
+| W8A8 Selective Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 187.69 ms | 0.8757 s | 71.94 tok/s | 13.90 ms | 63.00 | 35759 MiB |
+| W8A8 Selective Int8 + LayerNorm Prequant Reuse + Fused MoE + SGLang Linear Attention + CUDA Graph | 188.55 ms | 0.8853 s | 71.17 tok/s | 14.05 ms | 63.00 | 35759 MiB |
+| W8A8 Selective Int8 + LinearAttn Prefill Q/K Norm Outside Kernel + Fused MoE + SGLang Linear Attention + CUDA Graph | 179.30 ms | 0.8686 s | 72.53 tok/s | 13.79 ms | 63.00 | 35759 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 
@@ -444,6 +447,132 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - `TTFT` 提升约 `10.5%`
   - `E2E` 变慢约 `6.9%`
   - `output_tps` 下降约 `6.4%`
+
+### 3.7 Then Try Selective Int8
+
+- 配置：
+  - 基于 `W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph`
+  - 保留大层 `int8`
+  - 将已验证收益不佳的小层回退到 `bf16`：
+    - `moe_router_gate`
+    - `shared_expert_gate`
+    - `linear_attn_in_proj_ba`
+- 服务显存：
+  - 运行中占用：`35759 MiB / 81920 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/output_texts/selective_int8_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 259.13 ms | 0.9465 s | 63 |
+| run2 | 188.87 ms | 0.8770 s | 63 |
+| run3 | 187.35 ms | 0.8753 s | 63 |
+| run4 | 187.18 ms | 0.8754 s | 63 |
+| run5 | 187.35 ms | 0.8753 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 187.69 ms |
+| run2-run5 avg E2E | 0.8757 s |
+| run2-run5 output_tps | 71.94 tok/s |
+| avg_ms_per_output_token | 13.90 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对全量当前最佳 `W8A8`：
+  - `TTFT` 更快约 `0.7%`
+  - `E2E` 更快约 `1.2%`
+  - `output_tps` 更高约 `1.3%`
+
+### 3.8 Then Try LayerNorm Prequant Reuse
+
+- 配置：
+  - 基于 `Selective Int8`
+  - 将 layer 边界上的 `GemmaRMSNormFused.forward_with_quant(...)` 接到后续 attention / MLP
+  - 复用同一份 `x_q/x_scale`，避免模块内部再次量化同一输入
+- 服务显存：
+  - 运行中占用：`35759 MiB / 81920 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/output_texts/selective_int8_rmsnorm_quant_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 247.23 ms | 0.9432 s | 63 |
+| run2 | 189.07 ms | 0.8858 s | 63 |
+| run3 | 187.85 ms | 0.8846 s | 63 |
+| run4 | 189.24 ms | 0.8859 s | 63 |
+| run5 | 188.04 ms | 0.8847 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 188.55 ms |
+| run2-run5 avg E2E | 0.8853 s |
+| run2-run5 output_tps | 71.17 tok/s |
+| avg_ms_per_output_token | 14.05 ms |
+| avg_output_tokens | 63.00 |
+
+- 结论：
+  - 这版 layer-level `RMSNorm + prequant reuse` 没有继续优于 `Selective Int8`
+  - 相对 `Selective Int8`：
+    - `TTFT` 变慢约 `0.46%`
+    - `E2E` 变慢约 `1.10%`
+    - `output_tps` 下降约 `1.07%`
+  - 当前看，这条实现不是继续压 `TTFT/TPS` 的有效方向，不应作为默认优化保留
+
+### 3.9 Then Move LinearAttn Prefill Q/K Norm Outside Kernel
+
+- 配置：
+  - 基于 `Selective Int8`
+  - 保持 `decode` 路径不变
+  - 仅对 `linear_attn` 的 **prefill** 路径做如下修改：
+    - 先在 Python 侧对 `query/key` 做 `L2 norm`
+    - 调用 `fused_linear_attn_prefill_sglang(..., use_qk_l2norm_in_kernel=False)`
+- 设计动机：
+  - 专门的 microbench 显示：
+    - `prefill` 将 `q/k norm` 放到 kernel 外部后，单算子从约 `2.97 ms` 降到约 `2.53 ms`
+    - 约快 `17.4%`
+  - `decode` 几乎无差别，因此只改 `prefill`
+- 服务显存：
+  - 运行中占用：`35759 MiB / 81920 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/output_texts/linear_attn_prefill_norm_outside_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 923.35 ms | 1.6112 s | 63 |
+| run2 | 180.05 ms | 0.8695 s | 63 |
+| run3 | 179.11 ms | 0.8681 s | 63 |
+| run4 | 179.13 ms | 0.8687 s | 63 |
+| run5 | 178.91 ms | 0.8680 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 179.30 ms |
+| run2-run5 avg E2E | 0.8686 s |
+| run2-run5 output_tps | 72.53 tok/s |
+| avg_ms_per_output_token | 13.79 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对当前最佳 `Selective Int8`：
+  - `TTFT` 更快约 `4.5%`
+  - `E2E` 更快约 `0.8%`
+  - `output_tps` 更高约 `0.8%`
+
+- 结论：
+  - `linear_attn` 的 `prefill` kernel 仍有可挖的实现空间
+  - 当前最有效的一个点是：将 `q/k` 的 `L2 norm` 从 kernel 内部挪到外部
+  - 这是当前 `W8A8` 路线在 `Selective Int8` 之上进一步压低 `TTFT` 的有效优化
 
 #### 3.6.3 EP 小结
 

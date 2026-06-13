@@ -17,6 +17,14 @@ _GEMMA_RMSNORM_PROFILE = {
 }
 
 
+def _can_profile_int8_dense(x: torch.Tensor) -> bool:
+    return (
+        ENV.PROFILE_INT8_DENSE.value
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     in_dtype = x.dtype
     compute_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
@@ -92,7 +100,7 @@ class GemmaRMSNorm(BaseOP):
         self.weight = torch.empty(size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not ENV.PROFILE_INT8_DENSE.value or not x.is_cuda:
+        if not _can_profile_int8_dense(x):
             return _torch_gemma_rmsnorm(x, self.weight, self.eps)
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
@@ -126,7 +134,7 @@ class GemmaRMSNormFused(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            if not ENV.PROFILE_INT8_DENSE.value or not x.is_cuda:
+            if not _can_profile_int8_dense(x):
                 return _torch_gemma_rmsnorm(x, self.weight, self.eps), x
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
@@ -148,7 +156,7 @@ class GemmaRMSNormFused(BaseOP):
             return y, x
 
         merged = x + residual
-        if not ENV.PROFILE_INT8_DENSE.value or not merged.is_cuda:
+        if not _can_profile_int8_dense(merged):
             normalized = _torch_gemma_rmsnorm(merged, self.weight, self.eps)
             return normalized, merged
         e0 = torch.cuda.Event(enable_timing=True)
