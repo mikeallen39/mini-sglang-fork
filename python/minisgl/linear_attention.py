@@ -395,7 +395,18 @@ def fused_linear_attn_prefill_sglang(
     bk = triton.next_power_of_2(k_dim)
     if triton.cdiv(k_dim, bk) != 1:
         raise ValueError(f"Only NK=1 is supported, got K={k_dim}, BK={bk}")
-    bv = min(triton.next_power_of_2(v_dim), 32)
+
+    # Qwen3.6 uses K=128, V=128 here. A smaller BV with more warps yields
+    # materially better prefill throughput than the previous BV=32/warp=1
+    # default, while keeping the implementation simple.
+    if v_dim >= 128:
+        bv = 16
+        num_warps = 4
+        num_stages = 3
+    else:
+        bv = min(triton.next_power_of_2(v_dim), 32)
+        num_warps = 1
+        num_stages = 3
 
     output = torch.empty((t, hv, v_dim), dtype=v.dtype, device=v.device)
     grid = (triton.cdiv(v_dim, bv), hv)
@@ -427,7 +438,7 @@ def fused_linear_attn_prefill_sglang(
         BK=bk,
         BV=bv,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=1,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output

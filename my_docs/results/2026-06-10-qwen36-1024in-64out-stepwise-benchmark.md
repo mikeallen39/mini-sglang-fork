@@ -103,6 +103,7 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | W8A8 Selective Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph | 187.69 ms | 0.8757 s | 71.94 tok/s | 13.90 ms | 63.00 | 35759 MiB |
 | W8A8 Selective Int8 + LayerNorm Prequant Reuse + Fused MoE + SGLang Linear Attention + CUDA Graph | 188.55 ms | 0.8853 s | 71.17 tok/s | 14.05 ms | 63.00 | 35759 MiB |
 | W8A8 Selective Int8 + LinearAttn Prefill Q/K Norm Outside Kernel + Fused MoE + SGLang Linear Attention + CUDA Graph | 179.30 ms | 0.8686 s | 72.53 tok/s | 13.79 ms | 63.00 | 35759 MiB |
+| W8A8 Selective Int8 + LinearAttn Prefill Launch Tuning + Q/K Norm Outside Kernel + Fused MoE + SGLang Linear Attention + CUDA Graph | 165.33 ms | 0.8158 s | 77.22 tok/s | 12.95 ms | 63.00 | 35759 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 
@@ -573,6 +574,65 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - `linear_attn` 的 `prefill` kernel 仍有可挖的实现空间
   - 当前最有效的一个点是：将 `q/k` 的 `L2 norm` 从 kernel 内部挪到外部
   - 这是当前 `W8A8` 路线在 `Selective Int8` 之上进一步压低 `TTFT` 的有效优化
+
+### 3.10 Then Tune LinearAttn Prefill Launch Parameters
+
+- 配置：
+  - 基于 `W8A8 Selective Int8 + LinearAttn Prefill Q/K Norm Outside Kernel`
+  - 保持 `decode` 路径不变
+  - 仅调 `fused_linear_attn_prefill_sglang` 的 launch 参数
+- 调优内容：
+  - 通过 dedicated microbench 扫描 `BV / num_warps / num_stages`
+  - 在当前 `K=128, V=128` 的 Qwen3.6 shape 下，较优点集中在：
+    - `BV=16`
+    - `num_warps=4`
+    - `num_stages=3`
+  - `decode` 参数差异很小，因此未改 `decode`
+- 设计动机：
+  - 之前的 `prefill` kernel launch 配置偏保守
+  - microbench 显示仅调整 launch 参数即可继续压低 `prefill` kernel 时间
+- 服务显存：
+  - 运行中占用：`35759 MiB / 81920 MiB`
+- `run1` 输出文件：
+  - `my_docs/results/output_texts/linear_attn_prefill_launch_tuned_run1_output.txt`
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 413.01 ms | 1.0632 s | 63 |
+| run2 | 172.14 ms | 0.8226 s | 63 |
+| run3 | 162.66 ms | 0.8132 s | 63 |
+| run4 | 162.72 ms | 0.8132 s | 63 |
+| run5 | 163.79 ms | 0.8142 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 165.33 ms |
+| run2-run5 avg E2E | 0.8158 s |
+| run2-run5 output_tps | 77.22 tok/s |
+| avg_ms_per_output_token | 12.95 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `3.9` 当前最佳：
+  - `TTFT` 更快约 `7.8%`
+  - `E2E` 更快约 `6.1%`
+  - `output_tps` 更高约 `6.5%`
+
+- 相对当前 `bf16` 最优：
+  - `TTFT` 更快约 `15.2%`
+  - `E2E` 更快约 `12.7%`
+  - `output_tps` 更高约 `14.5%`
+
+- 结论：
+  - 当前 `W8A8` 路线下，`linear_attn prefill kernel` 仍然是最值得优化的大头之一
+  - 除了将 `q/k norm` 挪出 kernel，本身的 launch 参数也仍有可观优化空间
+  - 这次只通过 `BV / num_warps / num_stages` 调优，就进一步把当前最佳结果从：
+    - `179.30 ms / 0.8686 s / 72.53 tok/s`
+    提升到：
+    - `165.33 ms / 0.8158 s / 77.22 tok/s`
 
 #### 3.6.3 EP 小结
 

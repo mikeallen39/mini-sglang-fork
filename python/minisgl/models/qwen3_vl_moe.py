@@ -200,7 +200,10 @@ class Qwen3_5VLMoeForConditionalGeneration(BaseLLMModel):
 
     @property
     def supports_cuda_graph(self) -> bool:
-        return False
+        # The text-only path reuses the same language backbone as Qwen3.5-MoE and
+        # remains graph-safe. Multimodal requests still bypass graph replay at
+        # runtime because their batch carries pixel_values/image_grid_thw.
+        return True
 
     @property
     def supports_prefix_cache(self) -> bool:

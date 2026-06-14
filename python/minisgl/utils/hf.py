@@ -54,6 +54,22 @@ def load_processor(model_path: str) -> Any:
 
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
+    config_file = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_file):
+        try:
+            return AutoConfig.from_pretrained(model_path)
+        except Exception as exc:
+            logger.warning(
+                "AutoConfig.from_pretrained failed for %s; falling back to local config.json parsing: %s",
+                model_path,
+                exc,
+            )
+            with open(config_file, "r", encoding="utf-8") as f:
+                config_dict = json.load(f)
+            config_dict = _normalize_multimodal_config_dict(config_dict)
+            model_type = config_dict.get("model_type", "")
+            fallback_cls = type("LocalFallbackConfig", (PretrainedConfig,), {"model_type": model_type})
+            return fallback_cls(**config_dict)
     try:
         return AutoConfig.from_pretrained(model_path)
     except Exception as exc:
@@ -64,7 +80,6 @@ def _load_hf_config(model_path: str) -> Any:
         )
         # Fallback for model types unknown to the installed transformers version
         # (e.g. glm4_moe_lite on older releases).
-        config_file = os.path.join(model_path, "config.json")
         if not os.path.isfile(config_file):
             raise
         with open(config_file, "r", encoding="utf-8") as f:
