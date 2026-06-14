@@ -93,6 +93,9 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
     ) -> None:
+        if not model.supports_cuda_graph:
+            cuda_graph_bs = []
+            cuda_graph_max_bs = 0
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,

@@ -34,9 +34,21 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    mm_token_type_ids: torch.Tensor | None = None
+    rope_delta: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        if self.pixel_values is not None:
+            assert self.pixel_values.is_cpu
+        if self.image_grid_thw is not None:
+            assert self.image_grid_thw.is_cpu
+        if self.mm_token_type_ids is not None:
+            assert self.mm_token_type_ids.is_cpu
+        if self.rope_delta is not None:
+            assert self.rope_delta.is_cpu
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
@@ -75,8 +87,13 @@ class Batch:
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
+    text_positions: torch.Tensor = field(init=False)
+    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor = field(init=False)
     padded_reqs: List[Req] = field(init=False)
+    pixel_values: torch.Tensor | None = field(default=None, init=False)
+    image_grid_thw: torch.Tensor | None = field(default=None, init=False)
+    mm_token_type_ids: torch.Tensor | None = field(default=None, init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
 

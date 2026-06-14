@@ -160,7 +160,31 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs, self.page_table)
-        batch.positions = _make_positions(batch, self.device)
+        mm_reqs = [req for req in batch.reqs if req.pixel_values is not None]
+        if mm_reqs:
+            if len(mm_reqs) != len(batch.reqs):
+                raise NotImplementedError(
+                    "Mixed multimodal and text-only batches are not supported yet."
+                )
+            if batch.is_decode:
+                # Visual side inputs are only needed for the first prefill pass.
+                batch.pixel_values = None
+                batch.image_grid_thw = None
+            else:
+                if len(mm_reqs) != 1:
+                    raise NotImplementedError(
+                        "Only single-request multimodal prefill is supported at the moment."
+                    )
+                batch.pixel_values = mm_reqs[0].pixel_values
+                batch.image_grid_thw = mm_reqs[0].image_grid_thw
+                batch.mm_token_type_ids = mm_reqs[0].mm_token_type_ids
+        else:
+            batch.pixel_values = None
+            batch.image_grid_thw = None
+            batch.mm_token_type_ids = None
+        batch.text_positions = _make_positions(batch, self.device)
+        batch.positions = batch.text_positions
+        batch.mrope_positions = None
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]

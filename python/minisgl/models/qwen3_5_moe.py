@@ -289,6 +289,8 @@ class Qwen3_5SharedExpert(BaseOP):
         )
         self.gate_up_proj.quantize_in_moe_only = True
         self.down_proj.quantize_in_moe_only = True
+        self.gate_up_proj.disable_int8_quantization = True
+        self.down_proj.disable_int8_quantization = True
 
     def forward(
         self,
@@ -635,6 +637,7 @@ class Qwen3_5LinearAttention(BaseOP):
         profile_enabled = ENV.PROFILE_QWEN35.value and _can_profile_cuda_events(x)
         profile_bucket = "decode" if batch.is_decode else "prefill"
         quant_events = proj_events = req_events = None
+        quant_recorded = False
         if profile_enabled:
             quant_events = (
                 torch.cuda.Event(enable_timing=True),
@@ -661,6 +664,7 @@ class Qwen3_5LinearAttention(BaseOP):
             x_q, x_scale = quantize_activation_per_token_int8(x)
             if profile_enabled:
                 quant_events[1].record()
+                quant_recorded = True
         if profile_enabled:
             assert proj_events is not None
             proj_events[0].record()
@@ -709,7 +713,7 @@ class Qwen3_5LinearAttention(BaseOP):
             assert proj_events is not None and req_events is not None
             req_events[-1].synchronize()
             bucket = _LINEAR_ATTN_PROFILE[profile_bucket]
-            if quant_events is not None:
+            if quant_recorded and quant_events is not None:
                 bucket["quant_ms"] += quant_events[0].elapsed_time(quant_events[1])
             bucket["qkvz_ms"] += proj_events[0].elapsed_time(proj_events[1])
             bucket["ba_ms"] += proj_events[1].elapsed_time(proj_events[2])
@@ -833,8 +837,15 @@ class Qwen3_5Model(BaseOP):
             eps=config.rms_norm_eps,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+        x = self.embed_tokens.forward(input_ids) if inputs_embeds is None else inputs_embeds
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -853,7 +864,13 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        if batch.pixel_values is not None:
+            raise NotImplementedError(
+                "Multimodal request reached the Qwen3.5 text-only path. "
+                "A Qwen3-VL model implementation is still required."
+            )
+        output = self.model.forward(batch.input_ids)
         if ENV.PROFILE_QWEN35.value:
             self._maybe_log_profile()
         return self.lm_head.forward(output)
@@ -935,4 +952,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     pass
 
 
-__all__ = ["Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"]
+class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
+    pass
+
+
+class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForCausalLM):
+    pass
+
+
+__all__ = [
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+]

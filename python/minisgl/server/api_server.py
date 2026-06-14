@@ -6,10 +6,10 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Literal, Tuple
+from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
@@ -21,7 +21,12 @@ from minisgl.message import (
     TokenizeMsg,
     UserReply,
 )
-from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
+from minisgl.utils import (
+    ZmqAsyncPullQueue,
+    ZmqAsyncPushQueue,
+    init_logger,
+    model_supports_multimodal,
+)
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from pydantic import BaseModel, Field
@@ -72,7 +77,28 @@ class GenerateRequest(BaseModel):
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+
+
+class TextContentPart(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ImageURLPayload(BaseModel):
+    url: str
+
+
+class ImageURLContentPart(BaseModel):
+    type: Literal["image_url"]
+    image_url: ImageURLPayload
+
+
+ContentPart = TextContentPart | ImageURLContentPart
+
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str | List[ContentPart]
 
 
 class OpenAICompletionRequest(BaseModel):
@@ -95,6 +121,66 @@ class OpenAICompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
 
     ignore_eos: bool = False
+
+
+def _normalize_message_content(
+    content: str | List[ContentPart],
+) -> tuple[str, List[str]]:
+    if isinstance(content, str):
+        return content, []
+
+    text_parts: List[str] = []
+    image_urls: List[str] = []
+    for part in content:
+        if isinstance(part, TextContentPart):
+            text_parts.append(part.text)
+        elif isinstance(part, ImageURLContentPart):
+            image_urls.append(part.image_url.url)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported content part: {part}")
+
+    return "\n".join(p for p in text_parts if p), image_urls
+
+
+def _normalize_chat_messages(messages: List[Message]) -> tuple[List[Dict[str, Any]], List[str]]:
+    normalized: List[Dict[str, Any]] = []
+    image_urls: List[str] = []
+
+    for msg in messages:
+        if isinstance(msg.content, str):
+            normalized.append({"role": msg.role, "content": msg.content})
+            continue
+
+        msg_image_urls: List[str] = []
+        content_parts: List[Dict[str, Any]] = []
+        for part in msg.content:
+            if isinstance(part, TextContentPart):
+                content_parts.append({"type": "text", "text": part.text})
+            elif isinstance(part, ImageURLContentPart):
+                msg_image_urls.append(part.image_url.url)
+                content_parts.append(
+                    {"type": "image_url", "image_url": {"url": part.image_url.url}}
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported content part: {part}")
+        normalized.append({"role": msg.role, "content": content_parts})
+        image_urls.extend(msg_image_urls)
+
+    return normalized, image_urls
+
+
+def _raise_multimodal_not_supported(image_urls: List[str], model_path: str) -> None:
+    if not image_urls:
+        return
+    if not model_supports_multimodal(model_path):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_path}' does not appear to be a vision-language model. "
+                "The request format is accepted, but image_url inputs require a multimodal model."
+            ),
+        )
+    return
 
 
 class ModelCard(BaseModel):
@@ -329,7 +415,8 @@ async def v1_root():
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     if req.messages:
-        prompt = [msg.model_dump() for msg in req.messages]
+        prompt, image_urls = _normalize_chat_messages(req.messages)
+        _raise_multimodal_not_supported(image_urls, state.config.model_path)
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
@@ -369,7 +456,8 @@ async def available_models():
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
+    prompt, image_urls = _normalize_chat_messages(req.messages)
+    _raise_multimodal_not_supported(image_urls, state.config.model_path)
 
     # TODO: support more sampling parameters
     uid = state.new_user()

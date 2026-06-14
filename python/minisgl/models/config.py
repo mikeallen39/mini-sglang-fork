@@ -60,6 +60,11 @@ class ModelConfig:
     linear_num_value_heads: int = 0
     linear_key_head_dim: int = 0
     linear_value_head_dim: int = 0
+    vision_config: Dict[str, Any] | None = None
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -69,6 +74,10 @@ class ModelConfig:
     def use_mla(self) -> bool:
         """Whether to use Multi-Latent Attention"""
         return self.qk_lora_rank is not None and self.kv_lora_rank is not None
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.vision_config is not None or self.image_token_id is not None
 
     @property
     def attn_head_dim(self) -> int:
@@ -85,6 +94,7 @@ class ModelConfig:
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
         parent_config = config
+        config_dict = config.to_dict()
         if (
             getattr(config, "text_config", None) is not None
             and hasattr(config.text_config, "num_hidden_layers")
@@ -108,13 +118,6 @@ class ModelConfig:
         architectures = getattr(config, "architectures", None) or getattr(
             parent_config, "architectures", ["LlamaForCausalLM"]
         )
-        architectures = [
-            {
-                "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
-                "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
-            }.get(arch, arch)
-            for arch in architectures
-        ]
 
         # ===== GLM4.7 / DeepSeek V2 MLA related =====
         qk_lora_rank = getattr(config, "q_lora_rank", None)
@@ -146,6 +149,32 @@ class ModelConfig:
         linear_num_value_heads = getattr(config, "linear_num_value_heads", 0)
         linear_key_head_dim = getattr(config, "linear_key_head_dim", 0)
         linear_value_head_dim = getattr(config, "linear_value_head_dim", 0)
+        vision_config = getattr(parent_config, "vision_config", None)
+        if vision_config is None:
+            vision_config = config_dict.get("vision_config")
+        elif hasattr(vision_config, "to_dict"):
+            vision_config = vision_config.to_dict()
+        is_multimodal = vision_config is not None
+        if not is_multimodal:
+            architectures = [
+                {
+                    "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
+                    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+                }.get(arch, arch)
+                for arch in architectures
+            ]
+        image_token_id = getattr(parent_config, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = config_dict.get("image_token_id")
+        video_token_id = getattr(parent_config, "video_token_id", None)
+        if video_token_id is None:
+            video_token_id = config_dict.get("video_token_id")
+        vision_start_token_id = getattr(parent_config, "vision_start_token_id", None)
+        if vision_start_token_id is None:
+            vision_start_token_id = config_dict.get("vision_start_token_id")
+        vision_end_token_id = getattr(parent_config, "vision_end_token_id", None)
+        if vision_end_token_id is None:
+            vision_end_token_id = config_dict.get("vision_end_token_id")
 
         # Auto-enable MLA backend if MLA dimensions are present
         # Can be overridden by environment variable DISABLE_MLA_BACKEND=1
@@ -155,7 +184,6 @@ class ModelConfig:
 
         # Handle rope_theta / rope_scaling / rope_interleave
         # Try to get from attributes first, then fall back to config.to_dict()
-        config_dict = config.to_dict()
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is None:
             rope_scaling = config_dict.get("rope_scaling", None)
@@ -264,4 +292,9 @@ class ModelConfig:
             linear_num_value_heads=linear_num_value_heads,
             linear_key_head_dim=linear_key_head_dim,
             linear_value_head_dim=linear_value_head_dim,
+            vision_config=vision_config,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            vision_start_token_id=vision_start_token_id,
+            vision_end_token_id=vision_end_token_id,
         )

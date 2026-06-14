@@ -9,6 +9,8 @@ _MODEL_REGISTRY = {
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "Qwen3_5ForCausalLM": (".qwen3_5_moe", "Qwen3_5ForCausalLM"),
     "Qwen3_5MoeForCausalLM": (".qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+    "Qwen3_5ForConditionalGeneration": (".qwen3_vl_moe", "Qwen3_5VLMoeForConditionalGeneration"),
+    "Qwen3_5MoeForConditionalGeneration": (".qwen3_vl_moe", "Qwen3_5VLMoeForConditionalGeneration"),
     # GLM4 models
     "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
 }

@@ -1,5 +1,11 @@
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
-from .hf import cached_load_hf_config, download_hf_weight, load_tokenizer
+from .hf import (
+    cached_load_hf_config,
+    download_hf_weight,
+    load_processor,
+    load_tokenizer,
+    model_supports_multimodal,
+)
 from minisgl.linear_attention import (
     get_linear_attn_backend,
     has_sglang_linear_attn_kernel,
@@ -30,7 +36,9 @@ from .torch_utils import nvtx_annotate, torch_dtype
 __all__ = [
     "cached_load_hf_config",
     "download_hf_weight",
+    "load_processor",
     "load_tokenizer",
+    "model_supports_multimodal",
     "set_linear_attn_backend",
     "get_linear_attn_backend",
     "has_sglang_linear_attn_kernel",

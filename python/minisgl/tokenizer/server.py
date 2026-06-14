@@ -45,12 +45,20 @@ def tokenize_worker(
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
     tokenizer = load_tokenizer(tokenizer_path)
+    processor = None
+    try:
+        from minisgl.utils import load_processor, model_supports_multimodal
+
+        if model_supports_multimodal(tokenizer_path):
+            processor = load_processor(tokenizer_path)
+    except Exception as exc:
+        logger.warning("Failed to load processor for %s: %s", tokenizer_path, exc)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, processor=processor)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:
@@ -90,10 +98,15 @@ def tokenize_worker(
                     data=[
                         UserMsg(
                             uid=msg.uid,
-                            input_ids=t,
+                            input_ids=input_ids,
                             sampling_params=msg.sampling_params,
+                            pixel_values=pixel_values,
+                            image_grid_thw=image_grid_thw,
+                            mm_token_type_ids=mm_token_type_ids,
                         )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        for msg, (input_ids, pixel_values, image_grid_thw, mm_token_type_ids) in zip(
+                            tokenize_msg, tensors, strict=True
+                        )
                     ]
                 )
                 if len(batch_output.data) == 1:

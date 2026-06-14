@@ -6,7 +6,13 @@ from typing import Any
 from huggingface_hub import snapshot_download
 from minisgl.utils.logger import init_logger
 from tqdm.asyncio import tqdm
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    PretrainedConfig,
+    PreTrainedTokenizerBase,
+)
 
 logger = init_logger(__name__)
 
@@ -42,6 +48,10 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
         return AutoTokenizer.from_pretrained(model_path)
 
 
+def load_processor(model_path: str) -> Any:
+    return AutoProcessor.from_pretrained(model_path)
+
+
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
     try:
@@ -68,6 +78,13 @@ def _load_hf_config(model_path: str) -> Any:
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     config = _load_hf_config(model_path)
     return type(config)(**config.to_dict())
+
+
+@functools.cache
+def model_supports_multimodal(model_path: str) -> bool:
+    from minisgl.models.config import ModelConfig
+
+    return ModelConfig.from_hf(cached_load_hf_config(model_path)).is_multimodal
 
 
 def download_hf_weight(model_path: str) -> str:

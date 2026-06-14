@@ -16,6 +16,10 @@ class PendingReq:
     uid: int
     input_ids: torch.Tensor
     sampling_params: SamplingParams
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    mm_token_type_ids: torch.Tensor | None = None
+    rope_delta: torch.Tensor | None = None
     chunked_req: ChunkedReq | None = None
 
     @property

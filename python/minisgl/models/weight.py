@@ -8,6 +8,7 @@ from typing import Dict, Generator, Tuple
 
 import safetensors
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 from minisgl.distributed import get_ep_info, get_local_expert_range, get_moe_tp_info, get_tp_info
 from minisgl.layers.base import BaseOP
@@ -211,7 +212,42 @@ def _set_module_tensor(module_dict, checkpoint_key: str, weight: torch.Tensor) -
     if checkpoint_key not in module_dict:
         return False
 
-    module, attr_name = module_dict[checkpoint_key]
+    entry = module_dict[checkpoint_key]
+    if len(entry) == 3:
+        module, attr_name, entry_kind = entry
+        parent = module
+        parts = attr_name.split(".")
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        leaf_name = parts[-1]
+        current = getattr(parent, leaf_name)
+        if entry_kind == "torch_param":
+            if current.is_meta:
+                setattr(parent, leaf_name, nn.Parameter(weight, requires_grad=current.requires_grad))
+                return True
+            if current.shape != weight.shape or current.dtype != weight.dtype:
+                raise AssertionError(
+                    f"State dict mismatch for {checkpoint_key}: "
+                    f"module shape={tuple(current.shape)} dtype={current.dtype}, "
+                    f"ckpt shape={tuple(weight.shape)} dtype={weight.dtype}"
+                )
+            current.data.copy_(weight)
+            return True
+        if entry_kind == "torch_buffer":
+            if current.is_meta:
+                parent._buffers[leaf_name] = weight
+                return True
+            if current.shape != weight.shape or current.dtype != weight.dtype:
+                raise AssertionError(
+                    f"State dict mismatch for {checkpoint_key}: "
+                    f"module shape={tuple(current.shape)} dtype={current.dtype}, "
+                    f"ckpt shape={tuple(weight.shape)} dtype={weight.dtype}"
+                )
+            current.copy_(weight)
+            return True
+        raise RuntimeError(f"Unknown module dict entry kind: {entry_kind}")
+
+    module, attr_name = entry
     if hasattr(module, "weight_loader") and attr_name == "weight":
         module.weight_loader(weight)
         return True
@@ -238,7 +274,12 @@ def _stream_qwen3_5_local_qkv(
     tensor: torch.Tensor,
     device: torch.device,
 ) -> bool:
-    if config.architectures[0] not in {"Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"}:
+    if config.architectures[0] not in {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
         return False
     if ".self_attn." not in raw_name:
         return False
@@ -292,7 +333,12 @@ def _stream_qwen3_5_linear_attn_proj(
     tensor: torch.Tensor,
     device: torch.device,
 ) -> bool:
-    if config.architectures[0] not in {"Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"}:
+    if config.architectures[0] not in {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
         return False
     if ".linear_attn." not in raw_name:
         return False
@@ -447,6 +493,11 @@ def _build_module_dict(model: BaseOP, prefix: str = "") -> Dict[str, Tuple[BaseO
 
         if isinstance(value, (torch.Tensor, torch.nn.Parameter)):
             module_dict[full_name] = (model, name)
+        elif isinstance(value, torch.nn.Module):
+            for param_name, _ in value.named_parameters(recurse=True, remove_duplicate=False):
+                module_dict[f"{full_name}.{param_name}"] = (value, param_name, "torch_param")
+            for buffer_name, _ in value.named_buffers(recurse=True, remove_duplicate=False):
+                module_dict[f"{full_name}.{buffer_name}"] = (value, buffer_name, "torch_buffer")
         elif isinstance(value, OPList):
             for i, op in enumerate(value.op_list):
                 module_dict.update(_build_module_dict(op, f"{full_name}.{i}"))
