@@ -9,6 +9,8 @@ except ImportError:  # pragma: no cover - Triton is expected on CUDA setups.
     triton = None
     tl = None
 
+from minisgl.fla_vendor import chunk_gated_delta_rule
+
 
 SUPPORTED_LINEAR_ATTN_BACKENDS = {"torch", "sglang"}
 
@@ -30,7 +32,767 @@ def has_sglang_linear_attn_kernel() -> bool:
     return triton is not None and tl is not None
 
 
+def linear_attn_prefill_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+    gf = gate.float()
+    betaf = beta.float()
+    h = state.float()
+    t, hv, _ = q.shape
+    out = torch.empty((t, hv, v.shape[2]), device=v.device, dtype=torch.float32)
+    for i in range(t):
+        h.mul_(torch.exp(gf[i]).view(hv, 1, 1))
+        value_residual = vf[i] - torch.einsum("hkv,hk->hv", h, kf[i])
+        value_residual = value_residual * betaf[i].unsqueeze(-1)
+        h.add_(kf[i].unsqueeze(-1) * value_residual.unsqueeze(-2))
+        out[i] = torch.einsum("hkv,hk->hv", h, qf[i] * scale)
+    state.copy_(h.to(state.dtype))
+    return out.to(v.dtype)
+
+
+def linear_attn_prefill_chunk_scan_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+    gf = gate.float()
+    betaf = beta.float()
+    h = state.float()
+    t, hv, _ = q.shape
+    v_dim = v.shape[2]
+    out = torch.empty((t, hv, v_dim), device=v.device, dtype=torch.float32)
+    eye = torch.eye(q.shape[2], device=q.device, dtype=torch.float32).expand(hv, -1, -1)
+
+    for chunk_start in range(0, t, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, t)
+        chunk_len = chunk_end - chunk_start
+        gc = gf[chunk_start:chunk_end]
+        kc = kf[chunk_start:chunk_end]
+        vc = vf[chunk_start:chunk_end]
+        betac = betaf[chunk_start:chunk_end]
+        qc = qf[chunk_start:chunk_end]
+
+        gc_cumsum = torch.cumsum(gc, dim=0)
+        A = torch.zeros((chunk_len, hv, chunk_len), device=q.device, dtype=torch.float32)
+        for i in range(chunk_len):
+            for j in range(i):
+                A[i, :, j] = (
+                    betac[i]
+                    * torch.exp(gc_cumsum[i] - gc_cumsum[j])
+                    * torch.sum(kc[i] * kc[j], dim=-1)
+                )
+        A_inv = torch.zeros_like(A)
+        for h_idx in range(hv):
+            tri = torch.eye(chunk_len, device=q.device, dtype=torch.float32) + A[:, h_idx, :]
+            A_inv[:, h_idx, :] = torch.linalg.inv(tri)
+
+        u = torch.einsum("ihj,jhv->ihv", A_inv, vc * betac.unsqueeze(-1))
+        w = torch.einsum(
+            "ihj,jhk->ihk",
+            A_inv,
+            kc * betac.unsqueeze(-1) * torch.exp(gc_cumsum).unsqueeze(-1),
+        )
+
+        h_state_chunks = torch.empty((chunk_len, hv, q.shape[2], v_dim), device=q.device, dtype=torch.float32)
+        running_h = h.clone()
+        for i in range(chunk_len):
+            h_state_chunks[i] = running_h
+            running_h = torch.exp(gc[i]).view(hv, 1, 1) * running_h + kc[i].unsqueeze(-1) * u[i].unsqueeze(-2)
+
+        for i in range(chunk_len):
+            cross = torch.einsum("hkv,hk->hv", h_state_chunks[i], qc[i] * scale)
+            intra_mask = torch.arange(chunk_len, device=q.device) <= i
+            scores = torch.einsum("hk,jhk->hj", qc[i], kc)
+            scores = scores * torch.exp(gc_cumsum[i] - gc_cumsum).transpose(0, 1)
+            intra = torch.einsum("hj,jhv->hv", scores[:, intra_mask], u[intra_mask])
+            out[chunk_start + i] = cross + intra
+        h = running_h
+
+    state.copy_(h.to(state.dtype))
+    return out.to(v.dtype)
+
+
+def linear_attn_prefill_hf_chunk_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    initial_dtype = q.dtype
+    compute_dtype = torch.float64
+    qf = q.to(compute_dtype).permute(1, 0, 2).unsqueeze(0).contiguous()
+    kf = k.to(compute_dtype).permute(1, 0, 2).unsqueeze(0).contiguous()
+    vf = v.to(compute_dtype).permute(1, 0, 2).unsqueeze(0).contiguous()
+    betaf = beta.to(compute_dtype).permute(1, 0).unsqueeze(0).contiguous()
+    gf = gate.to(compute_dtype).permute(1, 0).unsqueeze(0).contiguous()
+    statef = state.to(compute_dtype).unsqueeze(0).contiguous()
+
+    batch_size, num_heads, sequence_length, k_head_dim = kf.shape
+    v_head_dim = vf.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    qf = torch.nn.functional.pad(qf, (0, 0, 0, pad_size))
+    kf = torch.nn.functional.pad(kf, (0, 0, 0, pad_size))
+    vf = torch.nn.functional.pad(vf, (0, 0, 0, pad_size))
+    betaf = torch.nn.functional.pad(betaf, (0, pad_size))
+    gf = torch.nn.functional.pad(gf, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    qf = qf * scale
+
+    v_beta = vf * betaf.unsqueeze(-1)
+    k_beta = kf * betaf.unsqueeze(-1)
+    q_chunks, k_chunks, v_chunks, k_beta_chunks, v_beta_chunks = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (qf, kf, vf, k_beta, v_beta)
+    ]
+    g_chunks = gf.reshape(gf.shape[0], gf.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
+
+    g_chunks = g_chunks.cumsum(dim=-1)
+    decay_mask = ((g_chunks.unsqueeze(-1) - g_chunks.unsqueeze(-2)).tril().exp()).tril()
+    attn = -((k_beta_chunks @ k_chunks.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value_chunks = attn @ v_beta_chunks
+    k_cumdecay = attn @ (k_beta_chunks * g_chunks.exp().unsqueeze(-1))
+
+    last_recurrent_state = statef
+    core_attn_out = torch.zeros_like(value_chunks)
+    for i in range(total_sequence_length // chunk_size):
+        q_i = q_chunks[:, :, i]
+        k_i = k_chunks[:, :, i]
+        v_i = value_chunks[:, :, i]
+        attn_i = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g_chunks[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn_i @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g_chunks[:, :, i, -1, None, None].exp()
+            + (k_i * (g_chunks[:, :, i, -1, None] - g_chunks[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    core_attn_out = core_attn_out.reshape(batch_size, num_heads, -1, v_head_dim)
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    out = core_attn_out.transpose(1, 2).contiguous().squeeze(0).to(initial_dtype)
+    final_state = last_recurrent_state.squeeze(0).contiguous()
+    state.copy_(final_state.to(state.dtype))
+    return out
+
+
+def linear_attn_prefill_chunk_stable_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+    gf = gate.float()
+    betaf = beta.float()
+    h = state.float()
+
+    t, hv, k_dim = q.shape
+    v_dim = v.shape[2]
+    out = torch.empty((t, hv, v_dim), device=v.device, dtype=torch.float32)
+
+    for chunk_start in range(0, t, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, t)
+        n = chunk_end - chunk_start
+        qc = qf[chunk_start:chunk_end]
+        kc = kf[chunk_start:chunk_end]
+        vc = vf[chunk_start:chunk_end]
+        gc = gf[chunk_start:chunk_end]
+        betac = betaf[chunk_start:chunk_end]
+
+        g_cumsum = gc.cumsum(dim=0)  # [n, hv]
+        # L[i, j] = beta_i * <k_i, k_j> * exp(g_i_cum - g_j_cum), for j < i
+        k_dot = torch.einsum("ihk,jhk->ijh", kc, kc)  # [n, n, hv]
+        g_diff = g_cumsum[:, None, :] - g_cumsum[None, :, :]
+        L = betac[:, None, :] * k_dot * torch.exp(g_diff)
+        tril_mask = torch.tril(torch.ones((n, n), device=q.device, dtype=torch.bool), diagonal=-1)
+        L = torch.where(tril_mask.unsqueeze(-1), L, torch.zeros_like(L))
+
+        # Solve (I + L_h) U_h = beta * V for each head h, chunk-local.
+        rhs_u = betac.unsqueeze(-1) * vc  # [n, hv, v]
+        U = torch.empty_like(rhs_u)
+        rhs_w = betac.unsqueeze(-1) * kc * torch.exp(g_cumsum).unsqueeze(-1)  # [n, hv, k]
+        W = torch.empty_like(rhs_w)
+        eye = torch.eye(n, device=q.device, dtype=torch.float32)
+        for h_idx in range(hv):
+            A_h = eye + L[:, :, h_idx]
+            U[:, h_idx] = torch.linalg.solve_triangular(A_h, rhs_u[:, h_idx], upper=False)
+            W[:, h_idx] = torch.linalg.solve_triangular(A_h, rhs_w[:, h_idx], upper=False)
+
+        running_h = h
+        h_before = torch.empty((n, hv, k_dim, v_dim), device=q.device, dtype=torch.float32)
+        for i in range(n):
+            h_before[i] = running_h
+            running_h = torch.exp(gc[i]).view(hv, 1, 1) * running_h + kc[i].unsqueeze(-1) * U[i].unsqueeze(-2)
+
+        # Cross-chunk contribution from initial state.
+        cross = torch.einsum("ihkv,ihk->ihv", h_before, qc * scale)
+        # Intra-chunk contribution from solved values.
+        for i in range(n):
+            scores = torch.einsum("hk,jhk->hj", qc[i] * scale, kc[: i + 1])
+            decay = torch.exp(g_cumsum[i] - g_cumsum[: i + 1]).transpose(0, 1)
+            intra = torch.einsum("jh,jhv->hv", scores.transpose(0, 1) * decay.transpose(0, 1), U[: i + 1])
+            out[chunk_start + i] = cross[i] + intra
+
+        h = running_h
+
+    state.copy_(h.to(state.dtype))
+    return out.to(v.dtype)
+
+
+def linear_attn_chunk_local_cumsum_reference(
+    gate: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    gatef = gate.float()
+    t, hv = gatef.shape
+    out = torch.empty_like(gatef)
+    for chunk_start in range(0, t, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, t)
+        out[chunk_start:chunk_end] = gatef[chunk_start:chunk_end].cumsum(dim=0)
+    return out
+
+
+def linear_attn_chunk_intra_reference(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Placeholder reference that preserves the chunk-stage API shape.
+    # For now, reuse the numerically correct HF-style chunk reference components.
+    kf = k.float()
+    vf = v.float()
+    betaf = beta.float()
+    gcf = g_cumsum.float()
+    t, hv, k_dim = k.shape
+    v_dim = v.shape[2]
+    u = torch.empty((t, hv, v_dim), device=v.device, dtype=torch.float32)
+    w = torch.empty((t, hv, k_dim), device=v.device, dtype=torch.float32)
+
+    for chunk_start in range(0, t, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, t)
+        n = chunk_end - chunk_start
+        kc = kf[chunk_start:chunk_end]
+        vc = vf[chunk_start:chunk_end]
+        betac = betaf[chunk_start:chunk_end]
+        gcc = gcf[chunk_start:chunk_end]
+
+        kc64 = kc.double()
+        vc64 = vc.double()
+        betac64 = betac.double()
+        gcc64 = gcc.double()
+        k_dot = torch.einsum("ihk,jhk->ijh", kc64, kc64)
+        g_diff = gcc64[:, None, :] - gcc64[None, :, :]
+        lower = torch.tril(torch.ones((n, n), device=k.device, dtype=torch.bool), diagonal=-1)
+        A = betac64[:, None, :] * k_dot * torch.exp(g_diff)
+        A = torch.where(lower.unsqueeze(-1), A, torch.zeros_like(A))
+        eye = torch.eye(n, device=k.device, dtype=torch.float64)
+        rhs_u = betac64.unsqueeze(-1) * vc64
+        rhs_w = betac64.unsqueeze(-1) * kc64 * torch.exp(gcc64).unsqueeze(-1)
+        for h_idx in range(hv):
+            tri = eye + A[:, :, h_idx]
+            u[chunk_start:chunk_end, h_idx] = torch.linalg.solve_triangular(
+                tri, rhs_u[:, h_idx], upper=False
+            ).float()
+            w[chunk_start:chunk_end, h_idx] = torch.linalg.solve_triangular(
+                tri, rhs_w[:, h_idx], upper=False
+            ).float()
+
+    return w, u
+
+
+def linear_attn_chunk_state_scan_reference(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gate: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    kf = k.float()
+    wf = w.float()
+    uf = u.float()
+    gf = gate.float()
+    h = state.float()
+    t, hv, k_dim = k.shape
+    v_dim = u.shape[2]
+    num_chunks = (t + chunk_size - 1) // chunk_size
+    h_chunk = torch.empty((num_chunks, hv, k_dim, v_dim), device=k.device, dtype=torch.float32)
+    v_new = torch.empty((t, hv, v_dim), device=k.device, dtype=torch.float32)
+    for chunk_idx, chunk_start in enumerate(range(0, t, chunk_size)):
+        chunk_end = min(chunk_start + chunk_size, t)
+        h_chunk[chunk_idx] = h
+        for i in range(chunk_start, chunk_end):
+            v_new[i] = uf[i] - torch.einsum("hk,hkv->hv", wf[i], h)
+        for i in range(chunk_start, chunk_end):
+            h = torch.exp(gf[i]).view(hv, 1, 1) * h + kf[i].unsqueeze(-1) * v_new[i].unsqueeze(-2)
+    return h_chunk, v_new, h
+
+
+def linear_attn_chunk_output_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v_new: torch.Tensor,
+    h_chunk: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    qf = q.float()
+    kf = k.float()
+    vnf = v_new.float()
+    gcf = g_cumsum.float()
+    t, hv, _ = q.shape
+    v_dim = v_new.shape[2]
+    out = torch.empty((t, hv, v_dim), device=q.device, dtype=torch.float32)
+    for chunk_idx, chunk_start in enumerate(range(0, t, chunk_size)):
+        chunk_end = min(chunk_start + chunk_size, t)
+        qc = qf[chunk_start:chunk_end]
+        kc = kf[chunk_start:chunk_end]
+        vnc = vnf[chunk_start:chunk_end]
+        gcc = gcf[chunk_start:chunk_end]
+        n = chunk_end - chunk_start
+        h0 = h_chunk[chunk_idx]
+        cross = torch.einsum("hkv,ihk->ihv", h0, qc * scale * torch.exp(gcc).unsqueeze(-1))
+        for i in range(n):
+            scores = torch.einsum("hk,jhk->hj", qc[i] * scale, kc[: i + 1])
+            decay = torch.exp(gcc[i] - gcc[: i + 1]).transpose(0, 1)
+            intra = torch.einsum("hj,jhv->hv", scores * decay, vnc[: i + 1])
+            out[chunk_start + i] = cross[i] + intra
+    return out.to(q.dtype)
+
+
+def linear_attn_prefill_chunk_sglang_style_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    # Match sglang chunk kernels: intra/recompute path expects low-precision
+    # value tensors entering tl.dot. The surrounding prefill path may still
+    # hand us fp32 values for numerical reasons, so keep a local low-precision
+    # view for chunk intra only.
+    if v.dtype != q.dtype:
+        v = v.to(q.dtype)
+    g_cumsum = linear_attn_chunk_local_cumsum_reference(gate, chunk_size=chunk_size)
+    w, u = linear_attn_chunk_intra_triton(k, v, g_cumsum, beta, chunk_size=chunk_size)
+    h_chunk, v_new, h_final = linear_attn_chunk_state_scan_reference(k, w, u, gate, state, chunk_size=chunk_size)
+    out = linear_attn_chunk_output_reference(q, k, v_new, h_chunk, g_cumsum, scale, chunk_size=chunk_size)
+    state.copy_(h_final.to(state.dtype))
+    return out
+
+
+def linear_attn_chunk_intra_triton(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if triton is None or tl is None:
+        return linear_attn_chunk_intra_reference(
+            k,
+            v,
+            g_cumsum,
+            beta,
+            chunk_size=chunk_size,
+        )
+    if chunk_size != 64:
+        return linear_attn_chunk_intra_reference(
+            k,
+            v,
+            g_cumsum,
+            beta,
+            chunk_size=chunk_size,
+        )
+    t, hv, k_dim = k.shape
+    v_dim = v.shape[2]
+    num_chunks = (t + chunk_size - 1) // chunk_size
+    # Stage 1: build chunk-local lower-triangular system M = I + L.
+    A = torch.empty((num_chunks, hv, chunk_size, chunk_size), device=k.device, dtype=k.dtype)
+    grid = (num_chunks, hv)
+    bk = min(64, triton.next_power_of_2(k_dim))
+    _linear_attn_chunk_kkt_kernel[grid](
+        k,
+        g_cumsum,
+        beta,
+        A,
+        stride_k_tok=k.stride(0),
+        stride_k_head=k.stride(1),
+        stride_g_tok=g_cumsum.stride(0),
+        stride_beta_tok=beta.stride(0),
+        stride_A_chunk=A.stride(0),
+        stride_A_head=A.stride(1),
+        stride_A_row=A.stride(2),
+        T=t,
+        HV=hv,
+        K=k_dim,
+        CHUNK=chunk_size,
+        BK=bk,
+        num_warps=4,
+        num_stages=3,
+    )
+    # Stage 2: invert each chunk-local lower-triangular matrix in Triton so the
+    # recompute path consumes the same "(I + L)^{-1}" representation as sglang.
+    _linear_attn_chunk_inverse_tril_kernel[grid](
+        A,
+        stride_A_chunk=A.stride(0),
+        stride_A_head=A.stride(1),
+        stride_A_row=A.stride(2),
+        T=t,
+        CHUNK=chunk_size,
+        num_warps=4,
+        num_stages=3,
+    )
+    u = torch.empty((t, hv, v_dim), device=v.device, dtype=torch.float32)
+    w = torch.empty((t, hv, k_dim), device=v.device, dtype=torch.float32)
+    grid_recompute = (num_chunks, hv)
+    bk_recompute = min(64, triton.next_power_of_2(k_dim))
+    bv_recompute = min(64, triton.next_power_of_2(v_dim))
+    _linear_attn_chunk_recompute_u_kernel[grid_recompute](
+        v,
+        beta,
+        A,
+        u,
+        stride_v_tok=v.stride(0),
+        stride_v_head=v.stride(1),
+        stride_beta_tok=beta.stride(0),
+        stride_A_chunk=A.stride(0),
+        stride_A_head=A.stride(1),
+        stride_A_row=A.stride(2),
+        stride_u_tok=u.stride(0),
+        stride_u_head=u.stride(1),
+        T=t,
+        HV=hv,
+        V=v_dim,
+        CHUNK=chunk_size,
+        BV=bv_recompute,
+        num_warps=4,
+        num_stages=3,
+    )
+    _linear_attn_chunk_recompute_w_kernel[grid_recompute](
+        k,
+        beta,
+        g_cumsum,
+        A,
+        w,
+        stride_k_tok=k.stride(0),
+        stride_k_head=k.stride(1),
+        stride_beta_tok=beta.stride(0),
+        stride_g_tok=g_cumsum.stride(0),
+        stride_A_chunk=A.stride(0),
+        stride_A_head=A.stride(1),
+        stride_A_row=A.stride(2),
+        stride_w_tok=w.stride(0),
+        stride_w_head=w.stride(1),
+        T=t,
+        HV=hv,
+        K=k_dim,
+        CHUNK=chunk_size,
+        BK=bk_recompute,
+        num_warps=4,
+        num_stages=3,
+    )
+    return w, u
+
+
 if triton is not None:
+
+    @triton.jit
+    def _linear_attn_chunk_kkt_kernel(
+        k,
+        g_cumsum,
+        beta,
+        A,
+        stride_k_tok: tl.constexpr,
+        stride_k_head: tl.constexpr,
+        stride_g_tok: tl.constexpr,
+        stride_beta_tok: tl.constexpr,
+        stride_A_chunk: tl.constexpr,
+        stride_A_head: tl.constexpr,
+        stride_A_row: tl.constexpr,
+        T: tl.constexpr,
+        HV: tl.constexpr,
+        K: tl.constexpr,
+        CHUNK: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        chunk_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        row = tl.arange(0, CHUNK)
+        col = tl.arange(0, CHUNK)
+        tok_row = chunk_idx * CHUNK + row
+        tok_col = chunk_idx * CHUNK + col
+        row_mask = tok_row < T
+        col_mask = tok_col < T
+        valid = row[:, None] > col[None, :]
+        valid = valid & row_mask[:, None] & col_mask[None, :]
+
+        acc = tl.zeros((CHUNK, CHUNK), dtype=tl.float32)
+        for k_block in range(0, K, BK):
+            offs_k = k_block + tl.arange(0, BK)
+            mask_k = offs_k < K
+            p_row = (
+                k
+                + tok_row[:, None] * stride_k_tok
+                + head_idx * stride_k_head
+                + offs_k[None, :]
+            )
+            p_col = (
+                k
+                + tok_col[:, None] * stride_k_tok
+                + head_idx * stride_k_head
+                + offs_k[None, :]
+            )
+            b_row = tl.load(p_row, mask=row_mask[:, None] & mask_k[None, :], other=0).to(tl.float32)
+            b_col = tl.load(p_col, mask=col_mask[:, None] & mask_k[None, :], other=0).to(tl.float32)
+            acc += tl.dot(b_row, tl.trans(b_col))
+
+        p_g_row = g_cumsum + tok_row * stride_g_tok + head_idx
+        p_g_col = g_cumsum + tok_col * stride_g_tok + head_idx
+        p_beta_row = beta + tok_row * stride_beta_tok + head_idx
+        g_row = tl.load(p_g_row, mask=row_mask, other=0).to(tl.float32)
+        g_col = tl.load(p_g_col, mask=col_mask, other=0).to(tl.float32)
+        beta_row = tl.load(p_beta_row, mask=row_mask, other=0).to(tl.float32)
+        acc = acc * tl.exp(g_row[:, None] - g_col[None, :]) * beta_row[:, None]
+        acc = tl.where(valid, acc, 0.0)
+        diag = row[:, None] == col[None, :]
+        acc = tl.where(diag & row_mask[:, None] & col_mask[None, :], acc + 1.0, acc)
+
+        p_A = (
+            A
+            + chunk_idx * stride_A_chunk
+            + head_idx * stride_A_head
+            + row[:, None] * stride_A_row
+            + col[None, :]
+        )
+        tl.store(p_A, acc, mask=row_mask[:, None] & col_mask[None, :])
+
+    @triton.jit
+    def _linear_attn_chunk_inverse_tril_kernel(
+        A,
+        stride_A_chunk: tl.constexpr,
+        stride_A_head: tl.constexpr,
+        stride_A_row: tl.constexpr,
+        T: tl.constexpr,
+        CHUNK: tl.constexpr,
+    ):
+        chunk_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        row = tl.arange(0, CHUNK)
+        col = tl.arange(0, CHUNK)
+        tok = chunk_idx * CHUNK + row
+        valid_row = tok < T
+        valid = valid_row[:, None] & valid_row[None, :]
+        p_A = (
+            A
+            + chunk_idx * stride_A_chunk
+            + head_idx * stride_A_head
+            + row[:, None] * stride_A_row
+            + col[None, :]
+        )
+        b_A = tl.load(p_A, mask=valid, other=0).to(tl.float32)
+        b_inv = tl.where(row[:, None] == col[None, :], 1.0, 0.0)
+
+        for i in range(CHUNK):
+            a_row = tl.sum(tl.where((row == i)[:, None], b_A, 0.0), axis=0)
+            diag = tl.sum(tl.where(col == i, a_row, 0.0), axis=0)
+            prev = tl.where(col < i, a_row, 0.0)
+            contrib = tl.sum(prev[:, None] * b_inv, axis=0)
+            new_row = tl.where(col < i, -contrib / diag, 0.0)
+            new_row = tl.where(col == i, 1.0 / diag, new_row)
+            b_inv = tl.where((row[:, None] == i), new_row[None, :], b_inv)
+
+        tl.store(p_A, b_inv, mask=valid)
+
+    @triton.jit
+    def _linear_attn_chunk_recompute_u_kernel(
+        v,
+        beta,
+        A,
+        u,
+        stride_v_tok: tl.constexpr,
+        stride_v_head: tl.constexpr,
+        stride_beta_tok: tl.constexpr,
+        stride_A_chunk: tl.constexpr,
+        stride_A_head: tl.constexpr,
+        stride_A_row: tl.constexpr,
+        stride_u_tok: tl.constexpr,
+        stride_u_head: tl.constexpr,
+        T: tl.constexpr,
+        HV: tl.constexpr,
+        V: tl.constexpr,
+        CHUNK: tl.constexpr,
+        BV: tl.constexpr,
+    ):
+        chunk_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        row = tl.arange(0, CHUNK)
+        tok0 = chunk_idx * CHUNK
+        row_mask = (tok0 + row) < T
+        p_beta = tl.make_block_ptr(
+            beta + head_idx,
+            (T,),
+            (stride_beta_tok,),
+            (tok0,),
+            (CHUNK,),
+            (0,),
+        )
+        b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+        p_A = tl.make_block_ptr(
+            A + chunk_idx * stride_A_chunk + head_idx * stride_A_head,
+            (CHUNK, CHUNK),
+            (stride_A_row, 1),
+            (0, 0),
+            (CHUNK, CHUNK),
+            (1, 0),
+        )
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+
+        for v_block in range(0, V, BV):
+            p_v = tl.make_block_ptr(
+                v + head_idx * stride_v_head,
+                (T, V),
+                (stride_v_tok, 1),
+                (tok0, v_block),
+                (CHUNK, BV),
+                (1, 0),
+            )
+            p_u = tl.make_block_ptr(
+                u + head_idx * stride_u_head,
+                (T, V),
+                (stride_u_tok, 1),
+                (tok0, v_block),
+                (CHUNK, BV),
+                (1, 0),
+            )
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
+            b_u = tl.dot(b_A, b_vb)
+            tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    @triton.jit
+    def _linear_attn_chunk_recompute_w_kernel(
+        k,
+        beta,
+        g_cumsum,
+        A,
+        w,
+        stride_k_tok: tl.constexpr,
+        stride_k_head: tl.constexpr,
+        stride_beta_tok: tl.constexpr,
+        stride_g_tok: tl.constexpr,
+        stride_A_chunk: tl.constexpr,
+        stride_A_head: tl.constexpr,
+        stride_A_row: tl.constexpr,
+        stride_w_tok: tl.constexpr,
+        stride_w_head: tl.constexpr,
+        T: tl.constexpr,
+        HV: tl.constexpr,
+        K: tl.constexpr,
+        CHUNK: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        chunk_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        tok0 = chunk_idx * CHUNK
+        p_beta = tl.make_block_ptr(
+            beta + head_idx,
+            (T,),
+            (stride_beta_tok,),
+            (tok0,),
+            (CHUNK,),
+            (0,),
+        )
+        p_g = tl.make_block_ptr(
+            g_cumsum + head_idx,
+            (T,),
+            (stride_g_tok,),
+            (tok0,),
+            (CHUNK,),
+            (0,),
+        )
+        p_A = tl.make_block_ptr(
+            A + chunk_idx * stride_A_chunk + head_idx * stride_A_head,
+            (CHUNK, CHUNK),
+            (stride_A_row, 1),
+            (0, 0),
+            (CHUNK, CHUNK),
+            (1, 0),
+        )
+        b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+        b_g = tl.exp(tl.load(p_g, boundary_check=(0,)).to(tl.float32))
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+
+        for k_block in range(0, K, BK):
+            p_k = tl.make_block_ptr(
+                k + head_idx * stride_k_head,
+                (T, K),
+                (stride_k_tok, 1),
+                (tok0, k_block),
+                (CHUNK, BK),
+                (1, 0),
+            )
+            p_w = tl.make_block_ptr(
+                w + head_idx * stride_w_head,
+                (T, K),
+                (stride_w_tok, 1),
+                (tok0, k_block),
+                (CHUNK, BK),
+                (1, 0),
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
+            b_w = tl.dot(b_A, b_kb)
+            tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
     @triton.jit
     def _fused_gdn_gating_kernel(
@@ -391,54 +1153,18 @@ def fused_linear_attn_prefill_sglang(
     v_dim = state.shape[2]
     if v.shape != (t, hv, v_dim):
         raise ValueError(f"Expected v shape {(t, hv, v_dim)}, got {tuple(v.shape)}")
-
-    bk = triton.next_power_of_2(k_dim)
-    if triton.cdiv(k_dim, bk) != 1:
-        raise ValueError(f"Only NK=1 is supported, got K={k_dim}, BK={bk}")
-
-    # Qwen3.6 uses K=128, V=128 here. A smaller BV with more warps yields
-    # materially better prefill throughput than the previous BV=32/warp=1
-    # default, while keeping the implementation simple.
-    if v_dim >= 128:
-        bv = 16
-        num_warps = 4
-        num_stages = 3
-    else:
-        bv = min(triton.next_power_of_2(v_dim), 32)
-        num_warps = 1
-        num_stages = 3
-
-    output = torch.empty((t, hv, v_dim), dtype=v.dtype, device=v.device)
-    grid = (triton.cdiv(v_dim, bv), hv)
-    _fused_linear_attn_prefill_kv_kernel[grid](
-        q=q,
-        k=k,
-        v=v,
-        gate=gate,
-        beta=beta,
-        output=output,
-        state=state,
+    initial_state = state.permute(0, 2, 1).unsqueeze(0).contiguous()
+    initial_state_indices = torch.zeros((1,), device=state.device, dtype=torch.long)
+    out, _, h = chunk_gated_delta_rule(
+        q=q.unsqueeze(0),
+        k=k.unsqueeze(0),
+        v=v.to(q.dtype).unsqueeze(0),
+        g=gate.unsqueeze(0),
+        beta=beta.unsqueeze(0),
         scale=scale,
-        stride_q_tok=q.stride(0),
-        stride_q_head=q.stride(1),
-        stride_k_tok=k.stride(0),
-        stride_k_head=k.stride(1),
-        stride_v_tok=v.stride(0),
-        stride_v_head=v.stride(1),
-        stride_gate_tok=gate.stride(0),
-        stride_beta_tok=beta.stride(0),
-        stride_output_tok=output.stride(0),
-        stride_output_head=output.stride(1),
-        stride_state_head=state.stride(0),
-        stride_state_k=state.stride(1),
-        T=t,
-        HV=hv,
-        K=k_dim,
-        V=v_dim,
-        BK=bk,
-        BV=bv,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        initial_state=initial_state.to(q.dtype),
+        initial_state_indices=initial_state_indices,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
-    return output
+    state.copy_(initial_state[0].permute(0, 2, 1).to(state.dtype))
+    return out.squeeze(0).to(v.dtype)

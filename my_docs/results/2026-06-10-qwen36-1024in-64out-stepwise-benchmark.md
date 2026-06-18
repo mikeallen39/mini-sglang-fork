@@ -104,6 +104,7 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | W8A8 Selective Int8 + LayerNorm Prequant Reuse + Fused MoE + SGLang Linear Attention + CUDA Graph | 188.55 ms | 0.8853 s | 71.17 tok/s | 14.05 ms | 63.00 | 35759 MiB |
 | W8A8 Selective Int8 + LinearAttn Prefill Q/K Norm Outside Kernel + Fused MoE + SGLang Linear Attention + CUDA Graph | 179.30 ms | 0.8686 s | 72.53 tok/s | 13.79 ms | 63.00 | 35759 MiB |
 | W8A8 Selective Int8 + LinearAttn Prefill Launch Tuning + Q/K Norm Outside Kernel + Fused MoE + SGLang Linear Attention + CUDA Graph | 165.33 ms | 0.8158 s | 77.22 tok/s | 12.95 ms | 63.00 | 35759 MiB |
+| W8A8 Selective Int8 + Vendored Full-Kernel Chunk Prefill + Fused MoE + SGLang Linear Attention + CUDA Graph | 113.29 ms | 0.7610 s | 82.79 tok/s | 12.08 ms | 63.00 | 35759 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 
@@ -633,6 +634,76 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
     - `179.30 ms / 0.8686 s / 72.53 tok/s`
     提升到：
     - `165.33 ms / 0.8158 s / 77.22 tok/s`
+
+### 3.11 Then Switch LinearAttn Prefill to Vendored Full-Kernel Chunk Backend
+
+- 配置：
+  - 基于 `W8A8 Selective Int8 + LinearAttn Prefill Launch Tuning + Q/K Norm Outside Kernel`
+  - 保持：
+    - `Fused MoE`
+    - `SGLang Linear Attention`
+    - `CUDA Graph`
+  - 只替换 `linear_attn` 的 `prefill` backend：
+    - 从本地 tuned 串行 prefill kernel
+    - 切到 vendored `sglang`-style full-kernel chunk backend
+- 集成方式：
+  - 将 `sglang` 的 chunk prefill 相关实现 vendoring 到：
+    - [python/minisgl/fla_vendor](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/python/minisgl/fla_vendor)
+  - 在 [python/minisgl/linear_attention.py](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/python/minisgl/linear_attention.py) 中，`fused_linear_attn_prefill_sglang()` 改为直接调用：
+    - `chunk_gated_delta_rule(...)`
+  - `initial_state` 以 in-place 更新方式承接 prefill 结束后的最终 state，并写回当前 `state`
+  - 为避免上游 helper 在 import 时触发 CUDA 初始化，vendored helper 做了最小本地化裁剪
+- CUDA Graph：
+  - 纯文本 benchmark 下保留 `CUDA Graph`
+  - 启动日志确认：
+    - `Start capturing CUDA graphs with sizes: [1]`
+    - `Capturing graphs: bs = 1 ...`
+    - `Scheduler is ready`
+- 设计动机：
+  - 之前的“外层 chunk 包装”或“半 Triton 半 Torch”接法都无法转化成端到端收益
+  - 这次改为尽量接近上游 `sglang` 的完整 prefill chunk backend，避免继续做局部半迁移
+- 服务显存：
+  - 运行中占用：`35759 MiB / 81920 MiB`
+- `run1` 输出文件：
+  - [chunk_vendor_fullkernel_run1_output.txt](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/my_docs/results/output_texts/chunk_vendor_fullkernel_run1_output.txt)
+- 正确性检查：
+  - `run1` 输出为正常中文说明性续写
+  - 未见乱码、随机符号串、异常重复或明显语义崩坏
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 11870.44 ms | 12.5167 s | 63 |
+| run2 | 117.28 ms | 0.7653 s | 63 |
+| run3 | 111.92 ms | 0.7595 s | 63 |
+| run4 | 111.89 ms | 0.7591 s | 63 |
+| run5 | 112.08 ms | 0.7600 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 113.29 ms |
+| run2-run5 avg E2E | 0.7610 s |
+| run2-run5 output_tps | 82.79 tok/s |
+| avg_ms_per_output_token | 12.08 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `3.10` 当前最佳：
+  - `TTFT` 更快约 `31.5%`
+  - `E2E` 更快约 `6.7%`
+  - `output_tps` 更高约 `7.2%`
+
+- 相对当前 `bf16` 最优：
+  - `TTFT` 更快约 `41.9%`
+  - `E2E` 更快约 `18.5%`
+  - `output_tps` 更高约 `22.8%`
+
+- 说明：
+  - `run1` 极慢主要来自首次 Triton chunk kernel 编译，不代表稳态性能
+  - 这次结果说明，真正完整 kernel 化并保留 `CUDA Graph` 后，chunk-scan 路线可以把此前离线 microbench 的潜力转化成端到端收益
+  - 之前多次失败并不是 chunk-scan 思路错误，而是：
+    - 只迁了一部分 kernel
+    - 仍残留 Python/Torch fallback
+    - 或错误地关闭了 `CUDA Graph`
 
 #### 3.6.3 EP 小结
 

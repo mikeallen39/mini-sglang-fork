@@ -357,7 +357,7 @@ def _adjust_config(config: EngineConfig):
         if not has_sglang_linear_attn_kernel():
             raise ValueError("linear_attn_backend='sglang' requires Triton")
         if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > 4:
-            override("cuda_graph_max_bs", 0)
+            override("cuda_graph_max_bs", 4)
             logger.warning_rank0(
                 "CUDA graph is temporarily restricted to bs<=4 for the sglang linear attention backend"
             )
