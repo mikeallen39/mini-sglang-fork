@@ -401,6 +401,76 @@ def _stream_qwen3_5_linear_attn_proj(
     return _set_module_tensor(module_dict, fused_key, fused)
 
 
+def _stream_glm4_mlp_proj(
+    config,
+    model,
+    module_dict,
+    raw_name: str,
+    tensor: torch.Tensor,
+    device: torch.device,
+) -> bool:
+    if config.architectures[0] != "Glm4MoeLiteForCausalLM":
+        return False
+    if not raw_name.endswith(".weight"):
+        return False
+    if ".mlp." not in raw_name:
+        return False
+
+    base_name = raw_name
+    if base_name.startswith("model.language_model."):
+        base_name = f"model.{base_name.removeprefix('model.language_model.')}"
+    elif base_name.startswith("language_model."):
+        base_name = f"model.{base_name.removeprefix('language_model.')}"
+    if base_name.startswith("model.layers."):
+        parts = base_name.split(".")
+        if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) >= config.num_layers:
+            return False
+
+    if base_name.endswith(".mlp.gate_proj.weight"):
+        fused_key = base_name.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight")
+        slot = "gate"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".mlp.up_proj.weight"):
+        fused_key = base_name.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight")
+        slot = "up"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".mlp.shared_experts.gate_proj.weight"):
+        fused_key = base_name.replace(
+            ".mlp.shared_experts.gate_proj.weight",
+            ".mlp.shared_experts.gate_up_proj.weight",
+        )
+        slot = "gate"
+        expected_type = "LinearColParallelMerged"
+    elif base_name.endswith(".mlp.shared_experts.up_proj.weight"):
+        fused_key = base_name.replace(
+            ".mlp.shared_experts.up_proj.weight",
+            ".mlp.shared_experts.gate_up_proj.weight",
+        )
+        slot = "up"
+        expected_type = "LinearColParallelMerged"
+    else:
+        return False
+
+    if fused_key not in module_dict:
+        return False
+
+    module, attr_name = module_dict[fused_key]
+    if attr_name != "weight" or type(module).__name__ != expected_type:
+        return False
+
+    if not hasattr(module, "_stacked_params"):
+        module._stacked_params = {}
+    module._stacked_params[slot] = tensor
+    if "gate" not in module._stacked_params or "up" not in module._stacked_params:
+        return True
+
+    fused = torch.cat(
+        [module._stacked_params.pop("gate"), module._stacked_params.pop("up")],
+        dim=0,
+    ).to(device=device)
+    return _set_module_tensor(module_dict, fused_key, fused)
+
+
 def _get_local_expert_layout(num_experts: int) -> tuple[int, int, int]:
     ep_info = get_ep_info()
     if ep_info.size == 1:
@@ -575,6 +645,15 @@ def load_weight_to_model(
                         device,
                     ):
                         continue
+                    if _stream_glm4_mlp_proj(
+                        config,
+                        model,
+                        module_dict,
+                        raw_name,
+                        tensor,
+                        device,
+                    ):
+                        continue
 
                     if (info := _stream_get_merge_info(name)) is None:
                         out_key, out_tensor = name, tensor
@@ -622,6 +701,8 @@ def load_weight_to_model(
             "Skipped %d checkpoint tensors without matching module entries",
             len(set(unmatched_keys)),
         )
+        for key in sorted(set(unmatched_keys))[:256]:
+            logger.warning("Unmatched checkpoint key: %s", key)
 
     logger.info(f"Model weights loaded successfully to {device}")
 
@@ -701,12 +782,26 @@ def _merge_state_dict(
             processed_keys.add(original_key)
             continue
 
-        # GLM4 shared experts - keep as is (do not merge gate_proj + up_proj)
-        # Example: model.layers.0.mlp.shared_experts.gate_proj
-        if ".mlp.shared_experts." in key:
-            filtered_state_dict[key] = state_dict[original_key]
-            processed_keys.add(original_key)
-            continue
+        # GLM4 shared experts: merge gate_proj + up_proj -> gate_up_proj
+        # Example:
+        #   model.layers.1.mlp.shared_experts.gate_proj.weight
+        #   model.layers.1.mlp.shared_experts.up_proj.weight
+        # -> model.layers.1.mlp.shared_experts.gate_up_proj.weight
+        if ".mlp.shared_experts." in key and ".gate_proj" in key:
+            gate_proj = state_dict[original_key]
+            up_proj_key = original_key.replace(".gate_proj", ".up_proj")
+            down_proj_key = original_key.replace(".gate_proj", ".down_proj")
+
+            if up_proj_key in state_dict and down_proj_key in state_dict:
+                up_proj = state_dict[up_proj_key]
+                down_proj = state_dict[down_proj_key]
+                gate_up_key = key.replace(".gate_proj", ".gate_up_proj")
+                filtered_state_dict[gate_up_key] = torch.cat([gate_proj, up_proj], dim=0)
+                filtered_state_dict[down_proj_key] = down_proj
+                processed_keys.add(original_key)
+                processed_keys.add(up_proj_key)
+                processed_keys.add(down_proj_key)
+                continue
 
         # Skip MLA keys - they don't need merging
         if use_mla and (
@@ -741,11 +836,20 @@ def _merge_state_dict(
                 processed_keys.add(original_key)
                 continue
 
-        # Standard MLP: keep gate_proj and up_proj separate (no merge)
-        # Skip merging for gate_proj - load directly instead
+        # Standard dense MLP / GLM4 dense first layer:
+        # merge gate_proj + up_proj -> gate_up_proj when the local model exposes
+        # a fused gate_up_proj parameter.
         if ".gate_proj" in key and ".mlp.experts." not in key and ".mlp.shared_experts." not in key:
-            # Direct load without merging
-            filtered_state_dict[key] = state_dict[original_key]
+            gate_proj = state_dict[original_key]
+            up_proj_key = original_key.replace(".gate_proj", ".up_proj")
+            if up_proj_key in state_dict:
+                up_proj = state_dict[up_proj_key]
+                gate_up_key = key.replace(".gate_proj", ".gate_up_proj")
+                filtered_state_dict[gate_up_key] = torch.cat([gate_proj, up_proj], dim=0)
+                processed_keys.add(original_key)
+                processed_keys.add(up_proj_key)
+                continue
+            filtered_state_dict[key] = gate_proj
             processed_keys.add(original_key)
             continue
 

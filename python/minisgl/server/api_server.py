@@ -40,6 +40,15 @@ _GLOBAL_STATE = None
 _ROLE_MARKERS = ("<|user|>", "<|assistant|>", "<|observation|>", "<|system|>")
 
 
+def _default_chat_template_kwargs(state: "FrontendManager") -> Dict[str, Any] | None:
+    if state.config.model_config.model_type == "glm4_moe_lite":
+        # GLM-4.7-Flash emits a malformed prompt suffix (`</think>`) when
+        # enable_thinking=False is forced through the HF chat template. Use the
+        # model's default template behavior instead.
+        return None
+    return {"enable_thinking": False}
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -385,7 +394,7 @@ async def generate(req: GenerateRequest, request: Request):
     chat_template_kwargs = None
     if req.use_chat_template:
         prompt = [{"role": "user", "content": req.prompt}]
-        chat_template_kwargs = {"enable_thinking": False}
+        chat_template_kwargs = _default_chat_template_kwargs(state)
     else:
         prompt = req.prompt
     await state.send_one(
@@ -434,7 +443,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
-            chat_template_kwargs={"enable_thinking": False},
+            chat_template_kwargs=_default_chat_template_kwargs(state),
         )
     )
 
@@ -472,7 +481,7 @@ async def shell_completion(req: OpenAICompletionRequest):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
-            chat_template_kwargs={"enable_thinking": False},
+            chat_template_kwargs=_default_chat_template_kwargs(state),
         )
     )
 

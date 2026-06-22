@@ -29,10 +29,9 @@ class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, processor: Any | None = None) -> None:
         self.tokenizer = tokenizer
         self.processor = processor
-        self._strip_glm_think = (
-            getattr(tokenizer, "name_or_path", "").endswith("GLM-4.7-Flash")
-            or tokenizer.convert_tokens_to_ids("[gMASK]") not in (-1, None)
-        )
+        # Keep the model-provided generation prompt intact. GLM chat templates
+        # intentionally append "<think>" and stripping it changes generation behavior.
+        self._strip_glm_think = False
 
     def _tokenize_multimodal(
         self,
@@ -74,8 +73,6 @@ class TokenizeManager:
             **(msg.chat_template_kwargs or {}),
         )
         assert isinstance(prompt, str)
-        if self._strip_glm_think and prompt.endswith("<think>"):
-            prompt = prompt[: -len("<think>")]
         inputs = self.processor(
             text=[prompt],
             images=images or None,
@@ -111,8 +108,6 @@ class TokenizeManager:
                     **(msg.chat_template_kwargs or {}),
                 )
                 assert isinstance(prompt, str)
-                if self._strip_glm_think and prompt.endswith("<think>"):
-                    prompt = prompt[: -len("<think>")]
             else:
                 prompt = msg.text
             input_ids: torch.Tensor = (  # type: ignore

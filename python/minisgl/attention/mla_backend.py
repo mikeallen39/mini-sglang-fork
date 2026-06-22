@@ -235,8 +235,24 @@ class MLABackend(BaseAttnBackend):
 
         # Build kv_indptr and kv_indices
         kv_indptr_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
-        page_table = get_global_ctx().page_table
-        kv_indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+        if (
+            self.capture is not None
+            and padded_size in self.capture_bs
+            and reqs
+            and reqs[0].table_idx >= self.max_graph_bs
+        ):
+            # Graph capture/replay dummy requests use synthetic table_idx values that
+            # intentionally live beyond the scheduler-managed page table range. In
+            # that case, kv indices must come from the static capture buffers rather
+            # than from the global page table.
+            page_table = self.capture.page_table[:padded_size, :]
+            base_table_idx = reqs[0].table_idx
+        else:
+            page_table = get_global_ctx().page_table
+            base_table_idx = 0
+        kv_indices = torch.cat(
+            [page_table[req.table_idx - base_table_idx, : req.device_len] for req in reqs]
+        )
 
         # FlashInfer MLA expects the KV lengths for each request here.
         kv_len_arr_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
@@ -260,7 +276,6 @@ class MLABackend(BaseAttnBackend):
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = MLACaptureData.create(max_bs, max_seq_len, self.kvcache.device)
-        capture.page_table = capture.page_table.view(-1)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
@@ -273,7 +288,7 @@ class MLABackend(BaseAttnBackend):
                 use_cuda_graph=True,
                 qo_indptr=capture.cu_seqlens_q[: bs + 1],
                 kv_indptr=capture.cu_seqlens_k[: bs + 1],
-                kv_indices=capture.page_table,
+                kv_indices=capture.page_table[:bs, :].reshape(-1),
                 kv_len_arr=capture.seq_lens[:bs],
                 backend="auto",
             )
@@ -289,6 +304,15 @@ class MLABackend(BaseAttnBackend):
         bs = batch.size
         assert bs in self.capture_bs and bs in self.graph_wrappers and self.capture
 
+        # Seed capture page table with the same dummy-page layout used by the main
+        # engine graph dummy requests. page_size is fixed to 1 for MLA, so a dense
+        # arange over max_seq_len is sufficient.
+        capture = self.capture
+        max_seq_len = capture.page_table.size(1)
+        capture.page_table[:bs, :max_seq_len].copy_(
+            torch.arange(max_seq_len, device=self.device, dtype=torch.int32).expand(bs, -1)
+        )
+
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, MLAMetadata)
@@ -299,5 +323,22 @@ class MLABackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, MLAMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
+        # CUDA graph replay must update the static buffers that were bound into the
+        # graph wrapper at capture time. Without these copies, decode replay can use
+        # stale dummy-request indices/lengths from graph capture, which is especially
+        # visible on long-context MLA workloads.
+        q_len = metadata.qo_indptr_cpu.size(0)
+        kv_len = metadata.kv_indptr_cpu.size(0)
+        self.capture.cu_seqlens_q[:q_len].copy_(
+            metadata.qo_indptr_cpu.to(self.device, non_blocking=True)
+        )
+        self.capture.cu_seqlens_k[:kv_len].copy_(
+            metadata.kv_indptr_cpu.to(self.device, non_blocking=True)
+        )
+        flat_len = metadata.kv_indices.numel()
+        self.capture.page_table.view(-1)[:flat_len].copy_(metadata.kv_indices)
+        self.capture.seq_lens[:bs].copy_(
+            metadata.kv_len_arr_cpu.to(self.device, non_blocking=True)
+        )
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
