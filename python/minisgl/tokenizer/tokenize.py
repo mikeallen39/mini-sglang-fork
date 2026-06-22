@@ -29,8 +29,6 @@ class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, processor: Any | None = None) -> None:
         self.tokenizer = tokenizer
         self.processor = processor
-        # Keep the model-provided generation prompt intact. GLM chat templates
-        # intentionally append "<think>" and stripping it changes generation behavior.
         self._strip_glm_think = False
 
     def _tokenize_multimodal(

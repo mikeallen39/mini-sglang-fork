@@ -68,6 +68,7 @@ class MLAMetadata(BaseAttnMetadata):
     causal:            bool
     wrapper:           BatchMLAPagedAttentionWrapper
     initialized:       bool = False
+    fast_plan:         bool = False
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -135,20 +136,38 @@ class MLABackend(BaseAttnBackend):
             return
 
         metadata.initialized = True
-        metadata.wrapper.plan(
-            qo_indptr=metadata.qo_indptr_cpu,
-            kv_indptr=metadata.kv_indptr_cpu,
-            kv_indices=metadata.kv_indices,
-            kv_len_arr=metadata.kv_len_arr_cpu,
-            num_heads=metadata.num_qo_heads,
-            head_dim_ckv=metadata.kv_lora_rank,
-            head_dim_kpe=metadata.qk_rope_head_dim,
-            page_size=metadata.page_size,
-            causal=metadata.causal,
-            sm_scale=1.0 / math.sqrt(metadata.kv_lora_rank + metadata.qk_rope_head_dim),
-            q_data_type=torch.bfloat16,  # TODO: get from config
-            kv_data_type=torch.bfloat16,
-        )
+        sm_scale = 1.0 / math.sqrt(metadata.kv_lora_rank + metadata.qk_rope_head_dim)
+        if metadata.fast_plan:
+            fast_mla_decode_plan(
+                metadata.wrapper,
+                metadata.qo_indptr_cpu,
+                metadata.kv_indptr_cpu,
+                metadata.kv_indices,
+                metadata.kv_len_arr_cpu,
+                metadata.num_qo_heads,
+                metadata.kv_lora_rank,
+                metadata.qk_rope_head_dim,
+                metadata.page_size,
+                metadata.causal,
+                sm_scale,
+                torch.bfloat16,
+                torch.bfloat16,
+            )
+        else:
+            metadata.wrapper.plan(
+                qo_indptr=metadata.qo_indptr_cpu,
+                kv_indptr=metadata.kv_indptr_cpu,
+                kv_indices=metadata.kv_indices,
+                kv_len_arr=metadata.kv_len_arr_cpu,
+                num_heads=metadata.num_qo_heads,
+                head_dim_ckv=metadata.kv_lora_rank,
+                head_dim_kpe=metadata.qk_rope_head_dim,
+                page_size=metadata.page_size,
+                causal=metadata.causal,
+                sm_scale=sm_scale,
+                q_data_type=torch.bfloat16,  # TODO: get from config
+                kv_data_type=torch.bfloat16,
+            )
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -239,7 +258,7 @@ class MLABackend(BaseAttnBackend):
             self.capture is not None
             and padded_size in self.capture_bs
             and reqs
-            and reqs[0].table_idx >= self.max_graph_bs
+            and reqs[0].table_idx >= get_global_ctx().page_table.size(0) - self.max_graph_bs
         ):
             # Graph capture/replay dummy requests use synthetic table_idx values that
             # intentionally live beyond the scheduler-managed page table range. In
@@ -269,6 +288,7 @@ class MLABackend(BaseAttnBackend):
             causal=batch.is_prefill,
             wrapper=self.decode_wrapper if batch.is_decode else self.prefill_wrapper,
         )
+
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
@@ -340,5 +360,59 @@ class MLABackend(BaseAttnBackend):
         self.capture.seq_lens[:bs].copy_(
             metadata.kv_len_arr_cpu.to(self.device, non_blocking=True)
         )
+        # Replay-safe wrappers must read from the static buffers that were bound
+        # during graph capture. Copying into capture tensors is insufficient if
+        # metadata still points plan() at the per-request dynamic tensors.
+        metadata.qo_indptr_cpu = self.capture.cu_seqlens_q[:q_len].cpu()
+        metadata.kv_indptr_cpu = self.capture.cu_seqlens_k[:kv_len].cpu()
+        metadata.kv_indices = self.capture.page_table[:bs, :].reshape(-1)[:flat_len]
+        metadata.kv_len_arr_cpu = self.capture.seq_lens[:bs].cpu()
         metadata.wrapper = self.graph_wrappers[bs]
+        metadata.fast_plan = False
         self._initialize_metadata_once(metadata)
+
+
+def fast_mla_decode_plan(
+    wrapper,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+    num_heads: int,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    page_size: int,
+    causal: bool,
+    sm_scale: float,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+) -> None:
+    """Fast replay-only MLA plan compatible with the local flashinfer build."""
+    wrapper._causal = causal
+    wrapper._page_size = page_size
+    wrapper._sm_scale = sm_scale
+    try:
+        wrapper._cached_module.plan(
+            wrapper._float_workspace_buffer,
+            wrapper._int_workspace_buffer,
+            wrapper._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except TypeError:
+        # Older flashinfer builds keep the legacy signature with plan_info only.
+        wrapper._cached_module.plan(
+            wrapper._float_workspace_buffer,
+            wrapper._int_workspace_buffer,
+            wrapper._plan_info,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )

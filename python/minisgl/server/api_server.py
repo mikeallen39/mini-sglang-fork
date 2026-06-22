@@ -82,6 +82,7 @@ class GenerateRequest(BaseModel):
     max_tokens: int
     ignore_eos: bool = False
     use_chat_template: bool = True
+    enable_thinking: bool | None = None
 
 
 class Message(BaseModel):
@@ -130,6 +131,7 @@ class OpenAICompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
 
     ignore_eos: bool = False
+    enable_thinking: bool | None = None
 
 
 def _normalize_message_content(
@@ -394,7 +396,11 @@ async def generate(req: GenerateRequest, request: Request):
     chat_template_kwargs = None
     if req.use_chat_template:
         prompt = [{"role": "user", "content": req.prompt}]
-        chat_template_kwargs = _default_chat_template_kwargs(state)
+        chat_template_kwargs = (
+            {"enable_thinking": req.enable_thinking}
+            if req.enable_thinking is not None
+            else _default_chat_template_kwargs(state)
+        )
     else:
         prompt = req.prompt
     await state.send_one(
@@ -443,7 +449,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
-            chat_template_kwargs=_default_chat_template_kwargs(state),
+            chat_template_kwargs=(
+                {"enable_thinking": req.enable_thinking}
+                if req.enable_thinking is not None
+                else _default_chat_template_kwargs(state)
+            ),
         )
     )
 
@@ -481,7 +491,11 @@ async def shell_completion(req: OpenAICompletionRequest):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
-            chat_template_kwargs=_default_chat_template_kwargs(state),
+            chat_template_kwargs=(
+                {"enable_thinking": req.enable_thinking}
+                if req.enable_thinking is not None
+                else _default_chat_template_kwargs(state)
+            ),
         )
     )
 

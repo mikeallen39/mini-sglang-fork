@@ -30,22 +30,47 @@ into local fused `gate_up_proj` modules for:
 
 This caused malformed generation such as repeated `!`.
 
-### 2. MLA CUDA graph replay used stale capture-time decode metadata
+### 2. MLA CUDA graph replay misclassified real requests as dummy graph requests
 
 `graph=0 + mla` produced normal long-context output, but `graph=1 + mla` produced degraded text on long prompts.
 
 The issue was in [python/minisgl/attention/mla_backend.py](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/python/minisgl/attention/mla_backend.py):
 
-- replay did not copy real request-time
-  - `qo_indptr`
-  - `kv_indptr`
-  - `kv_indices`
-  - `kv_len_arr`
-  into the static graph buffers bound during capture
+- replay already copied real request-time metadata into static graph buffers, but the
+  dummy-request detection condition was wrong
+- the old check used a condition equivalent to:
+  - `req.table_idx >= max_graph_bs`
+- this is invalid because real scheduler-assigned `table_idx` values can easily be
+  larger than `max_graph_bs`
+- under `graph=1`, some real decode requests were therefore treated as dummy graph
+  requests and incorrectly fetched `kv_indices` from the static `capture.page_table`
+  instead of the real global page table
 
-As a result, graph replay could use stale dummy-request decode metadata.
+As a result, MLA graph replay read the wrong KV pages for long-context decode.
 
-The replay path was fixed to update the static capture buffers before re-planning the wrapper.
+The fix was to identify dummy graph requests by their true reserved table range:
+
+- `req.table_idx >= get_global_ctx().page_table.size(0) - max_graph_bs`
+
+This cleanly separates:
+
+- real decode requests, which must use the live global page table
+- graph dummy requests, which are allowed to use the static capture page table
+
+The replay path still updates the static capture buffers before re-planning the wrapper.
+
+### 3. GLM no-thinking path
+
+`GLM-4.7-Flash` supports both:
+
+- default thinking mode
+- `enable_thinking=false`
+
+The local service now preserves the model's official template behavior instead of using
+an earlier incorrect "trim `<think>`" workaround. After the fixes:
+
+- `graph=0`: thinking and no-thinking both produce normal long outputs
+- `graph=1`: thinking and no-thinking both produce normal long outputs
 
 ## Sanity Check
 
@@ -56,7 +81,7 @@ After the fixes:
   - `graph=0 + mla`
   - `graph=1 + mla`
 
-The validated `run1` output file is:
+The validated default-thinking `run1` output file is:
 
 - [glm47_flash_graph_1024in_64out_run1_output.txt](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/my_docs/results/output_texts/glm47_flash_graph_1024in_64out_run1_output.txt)
 
@@ -64,11 +89,21 @@ The validated `run1` output file is:
 
 ### Raw runs
 
+Initial valid graph-enabled run:
+
 - `run1: TTFT=125.16 ms, E2E=1.1317 s, output_tokens=63`
 - `run2: TTFT=126.87 ms, E2E=1.1342 s, output_tokens=63`
 - `run3: TTFT=125.83 ms, E2E=1.1326 s, output_tokens=63`
 - `run4: TTFT=126.84 ms, E2E=1.1360 s, output_tokens=63`
 - `run5: TTFT=125.92 ms, E2E=1.1328 s, output_tokens=63`
+
+Post-fix verification rerun:
+
+- `run1: TTFT=171.09 ms, E2E=1.1804 s, output_tokens=63`
+- `run2: TTFT=125.11 ms, E2E=1.1399 s, output_tokens=63`
+- `run3: TTFT=126.88 ms, E2E=1.1441 s, output_tokens=63`
+- `run4: TTFT=128.12 ms, E2E=1.1432 s, output_tokens=63`
+- `run5: TTFT=126.18 ms, E2E=1.1406 s, output_tokens=63`
 
 ### Steady state
 

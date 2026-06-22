@@ -255,7 +255,9 @@ class Glm4MoeLiteExperts(BaseOP):
         output = ctx.moe_backend.forward(
             hidden_states=hidden_states,
             w1=self.gate_up_proj,
+            w1_scale=None,
             w2=self.down_proj,
+            w2_scale=None,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
