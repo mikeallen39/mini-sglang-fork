@@ -19,6 +19,8 @@ from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight, load_weight_to_model
 from minisgl.moe import create_moe_backend
 from minisgl.quantization import process_weights_after_loading, set_quantization
+from minisgl.speculative import DFlashVerifyInput, parse_dflash_draft_config
+from minisgl.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
 from minisgl.utils import (
     div_even,
     has_sglang_linear_attn_kernel,
@@ -41,6 +43,7 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    hidden_states: torch.Tensor | None = None
 
 
 class Engine:
@@ -86,6 +89,52 @@ class Engine:
         else:
             load_weight_to_model(config.model_path, self.model, device=self.device)
         process_weights_after_loading(self.model)
+
+        # ======================= Draft model initialization ========================
+        self.speculative_algorithm = config.speculative_algorithm
+        self.draft_model = None
+        self.dflash_target_layer_ids: list[int] | None = None
+        self.dflash_mask_token_id: int | None = None
+        if config.speculative_algorithm is not None:
+            if config.speculative_algorithm != "DFLASH":
+                raise ValueError(
+                    f"Unsupported speculative algorithm in mini-sglang: {config.speculative_algorithm}"
+                )
+            if config.speculative_draft_model_path is None or config.draft_model_config is None:
+                raise ValueError(
+                    "Speculative decoding requires a valid draft model path and config."
+                )
+            logger.info_rank0(
+                "Initializing draft model for speculative decoding: algo=%s draft=%s",
+                config.speculative_algorithm,
+                config.speculative_draft_model_path,
+            )
+            draft_cfg = parse_dflash_draft_config(draft_hf_config=config.draft_hf_config)
+            target_num_layers = int(config.model_config.num_layers)
+            draft_num_layers = int(draft_cfg.require_num_layers())
+            self.dflash_target_layer_ids = draft_cfg.resolve_target_layer_ids(
+                target_num_layers=target_num_layers,
+                draft_num_layers=draft_num_layers,
+            )
+            self.dflash_mask_token_id = draft_cfg.mask_token_id
+            draft_archs = config.draft_model_config.architectures
+            if draft_archs is None or any(arch not in {"DFlashDraftModel"} for arch in draft_archs):
+                raise NotImplementedError(
+                    "Phase-1 DFLASH plumbing succeeded, but mini-sglang does not yet "
+                    f"support loading draft architecture(s): {draft_archs}. "
+                    "Runtime speculative decoding and DFlash draft model classes are not integrated yet."
+                )
+            with torch.device(model_init_device), torch_dtype(config.dtype):
+                self.draft_model = create_model(config.draft_model_config)
+            if config.use_dummy_weight:
+                self.draft_model.load_state_dict(self._load_draft_weight_state_dict(config))
+            else:
+                load_weight_to_model(
+                    config.speculative_draft_model_path,
+                    self.draft_model,
+                    device=self.device,
+                )
+            process_weights_after_loading(self.draft_model)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -222,6 +271,19 @@ class Engine:
                 k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device).items()
             }
 
+    def _load_draft_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        assert self.draft_model is not None
+        if config.use_dummy_weight:
+            return {
+                k: torch.randn_like(v, device=self.device)
+                for k, v in self.draft_model.state_dict().items()
+            }
+        assert config.speculative_draft_model_path is not None
+        return {
+            k: v.to(self.dtype)
+            for k, v in load_weight(config.speculative_draft_model_path, self.device).items()
+        }
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
 
@@ -296,6 +358,10 @@ class Engine:
                 self.model.finish_cuda_graph_replay(batch, capture_dummy_reqs)
             else:
                 logits = self.model.forward()
+            hidden_states = None
+            getter = getattr(self.model, "get_last_hidden_capture", None)
+            if callable(getter):
+                hidden_states = getter()
 
         for req in batch.reqs:
             req.complete_one()
@@ -304,7 +370,101 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, hidden_states)
+
+    def forward_verify_greedy(
+        self,
+        *,
+        batch: Batch,
+        verify_input: DFlashVerifyInput,
+        prepare_metadata,
+        make_positions,
+        make_input_tuple,
+        token_pool: torch.Tensor,
+        prepare_verify_batch=None,
+        finalize_verify_batch=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if batch.size != 1:
+            raise NotImplementedError("Minimal DFLASH verify currently supports single-request batches only.")
+        candidate_tokens = verify_input.draft_token
+        if candidate_tokens.ndim != 2 or int(candidate_tokens.shape[0]) != 1:
+            raise ValueError(
+                f"candidate_tokens must have shape [1, block], got {tuple(candidate_tokens.shape)}"
+            )
+
+        req = batch.reqs[0]
+        block = int(candidate_tokens.shape[1])
+        if block <= 0:
+            accept_len = torch.zeros((1,), dtype=torch.int32, device=self.device)
+            bonus = candidate_tokens[:, 0].to(device=self.device, dtype=torch.int64)
+            return accept_len, bonus, None
+
+        verify_input_ids = torch.cat(
+            [
+                req.input_ids,
+                candidate_tokens[0, :-1].to(device="cpu", dtype=torch.int32),
+            ],
+            dim=0,
+        )
+        verify_req = Req(
+            input_ids=verify_input_ids,
+            table_idx=self.graph_dummy_base_idx,
+            cached_len=req.cached_len,
+            output_len=req.output_len,
+            uid=req.uid,
+            sampling_params=req.sampling_params,
+            cache_handle=req.cache_handle,
+            pixel_values=req.pixel_values,
+            image_grid_thw=req.image_grid_thw,
+            mm_token_type_ids=req.mm_token_type_ids,
+            rope_delta=req.rope_delta,
+        )
+        self.model.copy_runtime_state_slot(req.table_idx, verify_req.table_idx)
+        try:
+            verify_batch = Batch(reqs=[verify_req], phase="prefill", mode="verify")
+            verify_batch.spec_info = verify_input
+            if self.dflash_target_layer_ids is not None:
+                verify_batch.capture_hidden_layer_ids = self.dflash_target_layer_ids
+            if prepare_verify_batch is not None:
+                prepare_verify_batch(req, verify_req, verify_batch)
+            prepare_metadata(verify_batch)
+            verify_batch.text_positions = make_positions(verify_batch, self.device)
+            verify_batch.positions = verify_batch.text_positions
+            verify_batch.mrope_positions = None
+            input_mapping = make_input_tuple(verify_batch, self.device)
+            verify_batch.input_ids = token_pool[input_mapping]
+            verify_batch.out_loc = self.page_table[input_mapping]
+            self.attn_backend.prepare_metadata(verify_batch)
+
+            with self.ctx.forward_batch(verify_batch):
+                logits = self.model.forward()
+                hidden_states = None
+                getter = getattr(self.model, "get_last_hidden_capture", None)
+                if callable(getter):
+                    hidden_states = getter()
+
+            if int(logits.shape[0]) != block:
+                raise RuntimeError(
+                    f"DFLASH verify expected {block} logits rows, got {tuple(logits.shape)}"
+                )
+            if hidden_states is not None and int(hidden_states.shape[0]) != block:
+                raise RuntimeError(
+                    f"DFLASH verify expected {block} hidden rows, got "
+                    f"{None if hidden_states is None else tuple(hidden_states.shape)}"
+                )
+            target_predict = torch.argmax(logits, dim=-1).view(1, block)
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidate_tokens.to(device=target_predict.device, dtype=torch.long),
+                target_predict=target_predict.to(dtype=torch.long),
+            )
+            next_hidden = None
+            if hidden_states is not None:
+                next_hidden = hidden_states[accept_len.to(torch.long)].contiguous()
+            return accept_len, bonus, next_hidden
+        finally:
+            if "verify_batch" in locals() and finalize_verify_batch is not None:
+                finalize_verify_batch(req, verify_req, verify_batch)
+            self.model.clear_runtime_state_slot(verify_req.table_idx)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

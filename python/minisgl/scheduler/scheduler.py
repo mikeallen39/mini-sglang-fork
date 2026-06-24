@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
+import time
 from minisgl.core import Batch, Req, SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -12,6 +13,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
+from minisgl.speculative import DFlashDraftInput, DFlashVerifyInput
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -91,16 +93,29 @@ class Scheduler(SchedulerIOMixin):
         self.page_size = config.page_size
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self._dflash_profile_count = 0
+        self._dflash_profile_draft_ms = 0.0
+        self._dflash_profile_verify_ms = 0.0
+        self._dflash_profile_update_ms = 0.0
+        self._dflash_profile_accept_tokens = 0
+        self._dflash_profile_total_tokens = 0
         self._run_startup_prewarm()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, forward_output = last_data[0].batch, last_data[1]
+        _, next_tokens_cpu, copy_done, hidden_states = forward_output
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        if (
+            self.config.speculative_algorithm == "DFLASH"
+            and batch.is_prefill
+            and batch.mode == "target"
+        ):
+            self._update_dflash_prefill_state(batch, next_tokens_cpu, hidden_states)
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -120,6 +135,237 @@ class Scheduler(SchedulerIOMixin):
                     new_finished_reqs.add(req)
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
+
+    def _update_dflash_prefill_state(
+        self,
+        batch: Batch,
+        next_tokens_cpu: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+    ) -> None:
+        if self.engine.draft_model is None:
+            raise RuntimeError("DFLASH prefill state update requires a loaded draft model.")
+        if hidden_states is None:
+            raise RuntimeError(
+                "DFLASH prefill expected target hidden capture, but got None. "
+                "Target model capture wiring is incomplete."
+            )
+        if self.engine.dflash_mask_token_id is None:
+            raise RuntimeError("DFLASH mask_token_id is not initialized.")
+        if batch.prefill_extend_lens is None:
+            raise RuntimeError(
+                "DFLASH prefill state update requires prefill_extend_lens to be captured."
+            )
+
+        lengths = list(batch.prefill_extend_lens)
+        offset = 0
+        hidden_cpu = hidden_states.to(device="cpu")
+        for i, req in enumerate(batch.reqs):
+            length = lengths[i]
+            req_hidden = hidden_cpu[offset : offset + length]
+            offset += length
+            req.speculative_target_hidden = req_hidden.contiguous()
+            projected = self.engine.draft_model.project_target_hidden(
+                req_hidden.to(device=self.device, dtype=self.engine.dtype)
+            )
+            req.speculative_draft_hidden = projected.to(device="cpu")
+            req.speculative_verified_id = next_tokens_cpu[i : i + 1].clone()
+            req.speculative_draft_tokens = None
+        assert offset == hidden_states.shape[0]
+
+    def _build_dflash_draft_block(self, req: Req) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.engine.draft_model is None:
+            raise RuntimeError("DFLASH draft model is not loaded.")
+        if req.speculative_verified_id is None:
+            raise RuntimeError("DFLASH req is missing speculative_verified_id.")
+        if req.speculative_draft_hidden is None:
+            raise RuntimeError("DFLASH req is missing speculative_draft_hidden.")
+
+        target_model = self.engine.model
+        model_core = getattr(target_model, "model", None)
+        if model_core is None or not hasattr(model_core, "embed_tokens"):
+            raise RuntimeError("DFLASH target model is missing model.embed_tokens.")
+        if not hasattr(target_model, "lm_head"):
+            raise RuntimeError("DFLASH target model is missing lm_head.")
+
+        verified_id = req.speculative_verified_id.to(device=self.device, dtype=torch.long)
+        draft_hidden = req.speculative_draft_hidden.to(device=self.device, dtype=self.engine.dtype)
+        prefix_lens = torch.tensor([req.cached_len], device=self.device, dtype=torch.long)
+        return self.engine.draft_model.draft_block_greedy(
+            verified_id=verified_id,
+            draft_context=draft_hidden[-1:, :],
+            prefix_lens=prefix_lens,
+            target_embedding=model_core.embed_tokens,
+            target_lm_head=target_model.lm_head,
+            block_size=self.config.speculative_num_draft_tokens,
+        )
+
+    def _build_dflash_draft_input(self, req: Req) -> DFlashDraftInput:
+        if req.speculative_verified_id is None:
+            raise RuntimeError("DFLASH req is missing speculative_verified_id.")
+        if req.speculative_target_hidden is None:
+            raise RuntimeError("DFLASH req is missing speculative_target_hidden.")
+        return DFlashDraftInput(
+            verified_id=req.speculative_verified_id.to(device=self.device, dtype=torch.long),
+            target_hidden=req.speculative_target_hidden.to(device=self.device, dtype=self.engine.dtype),
+            ctx_lens=torch.tensor(
+                [int(req.speculative_target_hidden.shape[0])],
+                device=self.device,
+                dtype=torch.int32,
+            ),
+            draft_seq_lens=torch.tensor([req.cached_len], device=self.device, dtype=torch.int32),
+        )
+
+    def _update_dflash_step_state(self, req: Req, token_id: int, hidden_states: torch.Tensor | None) -> None:
+        req.speculative_verified_id = torch.tensor([token_id], dtype=torch.int32)
+        if hidden_states is None:
+            return
+        hidden_cpu = hidden_states.to(device="cpu").contiguous()
+        req.speculative_target_hidden = hidden_cpu
+        projected = self.engine.draft_model.project_target_hidden(
+            hidden_states.to(device=self.device, dtype=self.engine.dtype)
+        )
+        req.speculative_draft_hidden = projected.to(device="cpu")
+
+    def _prepare_dflash_verify_batch(self, req: Req, verify_req: Req, verify_batch: Batch) -> None:
+        verify_batch.padded_reqs = verify_batch.reqs
+        verify_batch.prefill_extend_lens = [verify_req.extend_len]
+        self.page_table[verify_req.table_idx].fill_(-1)
+        self.page_table[verify_req.table_idx, : req.cached_len].copy_(
+            self.page_table[req.table_idx, : req.cached_len]
+        )
+        self.token_pool[verify_req.table_idx, : verify_req.device_len].copy_(
+            verify_req.input_ids.to(device=self.device, dtype=torch.int32)
+        )
+        self.cache_manager.allocate_paged(verify_batch.reqs, self.page_table)
+
+    def _finalize_dflash_verify_batch(self, req: Req, verify_req: Req, verify_batch: Batch) -> None:
+        _ = req, verify_batch
+        self.cache_manager._free(self.page_table[verify_req.table_idx, verify_req.cached_len : verify_req.device_len])
+        self.page_table[verify_req.table_idx].fill_(-1)
+
+    def _append_req_token(self, req: Req, token_id: int) -> bool:
+        req.cached_len = req.device_len
+        req.device_len += 1
+        req.append_host(torch.tensor([token_id], dtype=torch.int32))
+        finished = not req.can_decode
+        if not req.sampling_params.ignore_eos:
+            finished |= token_id in self.eos_token_ids
+        return finished
+
+    def _run_one_target_decode_step(self, req: Req) -> tuple[int, bool]:
+        batch = Batch(reqs=[req], phase="decode", mode="verify")
+        batch.capture_hidden_layer_ids = self.engine.dflash_target_layer_ids
+        forward_input = self._prepare_batch(batch)
+        with self.engine.ctx.forward_batch(batch):
+            logits = self.engine.model.forward()
+            hidden_states = None
+            getter = getattr(self.engine.model, "get_last_hidden_capture", None)
+            if callable(getter):
+                hidden_states = getter()
+        sample_args = self.engine.sampler.prepare(batch)
+        next_token_gpu = self.engine.sampler.sample(logits[: batch.size], sample_args).to(torch.int32)
+        next_token = int(next_token_gpu[0].item())
+        finished = self._append_req_token(req, next_token)
+        self._update_dflash_step_state(req, next_token, hidden_states)
+        return next_token, finished
+
+    def _run_dflash_single_decode(self, req: Req) -> bool:
+        if self.config.speculative_algorithm != "DFLASH":
+            return False
+        if self.engine.draft_model is None:
+            return False
+        if req.speculative_verified_id is None or req.speculative_draft_hidden is None:
+            return False
+        if req.speculative_target_hidden is None:
+            return False
+        if len(self.decode_manager.running_reqs) != 1:
+            return False
+
+        t0 = time.perf_counter()
+        draft_input = self._build_dflash_draft_input(req)
+        draft_tokens, draft_hidden = self._build_dflash_draft_block(req)
+        req.speculative_target_hidden = draft_input.target_hidden.to(device="cpu")
+        t1 = time.perf_counter()
+        verify_input = DFlashVerifyInput(
+            draft_token=draft_tokens.to(device=self.device, dtype=torch.long),
+            draft_token_num=max(int(draft_tokens.shape[1]) - 1, 0),
+        )
+        accept_len, bonus, next_hidden = self.engine.forward_verify_greedy(
+            batch=Batch(reqs=[req], phase="decode", mode="verify"),
+            verify_input=verify_input,
+            prepare_metadata=self.engine.attn_backend.prepare_metadata,
+            make_positions=_make_positions,
+            make_input_tuple=_make_input_tuple,
+            token_pool=self.token_pool,
+            prepare_verify_batch=self._prepare_dflash_verify_batch,
+            finalize_verify_batch=self._finalize_dflash_verify_batch,
+        )
+        t2 = time.perf_counter()
+        accept_len_i = int(accept_len[0].item())
+        bonus_token = int(bonus[0].item())
+        reply: List[DetokenizeMsg] = []
+        with self.cache_manager.lazy_free_region():
+            finished = False
+            accepted_tokens = draft_tokens[0, 1 : 1 + accept_len_i].tolist()
+            for token in accepted_tokens:
+                finished = self._append_req_token(req, int(token))
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=int(token), finished=False))
+                if finished:
+                    break
+            if not finished:
+                finished = self._append_req_token(req, bonus_token)
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=bonus_token, finished=False))
+
+            if reply:
+                reply[-1].finished = finished
+            if finished:
+                self.decode_manager.remove_req(req)
+                self._free_req_resources(req)
+                self.finished_reqs = {req}
+            else:
+                self.finished_reqs = set()
+
+        if not finished:
+            self._update_dflash_step_state(req, bonus_token, next_hidden)
+        t3 = time.perf_counter()
+        req.speculative_draft_tokens = verify_input.draft_token.to(device="cpu", dtype=torch.int32)
+        req.speculative_accept_len = accept_len_i
+        if draft_hidden is not None:
+            req.speculative_draft_hidden = draft_hidden[0].to(device="cpu")
+        self._dflash_profile_count += 1
+        self._dflash_profile_draft_ms += (t1 - t0) * 1000.0
+        self._dflash_profile_verify_ms += (t2 - t1) * 1000.0
+        self._dflash_profile_update_ms += (t3 - t2) * 1000.0
+        self._dflash_profile_accept_tokens += accept_len_i
+        self._dflash_profile_total_tokens += max(int(draft_tokens.shape[1]) - 1, 0)
+        denom = max(self._dflash_profile_total_tokens, 1)
+        logger.info_rank0(
+            "DFLASH step %d: draft_ms=%.3f verify_ms=%.3f update_ms=%.3f "
+            "accept_len=%d block=%d accept_rate_running=%.3f (%d/%d)",
+            self._dflash_profile_count,
+            (t1 - t0) * 1000.0,
+            (t2 - t1) * 1000.0,
+            (t3 - t2) * 1000.0,
+            accept_len_i,
+            max(int(draft_tokens.shape[1]) - 1, 0),
+            self._dflash_profile_accept_tokens / denom,
+            self._dflash_profile_accept_tokens,
+            self._dflash_profile_total_tokens,
+        )
+        if self._dflash_profile_count % 10 == 0:
+            logger.info_rank0(
+                "DFLASH profile avg over %d steps: draft_ms=%.3f verify_ms=%.3f update_ms=%.3f "
+                "accept_rate=%.3f (%d/%d)",
+                self._dflash_profile_count,
+                self._dflash_profile_draft_ms / self._dflash_profile_count,
+                self._dflash_profile_verify_ms / self._dflash_profile_count,
+                self._dflash_profile_update_ms / self._dflash_profile_count,
+                self._dflash_profile_accept_tokens / denom,
+                self._dflash_profile_accept_tokens,
+                self._dflash_profile_total_tokens,
+            )
+        self.send_result(reply)
+        return True
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -160,6 +406,15 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs, self.page_table)
+        batch.prefill_extend_lens = [req.extend_len for req in batch.reqs] if batch.is_prefill else None
+        if (
+            self.config.speculative_algorithm == "DFLASH"
+            and batch.is_prefill
+            and self.engine.dflash_target_layer_ids is not None
+        ):
+            batch.capture_hidden_layer_ids = self.engine.dflash_target_layer_ids
+        else:
+            batch.capture_hidden_layer_ids = None
         mm_reqs = [req for req in batch.reqs if req.pixel_values is not None]
         if mm_reqs:
             if len(mm_reqs) != len(batch.reqs):
@@ -248,6 +503,15 @@ class Scheduler(SchedulerIOMixin):
         blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        if (
+            self.config.speculative_algorithm == "DFLASH"
+            and len(self.decode_manager.running_reqs) == 1
+            and not self.prefill_manager.runnable
+        ):
+            only_req = next(iter(self.decode_manager.running_reqs))
+            if self._run_dflash_single_decode(only_req):
+                return
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None

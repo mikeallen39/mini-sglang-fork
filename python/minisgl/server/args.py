@@ -17,6 +17,11 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    speculative_algorithm: str | None = None
+    speculative_draft_model_path: str | None = None
+    speculative_num_draft_tokens: int | None = None
+    speculative_dflash_block_size: int | None = None
+    speculative_dflash_draft_window_size: int | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -265,6 +270,42 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        default=ServerArgs.speculative_algorithm,
+        choices=["DFLASH"],
+        help="Speculative decoding algorithm. Currently only DFLASH is plumbed in mini-sglang.",
+    )
+
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        type=str,
+        default=ServerArgs.speculative_draft_model_path,
+        help="Path to the speculative draft model checkpoint.",
+    )
+
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=ServerArgs.speculative_num_draft_tokens,
+        help="Speculative draft token count / verify window length.",
+    )
+
+    parser.add_argument(
+        "--speculative-dflash-block-size",
+        type=int,
+        default=ServerArgs.speculative_dflash_block_size,
+        help="DFLASH block size. Alias of speculative_num_draft_tokens for DFLASH.",
+    )
+
+    parser.add_argument(
+        "--speculative-dflash-draft-window-size",
+        type=int,
+        default=ServerArgs.speculative_dflash_draft_window_size,
+        help="DFLASH draft-model KV window size.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -281,6 +322,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    if kwargs.get("speculative_draft_model_path") and kwargs["speculative_draft_model_path"].startswith("~"):
+        kwargs["speculative_draft_model_path"] = os.path.expanduser(
+            kwargs["speculative_draft_model_path"]
+        )
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]
@@ -336,6 +381,22 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     kwargs["quantization"] = None if kwargs["quantization"] == "none" else kwargs["quantization"]
     if kwargs["linear_attn_backend"] == "auto":
         kwargs["linear_attn_backend"] = "sglang" if has_sglang_linear_attn_kernel() else "torch"
+
+    if kwargs["speculative_algorithm"] == "DFLASH":
+        if kwargs["speculative_draft_model_path"] is None:
+            raise ValueError(
+                "DFLASH speculative decoding requires --speculative-draft-model-path."
+            )
+        if kwargs["speculative_dflash_block_size"] is not None:
+            if (
+                kwargs["speculative_num_draft_tokens"] is not None
+                and kwargs["speculative_num_draft_tokens"] != kwargs["speculative_dflash_block_size"]
+            ):
+                raise ValueError(
+                    "For DFLASH, --speculative-num-draft-tokens and "
+                    "--speculative-dflash-block-size must match."
+                )
+            kwargs["speculative_num_draft_tokens"] = kwargs["speculative_dflash_block_size"]
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

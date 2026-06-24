@@ -836,20 +836,38 @@ class Qwen3_5Model(BaseOP):
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
+        self._last_captured_hidden_states: torch.Tensor | None = None
 
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
         *,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+        batch = get_global_ctx().batch
+        capture_hidden_layer_ids = (
+            set(batch.capture_hidden_layer_ids) if batch.capture_hidden_layer_ids else None
+        )
+        captured_hidden_states: list[torch.Tensor] = []
+        self._last_captured_hidden_states = None
         x = self.embed_tokens.forward(input_ids) if inputs_embeds is None else inputs_embeds
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        for layer_id, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
-        return self.norm.forward(x, residual)[0]
+            if capture_hidden_layer_ids is not None and layer_id in capture_hidden_layer_ids:
+                captured_hidden_states.append(x)
+        final_hidden = self.norm.forward(x, residual)[0]
+        if capture_hidden_layer_ids is None:
+            return final_hidden, None
+        if len(captured_hidden_states) == 0:
+            hidden = final_hidden.new_empty((final_hidden.shape[0], 0))
+            self._last_captured_hidden_states = hidden
+            return final_hidden, hidden
+        hidden = torch.cat(captured_hidden_states, dim=-1)
+        self._last_captured_hidden_states = hidden
+        return final_hidden, hidden
 
 
 class Qwen3_5ForCausalLM(BaseLLMModel):
@@ -870,10 +888,14 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
                 "Multimodal request reached the Qwen3.5 text-only path. "
                 "A Qwen3-VL model implementation is still required."
             )
-        output = self.model.forward(batch.input_ids)
+        output, hidden_states = self.model.forward(batch.input_ids)
+        self._last_hidden_capture = hidden_states
         if ENV.PROFILE_QWEN35.value:
             self._maybe_log_profile()
         return self.lm_head.forward(output)
+
+    def get_last_hidden_capture(self) -> torch.Tensor | None:
+        return getattr(self, "_last_hidden_capture", None)
 
     @property
     def supports_prefix_cache(self) -> bool:
@@ -912,6 +934,12 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         self.model.linear_state_cache.clear(table_idx)
+
+    def copy_runtime_state_slot(self, src_table_idx: int, dst_table_idx: int) -> None:
+        for layer in self.model.layers.op_list:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                linear_attn.copy_state(src_table_idx, dst_table_idx)
 
     def _maybe_log_profile(self) -> None:
         counter = getattr(self, "_profile_counter", 0) + 1

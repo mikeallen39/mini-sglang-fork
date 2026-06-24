@@ -13,6 +13,8 @@ _MODEL_REGISTRY = {
     "Qwen3_5MoeForConditionalGeneration": (".qwen3_vl_moe", "Qwen3_5VLMoeForConditionalGeneration"),
     # GLM4 models
     "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
+    # Speculative draft models
+    "DFlashDraftModel": (".dflash", "DFlashDraftModel"),
 }
 
 

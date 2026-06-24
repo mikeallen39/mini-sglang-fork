@@ -38,6 +38,11 @@ class Req:
     image_grid_thw: torch.Tensor | None = None
     mm_token_type_ids: torch.Tensor | None = None
     rope_delta: torch.Tensor | None = None
+    speculative_verified_id: torch.Tensor | None = None
+    speculative_accept_len: int = 0
+    speculative_draft_tokens: torch.Tensor | None = None
+    speculative_target_hidden: torch.Tensor | None = None
+    speculative_draft_hidden: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -49,6 +54,14 @@ class Req:
             assert self.mm_token_type_ids.is_cpu
         if self.rope_delta is not None:
             assert self.rope_delta.is_cpu
+        if self.speculative_verified_id is not None:
+            assert self.speculative_verified_id.is_cpu
+        if self.speculative_draft_tokens is not None:
+            assert self.speculative_draft_tokens.is_cpu
+        if self.speculative_target_hidden is not None:
+            assert self.speculative_target_hidden.is_cpu
+        if self.speculative_draft_hidden is not None:
+            assert self.speculative_draft_hidden.is_cpu
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
@@ -84,6 +97,10 @@ class Req:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    mode: Literal["target", "draft", "verify"] = "target"
+    spec_info: object | None = None
+    capture_hidden_layer_ids: List[int] | None = None
+    prefill_extend_lens: List[int] | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

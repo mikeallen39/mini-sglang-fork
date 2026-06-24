@@ -34,16 +34,35 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    speculative_algorithm: str | None = None
+    speculative_draft_model_path: str | None = None
+    speculative_num_draft_tokens: int | None = None
+    speculative_dflash_block_size: int | None = None
+    speculative_dflash_draft_window_size: int | None = None
 
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)
 
     @cached_property
+    def draft_hf_config(self):
+        if self.speculative_draft_model_path is None:
+            return None
+        return cached_load_hf_config(self.speculative_draft_model_path)
+
+    @cached_property
     def model_config(self) -> ModelConfig:
         from minisgl.models import ModelConfig
 
         return ModelConfig.from_hf(self.hf_config)
+
+    @cached_property
+    def draft_model_config(self) -> ModelConfig | None:
+        if self.draft_hf_config is None:
+            return None
+        from minisgl.models import ModelConfig
+
+        return ModelConfig.from_hf(self.draft_hf_config)
 
     @property
     def max_seq_len(self) -> int:

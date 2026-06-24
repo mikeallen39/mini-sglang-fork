@@ -30,3 +30,6 @@ class BaseLLMModel(ABC, BaseOP):
 
     def clear_runtime_state_slot(self, table_idx: int) -> None:
         _ = table_idx
+
+    def copy_runtime_state_slot(self, src_table_idx: int, dst_table_idx: int) -> None:
+        _ = src_table_idx, dst_table_idx

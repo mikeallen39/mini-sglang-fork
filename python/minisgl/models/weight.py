@@ -471,6 +471,80 @@ def _stream_glm4_mlp_proj(
     return _set_module_tensor(module_dict, fused_key, fused)
 
 
+def _stream_dflash_qkv_and_mlp_proj(
+    config,
+    model,
+    module_dict,
+    raw_name: str,
+    tensor: torch.Tensor,
+    device: torch.device,
+) -> bool:
+    if config.architectures[0] != "DFlashDraftModel":
+        return False
+    if not raw_name.endswith(".weight"):
+        return False
+
+    base_name = raw_name
+
+    if (
+        ".self_attn." in base_name
+        and any(base_name.endswith(suffix) for suffix in (".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
+    ):
+        if base_name.endswith(".q_proj.weight"):
+            slot = "q"
+        elif base_name.endswith(".k_proj.weight"):
+            slot = "k"
+        else:
+            slot = "v"
+        fused_key = base_name.replace(f".{slot}_proj.weight", ".qkv_proj.weight")
+        if fused_key not in module_dict:
+            return False
+        module, attr_name = module_dict[fused_key]
+        if attr_name != "weight" or type(module).__name__ != "LinearQKVMerged":
+            return False
+        if not hasattr(module, "_stacked_params"):
+            module._stacked_params = {}
+        module._stacked_params[slot] = tensor
+        if not all(s in module._stacked_params for s in ("q", "k", "v")):
+            return True
+        fused = torch.cat(
+            [
+                module._stacked_params.pop("q"),
+                module._stacked_params.pop("k"),
+                module._stacked_params.pop("v"),
+            ],
+            dim=0,
+        ).to(device=device)
+        return _set_module_tensor(module_dict, fused_key, fused)
+
+    if ".mlp." in base_name and (
+        base_name.endswith(".mlp.gate_proj.weight") or base_name.endswith(".mlp.up_proj.weight")
+    ):
+        if base_name.endswith(".mlp.gate_proj.weight"):
+            slot = "gate"
+            fused_key = base_name.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight")
+        else:
+            slot = "up"
+            fused_key = base_name.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight")
+        if fused_key not in module_dict:
+            return False
+        module, attr_name = module_dict[fused_key]
+        if attr_name != "weight" or type(module).__name__ != "LinearColParallelMerged":
+            return False
+        if not hasattr(module, "_stacked_params"):
+            module._stacked_params = {}
+        module._stacked_params[slot] = tensor
+        if "gate" not in module._stacked_params or "up" not in module._stacked_params:
+            return True
+        fused = torch.cat(
+            [module._stacked_params.pop("gate"), module._stacked_params.pop("up")],
+            dim=0,
+        ).to(device=device)
+        return _set_module_tensor(module_dict, fused_key, fused)
+
+    return False
+
+
 def _get_local_expert_layout(num_experts: int) -> tuple[int, int, int]:
     ep_info = get_ep_info()
     if ep_info.size == 1:
@@ -646,6 +720,15 @@ def load_weight_to_model(
                     ):
                         continue
                     if _stream_glm4_mlp_proj(
+                        config,
+                        model,
+                        module_dict,
+                        raw_name,
+                        tensor,
+                        device,
+                    ):
+                        continue
+                    if _stream_dflash_qkv_and_mlp_proj(
                         config,
                         model,
                         module_dict,
