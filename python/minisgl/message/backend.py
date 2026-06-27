@@ -42,3 +42,11 @@ class UserMsg(BaseBackendMsg):
 @dataclass
 class AbortBackendMsg(BaseBackendMsg):
     uid: int
+
+
+@dataclass
+class ProfileBackendMsg(BaseBackendMsg):
+    action: str  # "start" or "stop"
+    output_dir: str = ""
+    activities: list | None = None
+    num_steps: int = 0

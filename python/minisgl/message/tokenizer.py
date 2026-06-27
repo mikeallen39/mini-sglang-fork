@@ -42,3 +42,11 @@ class TokenizeMsg(BaseTokenizerMsg):
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+
+
+@dataclass
+class ProfileTokenizerMsg(BaseTokenizerMsg):
+    action: str  # "start" or "stop"
+    output_dir: str = ""
+    activities: list | None = None
+    num_steps: int = 0

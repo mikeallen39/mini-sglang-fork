@@ -7,6 +7,7 @@ from minisgl.core import Batch, Req, SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
     AbortBackendMsg,
+    ProfileBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
     DetokenizeMsg,
@@ -366,6 +367,56 @@ class Scheduler(SchedulerIOMixin):
             )
         self.send_result(reply)
         return True
+    def _handle_profile_msg(self, msg: ProfileBackendMsg) -> None:
+        """Handle profile start/stop commands from the HTTP API."""
+        import os
+        if msg.action == "start":
+            logger.info("Starting PyTorch profiler...")
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            output_dir = msg.output_dir or os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
+            os.makedirs(output_dir, exist_ok=True)
+            self._profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=False,
+                with_stack=False,
+            )
+            self._profiler.__enter__()
+            self._profile_step_count = 0
+            self._profile_max_steps = msg.num_steps if msg.num_steps > 0 else None
+            logger.info(f"Profiler started. output_dir={output_dir}, max_steps={self._profile_max_steps}")
+        elif msg.action == "stop":
+            if hasattr(self, "_profiler") and self._profiler is not None:
+                logger.info("Stopping PyTorch profiler...")
+                try:
+                    self._profiler.__exit__(None, None, None)
+                    output_dir = msg.output_dir or os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
+                    import time
+                    trace_path = os.path.join(output_dir, f"{time.time()}-TP-0.trace.json")
+                    self._profiler.export_chrome_trace(trace_path)
+                    logger.info(f"Profile trace saved to {trace_path}")
+                except Exception as e:
+                    logger.error(f"Failed to stop profiler: {e}", exc_info=True)
+                finally:
+                    self._profiler = None
+
+
+    def _check_profile_step(self) -> None:
+        """Increment profile step counter and auto-stop if num_steps reached."""
+        if not hasattr(self, "_profiler") or self._profiler is None:
+            return
+        self._profile_step_count += 1
+        if self._profile_max_steps is not None and self._profile_step_count >= self._profile_max_steps:
+            import os, time
+            logger.info(f"Auto-stopping profiler after {self._profile_step_count} steps")
+            self._profiler.__exit__(None, None, None)
+            output_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
+            os.makedirs(output_dir, exist_ok=True)
+            trace_path = os.path.join(output_dir, f"{time.time()}-TP-0.trace.json")
+            self._profiler.export_chrome_trace(trace_path)
+            logger.info(f"Profile trace saved to {trace_path}")
+            self._profiler = None
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -394,8 +445,11 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
+        elif isinstance(msg, ProfileBackendMsg):
+            self._handle_profile_msg(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
+            raise NotImplementedError
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
@@ -497,6 +551,7 @@ class Scheduler(SchedulerIOMixin):
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(last_data)
+        self._check_profile_step()
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -519,6 +574,7 @@ class Scheduler(SchedulerIOMixin):
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
+        self._check_profile_step()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:

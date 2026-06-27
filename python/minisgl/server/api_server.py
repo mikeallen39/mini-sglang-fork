@@ -18,6 +18,7 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    ProfileTokenizerMsg,
     TokenizeMsg,
     UserReply,
 )
@@ -471,6 +472,26 @@ async def available_models():
     state = get_global_state()
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
+
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile():
+    """Start PyTorch profiler. Use with SGLANG_TORCH_PROFILER_DIR env var for output."""
+    state = get_global_state()
+    import os
+    output_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
+    await state.send_one(ProfileTokenizerMsg(action="start", output_dir=output_dir))
+    return {"status": "ok", "message": "Profiling started"}
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    """Stop PyTorch profiler and export chrome trace."""
+    state = get_global_state()
+    import os
+    output_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
+    await state.send_one(ProfileTokenizerMsg(action="stop", output_dir=output_dir))
+    return {"status": "ok", "message": "Profiling stopped"}
 
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
