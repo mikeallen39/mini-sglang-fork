@@ -84,12 +84,17 @@ class EnvClassSingleton:
     PROFILE_SPARSE_MOE = EnvBool(False)
     PROFILE_INT8_DENSE = EnvBool(False)
     MOE_SINGLE_KERNEL = EnvBool(False)  # fuse silu_and_mul into the second MoE GEMM
+    MOE_FUSED_ACTIVATION = EnvBool(False)  # use sgl_kernel fused silu_and_mul / gelu_and_mul in MoE stage2
+    MOE_SGL_REDUCE = EnvBool(False)  # use sgl_kernel moe_sum_reduce instead of local Triton reduce
+    LINEAR_RMSNORM_GATED = EnvBool(False)  # use fused RMSNorm+gate for Qwen3.6 linear attention output norm
+    SHARED_EXPERT_FUSED_GATE_ADD = EnvBool(False)  # fuse sigmoid(gate)*shared_output + moe_output for shared expert
     SKIP_AB_FP32_CAST = EnvBool(False)  # keep a,b in bf16 for decode (Triton kernel loads as fp32 internally)
     DEPTHWISE_CONV_DECODE = EnvBool(False)  # use fused Triton depthwise conv for decode
     FUSED_QKV_SPLIT = EnvBool(False)  # use fused QKV split kernel in GDN prefill
     GEMMA_FUSED_NORM = EnvBool(False)  # use sgl_kernel gemma_rmsnorm / gemma_fused_add_rmsnorm
     FULL_ATTN_FUSED_PREPARE = EnvBool(False)  # fuse Q/K GemmaRMSNorm + RoPE + gate extraction in full attention
     FULL_ATTN_FUSED_GATE_MUL = EnvBool(False)  # fuse sigmoid(gate) * attn_output in full attention
+    FULL_ATTN_SIGMOID_GATE = EnvBool(False)  # fuse sigmoid(gate) * attn_output via Triton sigmoid+multiply in one pass
 
     def __new__(cls):
         # single instance

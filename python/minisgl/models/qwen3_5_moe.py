@@ -24,8 +24,11 @@ from minisgl.layers import (
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
+    fused_gate_sigmoid_mul_add,
     fused_qk_gemma_rmsnorm_rope_gate,
+    fused_rmsnorm_gated,
     fused_sigmoid_mul,
+    fused_sigmoid_mul_flat,
     silu_and_mul,
 )
 from minisgl.quantization import (
@@ -162,9 +165,26 @@ class Qwen3_5RMSNormGated(BaseOP):
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x_shape = x.shape
+        x_2d = x.reshape(-1, x_shape[-1])
+        gate_2d = gate.reshape(-1, x_shape[-1])
+        if (
+            ENV.LINEAR_RMSNORM_GATED.value
+            and x_2d.is_cuda
+            and gate_2d.is_cuda
+            and x_2d.stride(-1) == 1
+            and gate_2d.stride(-1) == 1
+            and self.weight.is_cuda
+        ):
+            return fused_rmsnorm_gated(
+                x_2d,
+                gate_2d,
+                self.weight,
+                self.eps,
+                out=torch.empty_like(gate_2d),
+            ).reshape(x_shape)
         out_dtype = gate.dtype
-        x = x.reshape(-1, x_shape[-1])
-        gate = gate.reshape(-1, x_shape[-1])
+        x = x_2d
+        gate = gate_2d
         compute_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
         x = x.to(compute_dtype)
         variance = x.square().mean(dim=-1, keepdim=True)
@@ -235,11 +255,30 @@ class Qwen3_5SparseMoeBlock(BaseOP):
                 hidden_states_q=hidden_states_q,
                 hidden_states_scale=hidden_states_scale,
             )
-            shared_gate = self.shared_expert_gate.forward_prequantized(
-                hidden_states, hidden_states_q, hidden_states_scale
-            )
-            shared_output = torch.sigmoid(shared_gate) * shared_output
-            output = output + shared_output
+            if (
+                ENV.SHARED_EXPERT_FUSED_GATE_ADD.value
+                and hidden_states.is_cuda
+                and hidden_states.ndim == 2
+                and hidden_states.is_contiguous()
+                and shared_output.is_contiguous()
+                and output.is_contiguous()
+                and self.shared_expert_gate.bias is None
+                and self.shared_expert_gate.weight.ndim == 2
+                and self.shared_expert_gate.weight.shape[0] == 1
+                and self.shared_expert_gate.weight.is_contiguous()
+            ):
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.view(-1),
+                    shared_output,
+                    output,
+                )
+            else:
+                shared_gate = self.shared_expert_gate.forward_prequantized(
+                    hidden_states, hidden_states_q, hidden_states_scale
+                )
+                shared_output = torch.sigmoid(shared_gate) * shared_output
+                output = output + shared_output
         if profile_enabled:
             e3.record()
             e3.synchronize()
@@ -423,7 +462,9 @@ class Qwen3_5FullAttention(BaseOP):
         attn_output = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         attn_output = attn_output.view(-1, self.q_dim)
         if gate is not None:
-            if ENV.FULL_ATTN_FUSED_GATE_MUL.value and attn_output.is_cuda:
+            if ENV.FULL_ATTN_SIGMOID_GATE.value and attn_output.is_cuda and gate.ndim == 2:
+                attn_output = fused_sigmoid_mul_flat(attn_output, gate, attn_output)
+            elif ENV.FULL_ATTN_FUSED_GATE_MUL.value and attn_output.is_cuda:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 attn_output = attn_output * torch.sigmoid(gate)

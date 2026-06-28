@@ -3,6 +3,7 @@ from .activation_quant import per_token_quant_int8_triton, silu_and_mul_quant_in
 from .moe_impl import (
     fused_moe_kernel_triton,
     fused_moe_w2_silu_int8_kernel_triton,
+    fused_moe_silu_down_triton,
     moe_sum_reduce_triton,
 )
 from .pynccl import PyNCCLCommunicator, init_pynccl
@@ -21,5 +22,6 @@ __all__ = [
     "PyNCCLCommunicator",
     "fused_moe_kernel_triton",
     "fused_moe_w2_silu_int8_kernel_triton",
+    "fused_moe_silu_down_triton",
     "moe_sum_reduce_triton",
 ]

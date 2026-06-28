@@ -32,6 +32,103 @@ def has_sglang_linear_attn_kernel() -> bool:
     return triton is not None and tl is not None
 
 
+@triton.jit
+def _fused_qkvzba_split_reshape_cat_contiguous_kernel(
+    mixed_qkv,
+    z,
+    b,
+    a,
+    mixed_qkvz,
+    mixed_ba,
+    NUM_HEADS_QK: tl.constexpr,
+    NUM_HEADS_V: tl.constexpr,
+    HEAD_QK: tl.constexpr,
+    HEAD_V: tl.constexpr,
+):
+    i_bs = tl.program_id(0)
+    i_qk = tl.program_id(1)
+
+    qk_group = tl.arange(0, HEAD_QK)
+    v_group = tl.arange(0, HEAD_V)
+
+    TOTAL_Q = NUM_HEADS_QK * HEAD_QK
+    TOTAL_K = NUM_HEADS_QK * HEAD_QK
+    TOTAL_V = NUM_HEADS_V * HEAD_V
+    TOTAL_QKV = TOTAL_Q + TOTAL_K + TOTAL_V
+    TOTAL_QKVZ = TOTAL_QKV + TOTAL_V
+    TOTAL_BA = NUM_HEADS_V * 2
+    V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
+
+    q_base = i_bs * TOTAL_QKVZ + i_qk * HEAD_QK
+    k_base = i_bs * TOTAL_QKVZ + TOTAL_Q + i_qk * HEAD_QK
+    v_base = i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+    z_base = i_bs * TOTAL_QKVZ + TOTAL_QKV + i_qk * V_PER_GROUP * HEAD_V
+
+    q_out_base = i_bs * TOTAL_QKV + i_qk * HEAD_QK
+    k_out_base = i_bs * TOTAL_QKV + TOTAL_Q + i_qk * HEAD_QK
+    v_out_base = i_bs * TOTAL_QKV + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+
+    tl.store(mixed_qkv + q_out_base + qk_group, tl.load(mixed_qkvz + q_base + qk_group))
+    tl.store(mixed_qkv + k_out_base + qk_group, tl.load(mixed_qkvz + k_base + qk_group))
+
+    for i in tl.static_range(V_PER_GROUP):
+        v_offsets = v_group + i * HEAD_V
+        tl.store(
+            mixed_qkv + v_out_base + v_offsets,
+            tl.load(mixed_qkvz + v_base + v_offsets),
+        )
+        z_out_base = (i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i) * HEAD_V
+        tl.store(
+            z + z_out_base + v_group,
+            tl.load(mixed_qkvz + z_base + v_offsets),
+        )
+        b_offset = i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        tl.store(
+            b + b_offset,
+            tl.load(mixed_ba + i_bs * TOTAL_BA + i_qk * V_PER_GROUP + i),
+        )
+        tl.store(
+            a + b_offset,
+            tl.load(mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i),
+        )
+
+
+def fused_qkvzba_split_reshape_cat_contiguous(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_qk: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if triton is None:
+        raise RuntimeError("Triton is required for fused_qkvzba_split_reshape_cat_contiguous")
+
+    batch = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = torch.empty((batch, qkv_dim), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device)
+    z = torch.empty((batch, num_heads_v, head_v), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device)
+    b = torch.empty((batch, num_heads_v), dtype=mixed_ba.dtype, device=mixed_ba.device)
+    a = torch.empty_like(b)
+
+    grid = (batch, num_heads_qk)
+    _fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
+        mixed_qkv,
+        z,
+        b,
+        a,
+        mixed_qkvz,
+        mixed_ba,
+        num_heads_qk,
+        num_heads_v,
+        head_qk,
+        head_v,
+        num_warps=1,
+        num_stages=3,
+    )
+    return mixed_qkv, z, b, a
+
+
 def linear_attn_prefill_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1168,3 +1265,79 @@ def fused_linear_attn_prefill_sglang(
     )
     state.copy_(initial_state[0].permute(0, 2, 1).to(state.dtype))
     return out.squeeze(0).to(v.dtype)
+
+
+# ---------------------------------------------------------------------------
+#  Fused QKV split for GDN prefill (ported from sglang main)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_qkv_split_gdn_prefill_kernel(
+    q,
+    k,
+    v,
+    mixed_qkv,
+    MIXED_QKV_STRIDE_T: tl.constexpr,
+    MIXED_QKV_STRIDE_D: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_K_HEADS: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    HEAD_Q: tl.constexpr,
+    HEAD_K: tl.constexpr,
+    HEAD_V: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused QKV split: one triton kernel replaces 3 aten::slice + copy_ calls."""
+    i_t = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
+    k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
+    v_dim: tl.constexpr = NUM_V_HEADS * HEAD_V
+    qk_dim: tl.constexpr = q_dim + k_dim
+    qkv_dim: tl.constexpr = qk_dim + v_dim
+
+    mask = offsets < qkv_dim
+    values = tl.load(
+        mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
+        mask=mask,
+    )
+
+    q_mask = offsets < q_dim
+    tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
+
+    k_offsets = offsets - q_dim
+    k_mask = (offsets >= q_dim) & (offsets < qk_dim)
+    tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
+
+    v_offsets = offsets - qk_dim
+    v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
+    tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
+
+
+def fused_qkv_split_gdn_prefill(
+    mixed_qkv: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+):
+    """Split packed post-conv GDN QKV into contiguous tensors with fused kernel."""
+    seq_len = mixed_qkv.shape[0]
+    q = torch.empty(seq_len, num_q_heads * head_q, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    k = torch.empty(seq_len, num_k_heads * head_k, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    v = torch.empty(seq_len, num_v_heads * head_v, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+
+    qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    _fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
+        q, k, v, mixed_qkv,
+        mixed_qkv.stride(0), mixed_qkv.stride(1),
+        num_q_heads, num_k_heads, num_v_heads,
+        head_q, head_k, head_v,
+        BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
+        num_warps=8,
+        num_stages=3,
+    )
+    return q, k, v

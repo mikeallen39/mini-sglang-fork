@@ -352,11 +352,17 @@ def fused_experts_impl(
 ) -> torch.Tensor:
     from minisgl.kernel import (
         fused_moe_kernel_triton,
+        fused_moe_silu_down_triton,
         fused_moe_w2_silu_int8_kernel_triton,
         moe_sum_reduce_triton,
         silu_and_mul_quant_int8_triton,
     )
-    from minisgl.layers import gelu_and_mul, silu_and_mul
+    from minisgl.layers import (
+        fused_gelu_and_mul,
+        fused_silu_and_mul,
+        gelu_and_mul,
+        silu_and_mul,
+    )
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -484,8 +490,31 @@ def fused_experts_impl(
             compute_type=compute_type,
             filter_expert=filter_expert,
         )
+    elif ENV.MOE_SINGLE_KERNEL.value and not use_int8_stage2_int8:
+        # Fused silu_and_mul + down_proj in a single kernel.
+        # Skips the intermediate_cache2 buffer and the separate silu_and_mul launch.
+        if profile_enabled:
+            e1.record()
+        fused_moe_silu_down_triton(
+            intermediate_cache1.view(-1, N),
+            w2,
+            intermediate_cache3,
+            curr_topk_weights,
+            curr_topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            config,
+            compute_type=compute_type,
+            filter_expert=filter_expert,
+        )
+        if profile_enabled:
+            e2.record()
+            e3.record()  # stage2 and w2 merged; stage2_ms will be ~0
     else:
         FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
+        FUSED_FN_MAP = {"silu": fused_silu_and_mul, "gelu": fused_gelu_and_mul}
         if use_int8_stage2_int8:
             silu_and_mul_quant_int8_triton(
                 intermediate_cache1.view(-1, N),
@@ -493,7 +522,10 @@ def fused_experts_impl(
                 intermediate_cache2_scale,
             )
         else:
-            FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+            if ENV.MOE_FUSED_ACTIVATION.value:
+                FUSED_FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
         if profile_enabled:
             e2.record()
         fused_moe_kernel_triton(
@@ -516,10 +548,25 @@ def fused_experts_impl(
     if profile_enabled:
         e3.record()
 
-    moe_sum_reduce_triton(
-        intermediate_cache3,
-        out_hidden_states[begin_token_idx:end_token_idx],
-    )
+    if ENV.MOE_SGL_REDUCE.value and intermediate_cache3.is_cuda:
+        try:
+            import sgl_kernel
+
+            sgl_kernel.moe_sum_reduce(
+                intermediate_cache3,
+                out_hidden_states[begin_token_idx:end_token_idx],
+                0.0,
+            )
+        except Exception:
+            moe_sum_reduce_triton(
+                intermediate_cache3,
+                out_hidden_states[begin_token_idx:end_token_idx],
+            )
+    else:
+        moe_sum_reduce_triton(
+            intermediate_cache3,
+            out_hidden_states[begin_token_idx:end_token_idx],
+        )
     if profile_enabled:
         e4.record()
         e4.synchronize()

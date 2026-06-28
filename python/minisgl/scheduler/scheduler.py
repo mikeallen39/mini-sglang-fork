@@ -391,6 +391,7 @@ class Scheduler(SchedulerIOMixin):
                 logger.info("Stopping PyTorch profiler...")
                 try:
                     self._profiler.__exit__(None, None, None)
+                    torch.cuda.synchronize()
                     output_dir = msg.output_dir or os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp/minisgl_traces")
                     import time
                     trace_path = os.path.join(output_dir, f"{time.time()}-TP-0.trace.json")

@@ -27,4 +27,28 @@ def gelu_and_mul(x: _torch.Tensor, out: _torch.Tensor | None = None):
     return y
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul"]
+def fused_silu_and_mul(x: _torch.Tensor, out: _torch.Tensor) -> _torch.Tensor:
+    if x.is_cuda:
+        try:
+            import sgl_kernel
+
+            sgl_kernel.silu_and_mul(x, out)
+            return out
+        except Exception:
+            pass
+    return silu_and_mul(x, out)
+
+
+def fused_gelu_and_mul(x: _torch.Tensor, out: _torch.Tensor) -> _torch.Tensor:
+    if x.is_cuda:
+        try:
+            import sgl_kernel
+
+            sgl_kernel.gelu_and_mul(x, out)
+            return out
+        except Exception:
+            pass
+    return gelu_and_mul(x, out)
+
+
+__all__ = ["silu_and_mul", "gelu_and_mul", "fused_silu_and_mul", "fused_gelu_and_mul"]

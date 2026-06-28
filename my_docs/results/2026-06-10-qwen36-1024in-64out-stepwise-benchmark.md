@@ -1054,3 +1054,108 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 - 结论：
   - 这说明 decode conv 仍然有空间，但前提是要直接对齐 sglang 的实现，而不是另起一套自写替代品
   - 当前最好稳定结果已经推进到 `88.35 tok/s`
+
+### FULL_ATTN_SIGMOID_GATE (2026-06-28)
+
+**改动**：在 full-attention 路径中，将 `sigmoid(gate) * attn_output` 融合为一个 Triton kernel（`fused_sigmoid_mul_flat`，对 2D gate 做 sigmoid+multiply 一 pass 完成）。
+
+**配置**: `MINISGL_GEMMA_FUSED_NORM=1 MINISGL_FULL_ATTN_FUSED_PREPARE=1 MINISGL_DEPTHWISE_CONV_DECODE=1 MINISGL_LINEAR_RMSNORM_GATED=1 MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1 MINISGL_FULL_ATTN_SIGMOID_GATE=1`
+
+| Metric | Value |
+|--------|-------|
+| TTFT (稳定) | 121.44 ms |
+| E2E (稳定) | 0.7097 s |
+| output_tps | 88.77 tok/s |
+
+**结论**：性能退化（best 96.02 → 88.77 tok/s，-7.5%）。2D gate 上 sigmoid 开销极小，Triton kernel launch overhead 比直接 `F.sigmoid * x` 更大，此方向放弃。
+
+### 2026-06-28 重新校准 roadmap 起点
+
+这一轮对 `roadmap` 起点做了重测，原因是前一轮实验记录和代码状态不一致。
+
+- `baseline`（不开优化）：
+  - `TTFT = 130.90 ms`
+  - `E2E = 0.8770 s`
+  - `output_tps = 71.84 tok/s`
+- 组合：
+  - `MINISGL_GEMMA_FUSED_NORM=1`
+  - `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+  - `MINISGL_DEPTHWISE_CONV_DECODE=1`
+  - `MINISGL_LINEAR_RMSNORM_GATED=1`
+  - `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+
+第一次重测发现：
+
+- 该组合只有：
+  - `TTFT = 123.03 ms`
+  - `E2E = 0.7126 s`
+  - `output_tps = 88.41 tok/s`
+
+进一步排查发现：
+
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD` 当时在 `env.py` 中有开关定义，但在 `qwen3_5_moe.py` 中根本没有被使用
+- 也就是说，这个开关此前实际上是空开关
+
+修复后，再次单因素重测同一组合：
+
+- `TTFT = 122.70 ms`
+- `E2E = 0.6943 s`
+- `output_tps = 90.73 tok/s`
+
+结论：
+
+- `SHARED_EXPERT_FUSED_GATE_ADD` 真实有效，但真实收益不是此前记录中的量级
+- 当前工作树重新校准后的复现值为：
+  - `output_tps = 90.73 tok/s`
+- 历史 session 中曾跑到：
+  - `TTFT = 122.77 ms`
+  - `E2E = 0.6561 s`
+  - `output_tps = 96.02 tok/s`
+- 因此更准确的结论是：
+  - `96.02 tok/s` 是历史最好成绩
+  - `90.73 tok/s` 是当前代码状态下的复现值
+  - 当前真正需要做的是找出“为什么当前工作树比当时慢了约 5.5 tok/s”
+- 相对 baseline：
+  - `71.84 -> 90.73 tok/s`
+  - 累计提升约 `26.3%`
+
+备注：
+
+- 这说明 `roadmap` 的“继续沿整层边界融合推进”方向仍然成立
+- 但后续所有结论都必须以“开关已真实接线 + 单因素重测”为准，不能再直接沿用前一轮口头 best 值
+
+### 2026-06-28 恢复历史 `LINEAR_RMSNORM_GATED -> SHARED_EXPERT_FUSED_GATE_ADD` 链条
+
+在当前工作树中重新排查后发现：
+
+- `LINEAR_RMSNORM_GATED` 的 Triton kernel 和环境开关都还在
+- 但它已经没有真正接到 Qwen3.6 linear-attention 的输出 norm 路径上
+- 因此此前重跑只得到：
+  - `88.37 tok/s`（`GEMMA_FUSED_NORM + FULL_ATTN_FUSED_PREPARE + DEPTHWISE_CONV_DECODE`）
+- 在把 `LINEAR_RMSNORM_GATED` 接回 `Qwen3_5RMSNormGated.forward()` 之后，重新按历史顺序重测：
+
+1. `MINISGL_GEMMA_FUSED_NORM=1 MINISGL_FULL_ATTN_FUSED_PREPARE=1 MINISGL_DEPTHWISE_CONV_DECODE=1`
+   - `TTFT = 123.63 ms`
+   - `E2E = 0.7129 s`
+   - `output_tps = 88.37 tok/s`
+
+2. `+ MINISGL_LINEAR_RMSNORM_GATED=1`
+   - `TTFT = 121.83 ms`
+   - `E2E = 0.6749 s`
+   - `output_tps = 93.34 tok/s`
+
+3. `+ MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+   - `TTFT = 120.64 ms`
+   - `E2E = 0.6554 s`
+   - `output_tps = 96.13 tok/s`
+
+结论：
+
+- 历史链条已经在当前工作树上重新复现
+- 对应关系就是：
+  - `LINEAR_RMSNORM_GATED`：`88.37 -> 93.34 tok/s`
+  - `SHARED_EXPERT_FUSED_GATE_ADD`：`93.34 -> 96.13 tok/s`
+- 因此此前的历史记录
+  - `93.32 tok/s`
+  - `96.02 tok/s`
+  是正确的，只是中间 `LINEAR_RMSNORM_GATED` 这条接线后来丢了

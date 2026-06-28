@@ -1,4 +1,65 @@
 from typing import Any, Dict
+import torch
+
+
+def fused_moe_silu_down_triton(
+    intermediate1: torch.Tensor,
+    w2: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    config: Dict[str, Any],
+    compute_type: torch.dtype,
+    filter_expert: bool = False,
+) -> None:
+    import triton
+    from .triton.fused_moe import fused_moe_silu_down_kernel
+
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+    assert intermediate1.shape[-1] % 2 == 0, "intermediate1 must be packed [gate, up]"
+    N = intermediate1.shape[-1] // 2  # intermediate size
+    K = w2.shape[1]  # hidden size (w2 output dim)
+
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(K, META["BLOCK_SIZE_N"]),
+    )
+    if N % config["BLOCK_SIZE_K"] == 0:
+        even_Ks = True
+    else:
+        even_Ks = False
+
+    fused_moe_silu_down_kernel[grid](
+        intermediate1,
+        w2,
+        C,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N=N,
+        K=K,
+        EM=sorted_token_ids.shape[0],
+        num_valid_tokens=topk_ids.numel(),
+        stride_inter1m=intermediate1.stride(0),
+        stride_inter1n=intermediate1.stride(1),
+        stride_w2e=w2.stride(0),
+        stride_w2k_out=w2.stride(1),  # hidden dim (output)
+        stride_w2k_in=w2.stride(2),   # intermediate dim (input)
+        stride_cm=C.stride(1),
+        stride_cn=C.stride(2),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        compute_type=triton.language.bfloat16 if compute_type == torch.bfloat16 else triton.language.float16,
+        even_Ks=even_Ks,
+        filter_expert=filter_expert,
+        **config,
+    )
+from typing import Any, Dict
 
 import torch
 

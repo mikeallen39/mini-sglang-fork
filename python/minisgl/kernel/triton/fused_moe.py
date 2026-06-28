@@ -355,3 +355,105 @@ def fused_moe_w2_silu_int8_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+@triton.jit
+def fused_moe_silu_down_kernel(
+    # intermediate1 is packed [gate, up]: shape [M, 2*N] (first N=gate, second N=up)
+    intermediate1_ptr,
+    # w2: down_proj weights [E, K, N] (K=hidden, N=intermediate)
+    w2_ptr,
+    # output: [M, topk, K] -- same as original fused_moe_kernel C layout
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,  # intermediate size
+    K: tl.constexpr,  # hidden size (output dim)
+    EM,
+    num_valid_tokens,
+    stride_inter1m,
+    stride_inter1n,
+    stride_w2e,
+    stride_w2k_out,
+    stride_w2k_in,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+    filter_expert: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(K, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    if filter_expert and off_experts == -1:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < K)
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type),
+            mask=c_mask,
+        )
+        return
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    inter1_base = intermediate1_ptr + offs_token[:, None] * stride_inter1m
+    offs_ok = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    for k_tile in range(0, tl.cdiv(N, BLOCK_SIZE_K)):
+        curr_k = k_tile * BLOCK_SIZE_K + offs_k
+        k_mask = curr_k < N
+
+        gate = tl.load(
+            inter1_base + curr_k[None, :] * stride_inter1n,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        up = tl.load(
+            inter1_base + (N + curr_k)[None, :] * stride_inter1n,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        silu_val = gate * tl.sigmoid(gate)
+        act = (silu_val * up).to(tl.float32)
+
+        w2 = tl.load(
+            w2_ptr + off_experts * stride_w2e + offs_ok[:, None] * stride_w2k_out + curr_k[None, :] * stride_w2k_in,
+            mask=(offs_ok[:, None] < K) & (k_mask[None, :] if not even_Ks else True),
+            other=0,
+        )
+        accumulator += tl.dot(act.to(w2.dtype), w2.T)
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator *= moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < K)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
