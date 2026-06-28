@@ -1,11 +1,4 @@
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
-from .hf import (
-    cached_load_hf_config,
-    download_hf_weight,
-    load_processor,
-    load_tokenizer,
-    model_supports_multimodal,
-)
 from minisgl.linear_attention import (
     get_linear_attn_backend,
     has_sglang_linear_attn_kernel,
@@ -32,6 +25,36 @@ from .mp import (
 )
 from .registry import Registry
 from .torch_utils import nvtx_annotate, torch_dtype
+
+
+def cached_load_hf_config(*args, **kwargs):
+    from .hf import cached_load_hf_config as _cached_load_hf_config
+
+    return _cached_load_hf_config(*args, **kwargs)
+
+
+def download_hf_weight(*args, **kwargs):
+    from .hf import download_hf_weight as _download_hf_weight
+
+    return _download_hf_weight(*args, **kwargs)
+
+
+def load_processor(*args, **kwargs):
+    from .hf import load_processor as _load_processor
+
+    return _load_processor(*args, **kwargs)
+
+
+def load_tokenizer(*args, **kwargs):
+    from .hf import load_tokenizer as _load_tokenizer
+
+    return _load_tokenizer(*args, **kwargs)
+
+
+def model_supports_multimodal(*args, **kwargs):
+    from .hf import model_supports_multimodal as _model_supports_multimodal
+
+    return _model_supports_multimodal(*args, **kwargs)
 
 __all__ = [
     "cached_load_hf_config",

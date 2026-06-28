@@ -15,6 +15,38 @@ _GEMMA_RMSNORM_PROFILE = {
     "gemma_rmsnorm_ms": 0.0,
     "count": 0,
 }
+_SGL_KERNEL_ELEMENTWISE = None
+
+
+def _get_sgl_kernel_elementwise():
+    global _SGL_KERNEL_ELEMENTWISE
+    if _SGL_KERNEL_ELEMENTWISE is None:
+        from sgl_kernel import elementwise
+
+        _SGL_KERNEL_ELEMENTWISE = elementwise
+    return _SGL_KERNEL_ELEMENTWISE
+
+
+def _sgl_kernel_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return _get_sgl_kernel_elementwise().gemma_rmsnorm(x, weight, eps, out=torch.empty_like(x))
+
+
+def _sgl_kernel_gemma_fused_add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = x.clone()
+    residual_out = residual + x
+    _get_sgl_kernel_elementwise().gemma_fused_add_rmsnorm(
+        out, residual_out, weight, eps
+    )
+    return out, residual_out
 
 
 def _can_profile_int8_dense(x: torch.Tensor) -> bool:
@@ -98,8 +130,11 @@ class GemmaRMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         self.eps = eps
         self.weight = torch.empty(size)
+        self._use_fused = ENV.GEMMA_FUSED_NORM.value
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._use_fused and x.is_cuda:
+            return _sgl_kernel_gemma_rmsnorm(x, self.weight, self.eps)
         if not _can_profile_int8_dense(x):
             return _torch_gemma_rmsnorm(x, self.weight, self.eps)
         e0 = torch.cuda.Event(enable_timing=True)
@@ -129,11 +164,14 @@ class GemmaRMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         self.eps = eps
         self.weight = torch.empty(size)
+        self._use_fused = ENV.GEMMA_FUSED_NORM.value
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
+            if self._use_fused and x.is_cuda:
+                return GemmaRMSNorm.forward(self, x), x
             if not _can_profile_int8_dense(x):
                 return _torch_gemma_rmsnorm(x, self.weight, self.eps), x
             e0 = torch.cuda.Event(enable_timing=True)
@@ -154,6 +192,11 @@ class GemmaRMSNormFused(BaseOP):
                 _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] = 0.0
                 _GEMMA_RMSNORM_PROFILE["count"] = 0
             return y, x
+
+        if self._use_fused and x.is_cuda:
+            return _sgl_kernel_gemma_fused_add_rmsnorm(
+                x, residual, self.weight, self.eps
+            )
 
         merged = x + residual
         if not _can_profile_int8_dense(merged):

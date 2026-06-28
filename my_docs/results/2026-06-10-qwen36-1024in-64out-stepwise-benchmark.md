@@ -21,6 +21,29 @@
 
 ## 1.1 正确启动方式
 
+从 2026-06-28 起，`benchmark/online/bench_qwen36_1024in_64out.py` 的默认口径已调整为：
+
+- `input_token_mode=final-chat`
+- `input_tokens=1024` 指的是**应用 chat template 之后、真正送进模型的最终 prompt 长度**
+
+这样可以避免旧口径下出现的误差：
+
+- 旧模式按 `raw-content=1024` 截断用户文本
+- 但服务端会再套 chat template
+- 对 Qwen3.6 这条路径，最终实际输入会变成 `1036` token，而不是 `1024`
+
+如需复现旧行为，可显式传：
+
+```bash
+python benchmark/online/bench_qwen36_1024in_64out.py \
+  --input-token-mode raw-content
+```
+
+当前实测：
+
+- `raw-content` 模式：`user_content_tokens=1024`，`final_prompt_tokens=1036`
+- `final-chat` 模式：`user_content_tokens=1012`，`final_prompt_tokens=1024`
+
 对于本文件里的 `1024 in / 64 out` benchmark，服务启动时必须保证可用 KV 容量明显大于 `1024 + 64`，否则长输入请求会被直接丢弃，导致测速结果失真。
 
 当前确认可用的启动方式如下：
@@ -107,6 +130,13 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | W8A8 Selective Int8 + Vendored Full-Kernel Chunk Prefill + Fused MoE + SGLang Linear Attention + CUDA Graph | 113.29 ms | 0.7610 s | 82.79 tok/s | 12.08 ms | 63.00 | 35759 MiB |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
+| bf16 (不量化) + Fused MoE + SGLang Linear Attention + CUDA Graph | 118.49 ms | 0.8297 s | 75.93 tok/s | 13.17 ms | 63.00 | 68137 MiB |
+
+**sglang main 对标（bf16，相同 workload，disable radix cache）：**
+
+| sglang bf16 | 106.40 ms | 0.5160 s | 124.03 tok/s | — | 63.00 | — |
+
+> mini-sglang bf16 vs sglang bf16 公平对比下，output_tps 差距约 1.63x（75.93 vs 124.03）。说明差距并非来自 W8A8 量化，而是 decode 阶段存在结构性差异（见 Handoff 中的 kernel count 分析和 2026-06-27 的 profiling 探索）。
 
 ### 3.1 Baseline
 
@@ -716,3 +746,147 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - attention 仍然在每个 EP rank 上复制执行
   - expert 通信与聚合成本增加
   - 单并发下并行收益不容易完全兑现
+
+### 3.12 Then Enable Gemma Fused Norm
+
+- 目标：
+  - 在不改动 attention / MoE 主路径的前提下，只替换 Qwen3.6 中使用最重的 Gemma 风格 norm
+  - 观察它在 `CUDA Graph + 单并发 decode` 下是否能直接带来稳态吞吐收益
+- 配置：
+  - 基于当前已修复正确性的 `bf16 + fused MoE + sglang linear attention + attention-backend fi + CUDA Graph`
+  - 仅开启：
+    - `MINISGL_GEMMA_FUSED_NORM=1`
+- 实现说明：
+  - mini-sglang 原先直接调 `torch.ops.sgl_kernel.gemma_rmsnorm.default(...)`
+  - 但在当前 `sglang-cu13` 环境里，这些底层 op 没直接暴露在 `torch.ops.sgl_kernel`
+  - 这次改为走 `sgl_kernel.elementwise.gemma_rmsnorm / gemma_fused_add_rmsnorm` 的公开 wrapper
+  - 这样会自动复用 `flashinfer` 或 `sgl_kernel` 内部 fallback，而不是依赖未注册的裸 op 名称
+- 正确性检查：
+  - 短请求 `介绍一下自己` 输出正常
+  - 真实 `1024 final-chat / 64 out` 的 `run1` 输出为连贯中文续写，无模板残留或异常跳题
+- `run1` 输出文件：
+  - [gemma_fused_norm_run1_output.txt](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/my_docs/results/output_texts/gemma_fused_norm_run1_output.txt)
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 150.24 ms | 0.8088 s | 63 |
+| run2 | 125.06 ms | 0.7847 s | 63 |
+| run3 | 126.24 ms | 0.7859 s | 63 |
+| run4 | 125.61 ms | 0.7852 s | 63 |
+| run5 | 128.81 ms | 0.7885 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 126.43 ms |
+| run2-run5 avg E2E | 0.7861 s |
+| run2-run5 output_tps | 80.15 tok/s |
+| avg_ms_per_output_token | 12.48 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对当前 `fi + graph on` baseline：
+  - baseline：`TTFT 130.59 ms`，`E2E 0.8763 s`，`output_tps 71.89 tok/s`
+  - `Gemma Fused Norm`：
+    - `TTFT` 改善约 `3.2%`
+    - `E2E` 改善约 `10.3%`
+    - `output_tps` 提升约 `11.5%`
+
+- 结论：
+  - 这是当前修复 correctness 之后，第一个在 `graph on` 真正转化成端到端收益的单因素优化
+  - 也进一步支持之前的 profiling 判断：
+    - 当前单并发 decode 的主要差距，不在 MoE 单核融合
+    - 更像是在 norm / 周边 elementwise 路径上
+
+### 3.13 Then Skip Decode-Side A/B FP32 Cast
+
+- 目标：
+  - 只去掉 decode 路径里 `a.float().contiguous()` / `b.float().contiguous()`
+  - 保留其余实现完全不变，观察这些 dtype cast 是否真是当前 graph-on 的主要瓶颈
+- 配置：
+  - 基于当前已修复正确性的 `bf16 + fused MoE + sglang linear attention + attention-backend fi + CUDA Graph`
+  - 仅开启：
+    - `MINISGL_SKIP_AB_FP32_CAST=1`
+- 静态判断：
+  - `a/b` 进入的两个 Triton kernel：
+    - `fused_gdn_gating_sglang`
+    - `fused_linear_attn_decode_sglang`
+  - 内部都会立刻 `tl.load(...).to(tl.float32)`
+  - 所以从理论上看，外层显式 `.float()` 并非必须
+- 正确性检查：
+  - 短请求 `介绍一下自己` 输出正常
+  - 真实 `1024 final-chat / 64 out` 的 `run1` 输出也正常
+- `run1` 输出文件：
+  - [skip_ab_fp32_cast_run1_output.txt](/mnt/42_store/zxz/mini-sglang/mini-sglang-fork/my_docs/results/output_texts/skip_ab_fp32_cast_run1_output.txt)
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 249.43 ms | 0.9894 s | 63 |
+| run2 | 130.70 ms | 0.8720 s | 63 |
+| run3 | 130.68 ms | 0.8713 s | 63 |
+| run4 | 130.34 ms | 0.8709 s | 63 |
+| run5 | 130.57 ms | 0.8708 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 130.57 ms |
+| run2-run5 avg E2E | 0.8713 s |
+| run2-run5 output_tps | 72.31 tok/s |
+| avg_ms_per_output_token | 13.83 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对当前 `fi + graph on` baseline：
+  - baseline：`TTFT 130.59 ms`，`E2E 0.8763 s`，`output_tps 71.89 tok/s`
+  - `Skip A/B FP32 Cast`：
+    - `TTFT` 基本无变化
+    - `E2E` 改善约 `0.6%`
+    - `output_tps` 提升约 `0.6%`
+
+- 结论：
+  - 这条优化是安全的，但收益极小
+  - 说明 decode 路径里这两个外层 cast 不再是当前端到端主要瓶颈
+  - 之前 graph-off profiling 看到的 cast 开销，在 `graph on + 单并发` 真实场景里并不会显著转化成吞吐差距
+
+### 3.14 Then Enable Decode-Side Depthwise Conv Triton Fast Path
+
+- 目标：
+  - 只替换 linear attention decode 中的 depthwise conv 实现
+  - 验证 `F.conv1d + silu` 在 `graph on + 单并发 decode` 下是不是主要瓶颈
+- 配置：
+  - 基于当前已修复正确性的 `bf16 + fused MoE + sglang linear attention + attention-backend fi + CUDA Graph`
+  - 仅开启：
+    - `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- 实现说明：
+  - 用 `python/minisgl/depthwise_conv_triton.py` 中的单 token Triton kernel
+  - 替换 decode 路径上的 PyTorch `F.conv1d + silu`
+- 正确性检查：
+  - 短请求 `介绍一下自己` 输出正常
+  - 真实 `1024 final-chat / 64 out` 的 `run1` 输出也正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 154.88 ms | 0.9007 s | 63 |
+| run2 | 129.90 ms | 0.8755 s | 63 |
+| run3 | 130.23 ms | 0.8754 s | 63 |
+| run4 | 127.70 ms | 0.8735 s | 63 |
+| run5 | 130.03 ms | 0.8762 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 129.46 ms |
+| run2-run5 avg E2E | 0.8751 s |
+| run2-run5 output_tps | 71.99 tok/s |
+| avg_ms_per_output_token | 13.89 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对当前 `fi + graph on` baseline：
+  - baseline：`TTFT 130.59 ms`，`E2E 0.8763 s`，`output_tps 71.89 tok/s`
+  - `Depthwise Conv Decode`：
+    - `TTFT` 改善约 `0.9%`
+    - `E2E` 改善约 `0.1%`
+    - `output_tps` 提升约 `0.1%`
+
+- 结论：
+  - 这条优化同样是安全的，但几乎没有端到端收益
+  - 说明 decode 中这部分 conv kernel 在当前 workload 下不是 mini-sglang 相对 sglang 的主差距来源
