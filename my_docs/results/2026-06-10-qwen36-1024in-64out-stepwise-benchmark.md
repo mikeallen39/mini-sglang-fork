@@ -1159,3 +1159,360 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - `93.32 tok/s`
   - `96.02 tok/s`
   是正确的，只是中间 `LINEAR_RMSNORM_GATED` 这条接线后来丢了
+
+### FUSED_QKV_SPLIT (2026-06-28)
+
+目标：
+
+- 按 roadmap 的 “prepare / split / copy 融合” 方向，验证 linear-attn prefill 路径中的
+  `mixed_qkvz.split(...) + mixed_ba.split(...)`
+  是否仍然是值得优化的点
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_FUSED_QKV_SPLIT=1`
+
+结果：
+
+- `TTFT = 120.53 ms`
+- `E2E = 0.6597 s`
+- `output_tps = 95.50 tok/s`
+
+相对当前最好值：
+
+- `96.13 -> 95.50 tok/s`
+- 退化约 `0.7%`
+
+结论：
+
+- 当前这版 `FUSED_QKV_SPLIT` 在 graph-on / 单并发场景下没有收益
+- 说明 linear-attn prefill 的 `split` 本身不是当前端到端瓶颈，或者这版 fused split 的收益被额外 layout / launch 成本抵消
+- 此方向暂时降级，不作为下一优先级继续投入
+
+### MOE_FUSED_ACTIVATION (2026-06-28)
+
+目标：
+
+- 沿着 roadmap 的 “MoE 整条执行链” 方向，验证把 routed expert 路径中的
+  `silu_and_mul`
+  替换为 `sgl_kernel` fused activation 是否仍有稳定收益
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+
+结果：
+
+- `TTFT = 117.15 ms`
+- `E2E = 0.6392 s`
+- `output_tps = 98.56 tok/s`
+
+相对当前最好值：
+
+- `96.13 -> 98.56 tok/s`
+- 提升约 `2.5%`
+
+结论：
+
+- `MOE_FUSED_ACTIVATION` 在 graph-on / 单并发场景下是有效优化
+- 说明当前剩余差距里，MoE 周边的 activation 阶段仍有真实开销
+- 当前最好稳定值更新为：
+  - `output_tps = 98.56 tok/s`
+
+### MOE_SGL_REDUCE (2026-06-28)
+
+目标：
+
+- 验证把 MoE combine/reduce 从本地 Triton reduce 切换到 `sgl_kernel.moe_sum_reduce`
+  是否能继续提升 graph-on / 单并发场景的端到端吞吐
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_MOE_SGL_REDUCE=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出异常
+- 返回内容出现大量重复的特殊 token：
+  - `<|im_start|>`
+  - `</think>`
+- 说明当前 `MOE_SGL_REDUCE` 接法仍然存在语义错误
+
+结论：
+
+- `MOE_SGL_REDUCE` 当前 correctness fail
+- 在修复 reduce 语义之前，不进入性能主线比较
+- 此方向保留为后续专门修 correctness 的支线，不作为当前最高优先级继续投入
+
+### SHARED_EXPERT_FUSED_ACTIVATION (2026-06-28)
+
+目标：
+
+- 沿着 “shared expert 之外的剩余 gate/add/mul epilogue” 这条线继续推进
+- 验证 shared expert 内部 bf16 主路径中的
+  `gate_up_proj -> silu_and_mul -> down_proj`
+  是否还能通过 fused activation 再压掉一部分开销
+
+实现：
+
+- 新增开关：
+  - `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- 在 shared expert 的 bf16 主路径中，把
+  - `silu_and_mul(gate_up)`
+  替换为
+  - `fused_silu_and_mul(gate_up, inter)`
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 119.08 ms`
+- `E2E = 0.6351 s`
+- `output_tps = 99.19 tok/s`
+
+相对当前最好值：
+
+- `98.56 -> 99.19 tok/s`
+- 提升约 `0.6%`
+
+结论：
+
+- `SHARED_EXPERT_FUSED_ACTIVATION` 是有效但收益较小的优化
+- 说明 shared expert 内部仍有一部分 activation 开销可清理，但它不是当前最大的剩余瓶颈
+- 当前最好稳定值更新为：
+  - `output_tps = 99.19 tok/s`
+
+### LINEAR_PREFILL_QK_L2NORM (2026-06-28)
+
+目标：
+
+- 回到 linear-attention prefill 路径，减少当前仍然显式存在的：
+  - `F.normalize(query.float(), ...)`
+  - `F.normalize(key.float(), ...)`
+  - 以及对应的 `to(dtype) / contiguous`
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- 当开关打开时：
+  - 不再在 Python 路径里先做 `F.normalize`
+  - 直接把 `use_qk_l2norm_in_kernel=True` 传给 `fused_linear_attn_prefill_sglang`
+  - 让 Q/K 的 L2Norm 下沉到 kernel 内部完成
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 113.02 ms`
+- `E2E = 0.6290 s`
+- `output_tps = 100.17 tok/s`
+
+相对当前最好值：
+
+- `99.19 -> 100.17 tok/s`
+- 提升约 `1.0%`
+
+结论：
+
+- 这条优化是有效的
+- 而且它比 shared expert 局部 activation 更像“主线剩余瓶颈”，因为它直接打到了 roadmap 中明确指出的 prefill normalize / cast / contiguous 链
+- 当前最好稳定值更新为：
+  - `output_tps = 100.17 tok/s`
+
+### LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS (2026-06-28)
+
+目标：
+
+- 继续压缩 linear-attention prefill 路径中显式的：
+  - `value.float().contiguous()`
+  - `gate.contiguous()`
+  - `beta.contiguous()`
+- 验证这些包装是否已经被下游 `chunk_gated_delta_rule` 隐式处理，从而可以安全跳过
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- 当开关打开时：
+  - 直接传入 `value.float()`、`gate`、`beta`
+  - 不再额外做显式 `contiguous()`
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 110.04 ms`
+- `E2E = 0.6263 s`
+- `output_tps = 100.59 tok/s`
+
+相对当前最好值：
+
+- `100.17 -> 100.59 tok/s`
+- 提升约 `0.4%`
+
+结论：
+
+- 这条优化是有效的，但收益较小
+- 说明 prefill 侧这部分显式包装还有少量端到端开销
+- 当前最好稳定值更新为：
+  - `output_tps = 100.59 tok/s`
+
+### DEPTHWISE_CONV_PREFILL (2026-06-28)
+
+目标：
+
+- 针对阶段化 profile 中暴露出的 linear-attention prefill `conv` 开销
+- 尝试把当前的：
+  - `torch.cat + F.conv1d + activation`
+  替换为 sglang 现成的 `causal_conv1d_fn`
+
+实现：
+
+- 新增开关：
+  - `MINISGL_DEPTHWISE_CONV_PREFILL=1`
+- 当开关打开时：
+  - 仅在线性注意力 prefill 路径中调用 `sglang.srt.layers.attention.mamba.causal_conv1d.causal_conv1d_fn`
+  - decode 路径保持不变
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_DEPTHWISE_CONV_PREFILL=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 125.72 ms`
+- `E2E = 0.6404 s`
+- `output_tps = 98.37 tok/s`
+
+相对当前最好值：
+
+- `100.59 -> 98.37 tok/s`
+- 退化约 `2.2%`
+
+结论：
+
+- 这条优化在当前实现方式下无效，且明显退化
+- 说明直接复用 `causal_conv1d_fn` 并没有在 mini-sglang 当前调用形态下打中真实瓶颈
+- 此方向暂时降级，不作为当前主线继续推进
+
+### SKIP_AB_FP32_CAST (2026-06-28)
+
+目标：
+
+- 回到当前 benchmark 更直接相关的 decode 热路径
+- 验证 linear-attention decode 里：
+  - `a.float().contiguous()`
+  - `b.float().contiguous()`
+  是否仍有可省去的端到端开销
+
+实现：
+
+- 使用已有开关：
+  - `MINISGL_SKIP_AB_FP32_CAST=1`
+- 当开关打开时：
+  - 直接传入 bf16 的 `a` / `b`
+  - 不再在 Python 侧先做显式 fp32 cast
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 114.02 ms`
+- `E2E = 0.6235 s`
+- `output_tps = 101.04 tok/s`
+
+相对当前最好值：
+
+- `100.59 -> 101.04 tok/s`
+- 提升约 `0.4%`
+
+结论：
+
+- 这条优化是有效的
+- 虽然收益不大，但说明当前 `64 out` 场景下 decode 路径里的 `a/b -> fp32` 包装仍有少量端到端成本
+- 当前最好稳定值更新为：
+  - `output_tps = 101.04 tok/s`

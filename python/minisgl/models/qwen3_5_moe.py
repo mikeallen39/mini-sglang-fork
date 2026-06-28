@@ -24,6 +24,7 @@ from minisgl.layers import (
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
+    fused_silu_and_mul,
     fused_gate_sigmoid_mul_add,
     fused_qk_gemma_rmsnorm_rope_gate,
     fused_rmsnorm_gated,
@@ -45,6 +46,13 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 logger = init_logger(__name__)
+
+try:
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn as sglang_causal_conv1d_fn,
+    )
+except ImportError:  # pragma: no cover
+    sglang_causal_conv1d_fn = None
 
 try:
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -374,6 +382,14 @@ class Qwen3_5SharedExpert(BaseOP):
                 bias=self.down_proj.bias,
             )
         gate_up = self.gate_up_proj.forward_prequantized(x, hidden_states_q, hidden_states_scale)
+        if ENV.SHARED_EXPERT_FUSED_ACTIVATION.value and gate_up.is_cuda and gate_up.ndim == 2:
+            inter = torch.empty(
+                (gate_up.shape[0], gate_up.shape[1] // 2),
+                device=gate_up.device,
+                dtype=gate_up.dtype,
+            )
+            fused_silu_and_mul(gate_up, inter)
+            return self.down_proj.forward(inter)
         return self.down_proj.forward(silu_and_mul(gate_up))
 
 
@@ -533,6 +549,33 @@ class Qwen3_5LinearAttention(BaseOP):
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = get_global_ctx().batch
+        if (
+            ENV.DEPTHWISE_CONV_PREFILL.value
+            and sglang_causal_conv1d_fn is not None
+            and mixed_qkv.shape[0] > 1
+            and batch.is_prefill
+        ):
+            conv_weight = self.conv1d.weight.squeeze(1).to(dtype=mixed_qkv.dtype)
+            x = mixed_qkv.transpose(0, 1)
+            cache_indices = torch.tensor([0], dtype=torch.int32, device=mixed_qkv.device)
+            query_start_loc = torch.tensor(
+                [0, mixed_qkv.shape[0]], dtype=torch.int32, device=mixed_qkv.device
+            )
+            has_initial_state = torch.tensor([conv_state.abs().any().item()], dtype=torch.bool, device=mixed_qkv.device)
+            next_state = conv_state.unsqueeze(0)
+            updated = sglang_causal_conv1d_fn(
+                x,
+                conv_weight,
+                bias=None,
+                activation=self.activation,
+                conv_states=next_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=[mixed_qkv.shape[0]],
+            )
+            return updated.transpose(0, 1), next_state.squeeze(0)
         if (
             ENV.DEPTHWISE_CONV_DECODE.value
             and sglang_causal_conv1d_update is not None
@@ -708,18 +751,31 @@ class Qwen3_5LinearAttention(BaseOP):
             )
         else:
             query, key, value, _ = self._reshape_qkv(mixed_qkv, z)
-            query = F.normalize(query.float(), dim=-1, eps=1e-6).to(query.dtype).contiguous()
-            key = F.normalize(key.float(), dim=-1, eps=1e-6).to(key.dtype).contiguous()
+            use_qk_l2norm_in_kernel = ENV.LINEAR_PREFILL_QK_L2NORM.value
+            if use_qk_l2norm_in_kernel:
+                query = query.contiguous()
+                key = key.contiguous()
+            else:
+                query = F.normalize(query.float(), dim=-1, eps=1e-6).to(query.dtype).contiguous()
+                key = F.normalize(key.float(), dim=-1, eps=1e-6).to(key.dtype).contiguous()
             gate, beta = fused_gdn_gating_sglang(A_log, a, b, dt_bias)
+            if ENV.LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS.value:
+                value_in = value.float()
+                gate_in = gate
+                beta_in = beta
+            else:
+                value_in = value.float().contiguous()
+                gate_in = gate.contiguous()
+                beta_in = beta.contiguous()
             outputs = fused_linear_attn_prefill_sglang(
                 query,
                 key,
-                value.float().contiguous(),
-                gate.contiguous(),
-                beta.contiguous(),
+                value_in,
+                gate_in,
+                beta_in,
                 ssm_state,
                 self.scale,
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
         if profile_events is not None:
             kernel_end.record()

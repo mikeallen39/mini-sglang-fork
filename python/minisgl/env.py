@@ -88,9 +88,13 @@ class EnvClassSingleton:
     MOE_SGL_REDUCE = EnvBool(False)  # use sgl_kernel moe_sum_reduce instead of local Triton reduce
     LINEAR_RMSNORM_GATED = EnvBool(False)  # use fused RMSNorm+gate for Qwen3.6 linear attention output norm
     SHARED_EXPERT_FUSED_GATE_ADD = EnvBool(False)  # fuse sigmoid(gate)*shared_output + moe_output for shared expert
+    SHARED_EXPERT_FUSED_ACTIVATION = EnvBool(False)  # use fused silu_and_mul inside shared expert bf16 path
     SKIP_AB_FP32_CAST = EnvBool(False)  # keep a,b in bf16 for decode (Triton kernel loads as fp32 internally)
     DEPTHWISE_CONV_DECODE = EnvBool(False)  # use fused Triton depthwise conv for decode
+    DEPTHWISE_CONV_PREFILL = EnvBool(False)  # use sglang causal_conv1d_fn for prefill depthwise conv
     FUSED_QKV_SPLIT = EnvBool(False)  # use fused QKV split kernel in GDN prefill
+    LINEAR_PREFILL_QK_L2NORM = EnvBool(False)  # move Q/K l2norm from PyTorch prefill path into the linear-attn kernel
+    LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS = EnvBool(False)  # skip explicit prefill contiguous/cast wrappers that chunk_gated_delta_rule already guards
     GEMMA_FUSED_NORM = EnvBool(False)  # use sgl_kernel gemma_rmsnorm / gemma_fused_add_rmsnorm
     FULL_ATTN_FUSED_PREPARE = EnvBool(False)  # fuse Q/K GemmaRMSNorm + RoPE + gate extraction in full attention
     FULL_ATTN_FUSED_GATE_MUL = EnvBool(False)  # fuse sigmoid(gate) * attn_output in full attention
