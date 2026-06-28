@@ -8,6 +8,7 @@ import torch
 from minisgl.core import get_global_ctx
 from minisgl.layers import ParallelLMHead
 from minisgl.models.qwen3_5_moe import Qwen3_5Model
+from minisgl.utils import get_linear_attn_backend
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeVisionConfig
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeVisionModel
 
@@ -203,16 +204,50 @@ class Qwen3_5VLMoeForConditionalGeneration(BaseLLMModel):
         # The text-only path reuses the same language backbone as Qwen3.5-MoE and
         # remains graph-safe. Multimodal requests still bypass graph replay at
         # runtime because their batch carries pixel_values/image_grid_thw.
-        return True
+        return get_linear_attn_backend() == "sglang"
 
-    @property
-    def supports_prefix_cache(self) -> bool:
-        return False
+    def get_last_hidden_capture(self) -> torch.Tensor | None:
+        return getattr(self, "_last_hidden_capture", None)
+
+    def prepare_for_cuda_graph_replay(self, batch, dummy_reqs) -> None:
+        if not batch.is_decode:
+            return
+        for real_req, dummy_req in zip(batch.reqs, dummy_reqs, strict=False):
+            if real_req.table_idx == dummy_req.table_idx:
+                continue
+            for layer in self.model.layers.op_list:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.copy_state(real_req.table_idx, dummy_req.table_idx)
+
+    def finish_cuda_graph_replay(self, batch, dummy_reqs) -> None:
+        if not batch.is_decode:
+            return
+        for real_req, dummy_req in zip(batch.reqs, dummy_reqs, strict=False):
+            if real_req.table_idx == dummy_req.table_idx:
+                continue
+            for layer in self.model.layers.op_list:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.copy_state(dummy_req.table_idx, real_req.table_idx)
+
+    def clear_runtime_state_slot(self, table_idx: int) -> None:
+        self.model.linear_state_cache.clear(table_idx)
+
+    def copy_runtime_state_slot(self, src_table_idx: int, dst_table_idx: int) -> None:
+        for layer in self.model.layers.op_list:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                linear_attn.copy_state(src_table_idx, dst_table_idx)
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         if batch.pixel_values is None:
-            return self.lm_head.forward(self.model.forward(batch.input_ids))
+            hidden, _ = self.model.forward(batch.input_ids)
+            self._last_hidden_capture = getattr(
+                self.model, "_last_captured_hidden_states", None
+            )
+            return self.lm_head.forward(hidden)
         if batch.is_decode:
             if batch.reqs[0].rope_delta is None:
                 raise RuntimeError("Missing multimodal rope delta for decode step.")
@@ -223,7 +258,10 @@ class Qwen3_5VLMoeForConditionalGeneration(BaseLLMModel):
             original_positions = batch.positions
             batch.positions = batch.mrope_positions
             try:
-                output = self.model.forward(batch.input_ids)
+                output, _ = self.model.forward(batch.input_ids)
+                self._last_hidden_capture = getattr(
+                    self.model, "_last_captured_hidden_states", None
+                )
             finally:
                 batch.positions = original_positions
             return self.lm_head.forward(output)
@@ -233,6 +271,7 @@ class Qwen3_5VLMoeForConditionalGeneration(BaseLLMModel):
             batch.image_grid_thw,
             batch.mm_token_type_ids,
         )
+        self._last_hidden_capture = None
         return self.lm_head.forward(output)
 
 
