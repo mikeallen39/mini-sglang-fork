@@ -131,6 +131,10 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP2 | 208.44 ms | 1.0111 s | 62.31 tok/s | 16.05 ms | 63.00 | 20775 MiB x 2 |
 | W8A8 Int8 + Fused MoE + SGLang Linear Attention + CUDA Graph + EP4 | 205.37 ms | 1.0244 s | 61.50 tok/s | 16.26 ms | 63.00 | 13001 MiB x 4 |
 | bf16 (不量化) + Fused MoE + SGLang Linear Attention + CUDA Graph | 118.49 ms | 0.8297 s | 75.93 tok/s | 13.17 ms | 63.00 | 68137 MiB |
+| bf16 + Gemma Fused Norm + Q/K Inplace Fused Norm Copy-Back + Fused MoE + SGLang Linear Attention + CUDA Graph | 125.24 ms | 0.7613 s | 82.75 tok/s | 12.08 ms | 63.00 | 68153 MiB |
+| bf16 + Gemma Fused Norm + FullAttn Fused Prepare + Fused MoE + SGLang Linear Attention + CUDA Graph | 121.91 ms | 0.7277 s | 86.58 tok/s | 11.55 ms | 63.00 | 68153 MiB |
+| bf16 + Gemma Fused Norm + FullAttn Fused Prepare + Fused Gate Mul + Fused MoE + SGLang Linear Attention + CUDA Graph | 122.81 ms | 0.7279 s | 86.55 tok/s | 11.55 ms | 63.00 | 68153 MiB |
+| bf16 + Gemma Fused Norm + FullAttn Fused Prepare + SGLang CausalConv1dUpdate Decode + Fused MoE + SGLang Linear Attention + CUDA Graph | 123.30 ms | 0.7131 s | 88.35 tok/s | 11.32 ms | 63.00 | 68155 MiB |
 
 **sglang main 对标（bf16，相同 workload，disable radix cache）：**
 
@@ -890,3 +894,163 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 - 结论：
   - 这条优化同样是安全的，但几乎没有端到端收益
   - 说明 decode 中这部分 conv kernel 在当前 workload 下不是 mini-sglang 相对 sglang 的主差距来源
+
+### 3.15 Then Extend Gemma Fused Norm to Q/K `forward_inplace()`
+
+- 目标：
+  - 把 full attention 中 `q_norm.forward_inplace()` / `k_norm.forward_inplace()` 也接到 fused Gemma norm
+  - 观察 q/k norm 这块是否还能继续缩小与 sglang 的差距
+- 配置：
+  - 基于 `MINISGL_GEMMA_FUSED_NORM=1`
+  - 在 `GemmaRMSNorm.forward_inplace()` 中改为 fused 结果 `copy_` 回原张量
+- 为什么这样改：
+  - sglang 的 full-attention q/k norm 已经走 fused 路径
+  - mini-sglang 之前虽然主 norm 吃到了 fused，但 `forward_inplace()` 仍然停留在 torch 路径
+  - 直接 `out=x` 的原地写回版本会引入重复句子等正确性问题，因此改成“先 fused 计算，再 `copy_` 回原张量”的保守版本
+- 正确性检查：
+  - 长 prompt 输出恢复正常，无重复句子
+  - 短请求输出正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run2-run5 avg | 125.24 ms | 0.7613 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 output_tps | 82.75 tok/s |
+| avg_ms_per_output_token | 12.08 ms |
+
+- 相对 `Gemma Fused Norm` 初版（80.15 tok/s）：
+  - `output_tps` 再提升约 `3.2%`
+- 结论：
+  - 这说明 q/k inplace norm 仍然有收益
+  - 但收益已经明显小于首轮 `Gemma Fused Norm`，说明它不是剩余大差距的主来源
+
+### 3.16 Then Port SGLang Full-Attention Fused Prepare
+
+- 目标：
+  - 直接对齐 sglang 的 full-attention 前处理路径
+  - 将 `Q/K GemmaRMSNorm + RoPE + gate 提取` 合成 1 条 fused 路径
+- 配置：
+  - `MINISGL_GEMMA_FUSED_NORM=1`
+  - `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- 实现说明：
+  - 新增 `python/minisgl/layers/fused_qk_rmsnorm_rope_gate.py`
+  - 在 `Qwen3_5FullAttention.forward()` 中，当满足 CUDA + `attn_output_gate=True` 时，直接走 fused prepare
+  - 原路径保留，默认关闭，可做消融
+- 为什么有效：
+  - sglang 当前 full attention 已经有这条 fused prepare
+  - mini-sglang 原先仍然是：
+    - `split`
+    - `q_norm.forward_inplace`
+    - `k_norm.forward_inplace`
+    - `rotary.forward`
+    - 后续再处理 gate
+  - 这条融合减少了多次 q/k norm、rope 相关的中间张量和 kernel
+- 正确性检查：
+  - 短请求 `介绍一下自己` 输出正常
+  - `1024 final-chat / 64 out` 的 `run1` 输出正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 154.51 ms | 0.7590 s | 63 |
+| run2 | 118.92 ms | 0.7249 s | 63 |
+| run3 | 122.92 ms | 0.7284 s | 63 |
+| run4 | 122.52 ms | 0.7287 s | 63 |
+| run5 | 123.29 ms | 0.7287 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 121.91 ms |
+| run2-run5 avg E2E | 0.7277 s |
+| run2-run5 output_tps | 86.58 tok/s |
+| avg_ms_per_output_token | 11.55 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `82.75 tok/s`：
+  - `output_tps` 再提升约 `4.6%`
+- 结论：
+  - 这是当前追赶 sglang 主线里第二个明确有效的结构性优化
+  - 也进一步证明：和 sglang 直接对齐 full-attention 编排，比继续抠零散小 kernel 更有效
+
+### 3.17 Then Port SGLang Fused Gate Mul
+
+- 目标：
+  - 对齐 sglang 的 `fused_sigmoid_mul(attn_output, gate)`
+  - 验证 full-attention 输出侧的 `attn_output * sigmoid(gate)` 是否还是一个值得优化的点
+- 配置：
+  - `MINISGL_GEMMA_FUSED_NORM=1`
+  - `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+  - `MINISGL_FULL_ATTN_FUSED_GATE_MUL=1`
+- 实现说明：
+  - 新增 `python/minisgl/layers/elementwise.py`
+  - 用 Triton 实现和 sglang 等价的 fused sigmoid-mul
+- 正确性检查：
+  - 短请求输出正常
+  - 长 prompt 输出正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run2-run5 avg | 122.81 ms | 0.7279 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 output_tps | 86.55 tok/s |
+| avg_ms_per_output_token | 11.55 ms |
+
+- 相对 `FullAttn Fused Prepare`：
+  - 几乎无变化
+- 结论：
+  - 这条路径不是当前主缺口
+  - `sigmoid(gate)` 本身的输出侧 elementwise 不是 mini-sglang 相比 sglang 的大差距来源
+
+### 3.18 Then Replace Decode Conv with SGLang `causal_conv1d_update`
+
+- 目标：
+  - 沿着和 sglang 直接对齐的方向，把 linear-attn decode 的 conv 从 mini 原有 `torch.cat + F.conv1d` 改为 `sglang` 当前主线使用的 `causal_conv1d_update`
+- 配置：
+  - `MINISGL_GEMMA_FUSED_NORM=1`
+  - `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+  - `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- 实现说明：
+  - 不再使用之前自写的 `depthwise_conv_triton.py` 作为主线
+  - 直接在 `_run_depthwise_conv()` 中优先调用：
+    - `sglang.srt.layers.attention.mamba.causal_conv1d.causal_conv1d_update`
+  - 保留原 torch 路径作为回退
+- 为什么有效：
+  - 新一轮 graph-off trace 显示，当前 mini-sglang 仍有大量
+    - `conv_depthwise2d_forward_kernel_generic`
+  - 而 sglang 对应的是：
+    - `_causal_conv1d_update_kernel`
+  - 这说明此前“decode conv 不是主差距”的判断只适用于自写 Triton 版本，不适用于“直接对齐 sglang 现有实现”
+- 正确性检查：
+  - 短请求 `介绍一下自己` 输出正常
+  - `1024 final-chat / 64 out` 的 `run1` 输出正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 151.17 ms | 0.7410 s | 63 |
+| run2 | 122.50 ms | 0.7123 s | 63 |
+| run3 | 122.79 ms | 0.7125 s | 63 |
+| run4 | 124.71 ms | 0.7144 s | 63 |
+| run5 | 123.21 ms | 0.7132 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 123.30 ms |
+| run2-run5 avg E2E | 0.7131 s |
+| run2-run5 output_tps | 88.35 tok/s |
+| avg_ms_per_output_token | 11.32 ms |
+| avg_output_tokens | 63.00 |
+
+- 相对 `86.58 tok/s`：
+  - `output_tps` 再提升约 `2.0%`
+- 相对修复后原 baseline `71.89 tok/s`：
+  - `output_tps` 累计提升约 `22.9%`
+- 结论：
+  - 这说明 decode conv 仍然有空间，但前提是要直接对齐 sglang 的实现，而不是另起一套自写替代品
+  - 当前最好稳定结果已经推进到 `88.35 tok/s`

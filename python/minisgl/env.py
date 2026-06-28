@@ -83,6 +83,13 @@ class EnvClassSingleton:
     PROFILE_FUSED_MOE = EnvBool(False)
     PROFILE_SPARSE_MOE = EnvBool(False)
     PROFILE_INT8_DENSE = EnvBool(False)
+    MOE_SINGLE_KERNEL = EnvBool(False)  # fuse silu_and_mul into the second MoE GEMM
+    SKIP_AB_FP32_CAST = EnvBool(False)  # keep a,b in bf16 for decode (Triton kernel loads as fp32 internally)
+    DEPTHWISE_CONV_DECODE = EnvBool(False)  # use fused Triton depthwise conv for decode
+    FUSED_QKV_SPLIT = EnvBool(False)  # use fused QKV split kernel in GDN prefill
+    GEMMA_FUSED_NORM = EnvBool(False)  # use sgl_kernel gemma_rmsnorm / gemma_fused_add_rmsnorm
+    FULL_ATTN_FUSED_PREPARE = EnvBool(False)  # fuse Q/K GemmaRMSNorm + RoPE + gate extraction in full attention
+    FULL_ATTN_FUSED_GATE_MUL = EnvBool(False)  # fuse sigmoid(gate) * attn_output in full attention
 
     def __new__(cls):
         # single instance

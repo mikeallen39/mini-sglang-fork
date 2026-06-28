@@ -12,6 +12,7 @@ from minisgl.linear_attention import (
     fused_gdn_gating_sglang,
     fused_linear_attn_decode_sglang,
     fused_linear_attn_prefill_sglang,
+    fused_qkvzba_split_reshape_cat_contiguous,
 )
 from minisgl.layers import (
     BaseOP,
@@ -23,6 +24,8 @@ from minisgl.layers import (
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
+    fused_qk_gemma_rmsnorm_rope_gate,
+    fused_sigmoid_mul,
     silu_and_mul,
 )
 from minisgl.quantization import (
@@ -39,6 +42,13 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 logger = init_logger(__name__)
+
+try:
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_update as sglang_causal_conv1d_update,
+    )
+except ImportError:  # pragma: no cover
+    sglang_causal_conv1d_update = None
 
 _SPARSE_MOE_PROFILE = {
     "router_ms": 0.0,
@@ -368,7 +378,33 @@ class Qwen3_5FullAttention(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         qkv = self.qkv_proj.forward(x)
-        if self.attn_output_gate:
+        use_fused_prepare = (
+            ENV.FULL_ATTN_FUSED_PREPARE.value
+            and x.is_cuda
+            and self.attn_output_gate
+            and ctx.batch.positions.ndim == 1
+            and self.rotary.is_neox
+            and getattr(self.rotary, "rotary_dim", self.head_dim) <= self.head_dim
+        )
+        if use_fused_prepare:
+            q_and_gate, k, v = qkv.split([self.q_dim * 2, self.kv_dim, self.kv_dim], dim=-1)
+            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                q_and_gate,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary._cos_sin_cache,
+                ctx.batch.positions,
+                self.q_norm.eps,
+                self.local_num_qo_heads,
+                self.local_num_kv_heads,
+                self.head_dim,
+                self.rotary.rotary_dim,
+                has_gate=True,
+            )
+            q = q.view(-1, self.local_num_qo_heads, self.head_dim)
+            gate = gate.view(-1, self.q_dim)
+        elif self.attn_output_gate:
             q_and_gate, k, v = qkv.split([self.q_dim * 2, self.kv_dim, self.kv_dim], dim=-1)
             orig_shape = q_and_gate.shape[:-1]
             q_and_gate = q_and_gate.view(*orig_shape, self.local_num_qo_heads, -1)
@@ -379,14 +415,18 @@ class Qwen3_5FullAttention(BaseOP):
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
             gate = None
 
-        self.q_norm.forward_inplace(q.view(-1, self.local_num_qo_heads, self.head_dim))
-        self.k_norm.forward_inplace(k.view(-1, self.local_num_kv_heads, self.head_dim))
-        q, k = self.rotary.forward(ctx.batch.positions, q, k)
-        q = q.view(-1, self.local_num_qo_heads, self.head_dim)
+        if not use_fused_prepare:
+            self.q_norm.forward_inplace(q.view(-1, self.local_num_qo_heads, self.head_dim))
+            self.k_norm.forward_inplace(k.view(-1, self.local_num_kv_heads, self.head_dim))
+            q, k = self.rotary.forward(ctx.batch.positions, q, k)
+            q = q.view(-1, self.local_num_qo_heads, self.head_dim)
         attn_output = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         attn_output = attn_output.view(-1, self.q_dim)
         if gate is not None:
-            attn_output = attn_output * torch.sigmoid(gate)
+            if ENV.FULL_ATTN_FUSED_GATE_MUL.value and attn_output.is_cuda:
+                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj.forward(attn_output)
 
 
@@ -452,6 +492,20 @@ class Qwen3_5LinearAttention(BaseOP):
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            ENV.DEPTHWISE_CONV_DECODE.value
+            and sglang_causal_conv1d_update is not None
+            and mixed_qkv.shape[0] == 1
+        ):
+            conv_weight = self.conv1d.weight.squeeze(1).to(dtype=mixed_qkv.dtype)
+            updated = sglang_causal_conv1d_update(
+                mixed_qkv,
+                conv_state.unsqueeze(0),
+                conv_weight,
+                bias=None,
+                activation=self.activation,
+            )
+            return updated, conv_state
         conv_weight = self.conv1d.weight.squeeze(1).to(dtype=mixed_qkv.dtype)
         x = mixed_qkv.transpose(0, 1)
         padded = torch.cat((conv_state.to(dtype=x.dtype), x), dim=-1).unsqueeze(0)
@@ -586,8 +640,12 @@ class Qwen3_5LinearAttention(BaseOP):
         if profile_events is not None:
             conv_end.record()
 
-        a = a.float().contiguous()
-        b = b.float().contiguous()
+        if ENV.SKIP_AB_FP32_CAST.value:
+            a = a.contiguous()
+            b = b.contiguous()
+        else:
+            a = a.float().contiguous()
+            b = b.float().contiguous()
         A_log = self._get_A_log_fp32()
         dt_bias = self._get_dt_bias_fp32()
         if is_decode:
@@ -674,10 +732,20 @@ class Qwen3_5LinearAttention(BaseOP):
         mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
         if profile_enabled:
             proj_events[2].record()
-        mixed_qkv, z = mixed_qkvz.split(
-            [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
-        )
-        b, a = mixed_ba.split([self.num_v_heads, self.num_v_heads], dim=-1)
+        if ENV.FUSED_QKV_SPLIT.value and self.backend == "sglang":
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                mixed_qkvz,
+                mixed_ba,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        else:
+            mixed_qkv, z = mixed_qkvz.split(
+                [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
+            )
+            b, a = mixed_ba.split([self.num_v_heads, self.num_v_heads], dim=-1)
 
         outputs = []
         offset = 0

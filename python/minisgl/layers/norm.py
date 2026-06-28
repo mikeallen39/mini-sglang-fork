@@ -32,7 +32,10 @@ def _sgl_kernel_gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    return _get_sgl_kernel_elementwise().gemma_rmsnorm(x, weight, eps, out=torch.empty_like(x))
+    x_2d = x.reshape(-1, x.shape[-1])
+    out = torch.empty_like(x_2d)
+    out = _get_sgl_kernel_elementwise().gemma_rmsnorm(x_2d, weight, eps, out=out)
+    return out.reshape_as(x)
 
 
 def _sgl_kernel_gemma_fused_add_rmsnorm(
@@ -157,6 +160,9 @@ class GemmaRMSNorm(BaseOP):
         return y
 
     def forward_inplace(self, x: torch.Tensor) -> None:
+        if self._use_fused and x.is_cuda:
+            x.copy_(_sgl_kernel_gemma_rmsnorm(x, self.weight, self.eps))
+            return
         x.copy_(_torch_gemma_rmsnorm(x, self.weight, self.eps))
 
 
