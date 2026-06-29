@@ -72,6 +72,7 @@ class MoELayer(BaseOP):
             intermediate_size_per_partition,
         )
         self.down_proj_scale: torch.Tensor | None = None
+        self.output_buffer: torch.Tensor | None = None
 
     def forward(
         self,
@@ -103,7 +104,15 @@ class MoELayer(BaseOP):
             local_expert_start=self.local_expert_start,
             num_global_experts=self.num_experts,
             num_dispatch_experts=self.num_local_experts,
+            output_buffer=self.output_buffer if self.output_buffer is not None else None,
         )
+        if (
+            self.output_buffer is None
+            or self.output_buffer.shape != final_hidden_states.shape
+            or self.output_buffer.dtype != final_hidden_states.dtype
+            or self.output_buffer.device != final_hidden_states.device
+        ):
+            self.output_buffer = final_hidden_states
         if self.world_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states

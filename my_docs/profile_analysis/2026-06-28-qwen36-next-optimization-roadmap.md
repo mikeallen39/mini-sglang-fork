@@ -791,9 +791,9 @@
 
 当前主线最好稳定值更新为：
 
-- `TTFT = 100.47 ms`
-- `E2E = 0.5621 s`
-- `output_tps = 112.08 tok/s`
+- `TTFT = 99.06 ms`
+- `E2E = 0.5526 s`
+- `output_tps = 114.01 tok/s`
 
 补充：
 
@@ -805,10 +805,27 @@
     - `output_tps = 112.65 tok/s`
 - 这说明 attention metadata / planner 的 graph replay 组织方式确实是 mini-sglang 落后于 sglang 的一个来源
 - 但收益只有 `+0.57 tok/s`，不能解释剩余的大部分差距
+- 另一个引擎级实验 `MINISGL_DECODE_BATCH_REUSE_BUFFERS=1` 已经验证为退化：
+  - `112.08 -> 111.64 tok/s`
+  - 说明简单的 decode host/device 索引 buffer 复用并不是当前主线收益点
+- 这一轮继续把之前笼统的 `MOE_REUSE_WORKSPACE` 拆开，结果是：
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+    - `112.85 -> 113.06 tok/s`
+  - `MINISGL_MOE_REUSE_ALIGN_WORKSPACE=1`
+    - `112.85 -> 112.93 tok/s`
+  - `MINISGL_MOE_GATE_MM_OUT=1`
+    - 退化到 `112.76 tok/s`
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1 + MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+    - `112.85 -> 114.01 tok/s`
+- 这说明：
+  - 当前 MoE 周边链里，真正打中的“小张量分配”是 `topk` 输出缓冲
+  - `align` 缓冲复用基本不重要
+  - router logits 改成 `torch.mm(..., out=...)` 并没有收益
+  - `topk workspace` 和 decode graph fast planner 可以稳定叠加
 
 相对 sglang `124.03 tok/s`：
 
-- 已达到约 `90.4%`
+- 已达到约 `91.9%`
 
 ### 对后续优化方向的影响
 
@@ -820,6 +837,131 @@
 4. `MOE_SGL_REDUCE` 修复后 correctness 正常，但目前没有显示出明显大于噪声的收益
 5. 相比之下，shared expert 双流和 workspace 复用都不是当前主矛盾
 6. 从引擎级对比看，decode graph replay 的 attention metadata/planner 路径确实存在设计差异，但单独对齐 `fast_decode_plan` 只能带来小收益，说明它不是剩余差距的主来源
+7. decode batch 边界上的小索引张量构造/复用也已经做过单因素实验，当前实现为负收益，因此这条线的优先级应降低
+8. MoE 周边链里的“buffer 复用”不能一概而论：
+   - `topk` 输出缓冲复用有效
+   - `align` 临时缓冲复用基本不值钱
+   - router logits 输出复用退化
+   - 因此后续仍应按单因素逐项拆，而不是再用大开关把多种复用绑在一起
+
+### 2026-06-29 补充：MoE reduce / 单 kernel 重新核实
+
+在 `114.01 tok/s` 主线附近，又补做了三类更窄的验证：
+
+- `MINISGL_MOE_FASTPATH_TOPK2_REDUCE=1`
+  - `114.01 -> 113.41 tok/s`
+- `MINISGL_MOE_TORCH_COMPILE_REDUCE=1`
+  - `114.01 -> 113.55 tok/s`
+- `MINISGL_MOE_SINGLE_KERNEL=1`
+  - 强退化到 `101.84 tok/s`
+
+以及一项关键反向消融：
+
+- 关闭 `MINISGL_MOE_SGL_REDUCE=1`
+  - `114.01 -> 112.83 tok/s`
+
+由此可以把当前判断收紧为：
+
+1. `MOE_SGL_REDUCE` 在最新主线里仍然是有效项，不是偶然噪声
+2. 但继续围绕 reduce 再叠加更多局部变体，收益已经明显见顶
+3. `MOE_SINGLE_KERNEL` 这类更激进的“宽融合”在当前 Qwen3.6 routed-expert shape 上显著不合适
+4. 因此下一步不应继续在 reduce 变体或单 kernel 路线上消耗时间，而应继续回到 **MoE topk / dispatch / combine 边界** 做更窄、更可控的单因素优化
+
+### 对当前主线的修正
+
+之前的一个风险是容易把“MoE 是大头”误读成“直接做更宽的内核融合就会更快”。这批实验基本证伪了这个简化判断。
+
+更准确的主线应当是：
+
+- 当前收益最大的仍然是 **MoE 周边链路中那些每步都会命中的小边界和小张量成本**
+- 已验证有效：
+  - `MOE_SKIP_TOPK_POST_RENORM`
+  - `MOE_SKIP_TOPK_FP32_CAST`
+  - `MOE_SKIP_DISPATCH_LOCAL_MASK`
+  - `MOE_ALIGN_SMALL_CAP`
+  - `MOE_SGLANG_CONFIG_LOOKUP`
+  - `MOE_SGLANG_DOWN_CONFIG`
+  - `MOE_SGL_REDUCE`
+  - `MOE_REUSE_TOPK_WORKSPACE`
+- 已验证无效或退化：
+  - `MOE_REUSE_ALIGN_WORKSPACE`
+  - `MOE_GATE_MM_OUT`
+  - `MOE_FASTPATH_TOPK2_REDUCE`
+  - `MOE_TORCH_COMPILE_REDUCE`
+  - `MOE_SINGLE_KERNEL`
+
+因此，后续优化仍应保持两个原则：
+
+1. 继续以 **单因素、可开关** 的方式推进
+2. 优先打 `topk -> dispatch -> combine` 连接处，而不是扩大成更激进的整段融合
+
+### 2026-06-29 补充：重新做“整层累计开销”归因后的结论
+
+在当前主线 best 配置附近，重新开启了模型内置 profile：
+
+- `MINISGL_PROFILE_QWEN35=1`
+- `MINISGL_PROFILE_SPARSE_MOE=1`
+- `MINISGL_PROFILE_FUSED_MOE=1`
+
+注意：
+
+- profile 模式本身会明显拖慢 benchmark，因此这里只用于归因，不用于更新主线性能值
+
+#### 观察 1：SparseMoE 的主要时间仍在 experts，本体不是 router/shared
+
+多轮日志都比较一致：
+
+- `SparseMoE profile avg`
+  - `router ≈ 0.02 ~ 0.05 ms`
+  - `experts ≈ 1.20 ~ 1.26 ms`
+  - `shared ≈ 0.09 ~ 0.18 ms`
+
+结论：
+
+- 先前针对 router / dispatch / shared expert 的优化虽然有效，但它们已经不是当前剩余差距的主矛盾
+- 现在真正的大头仍然是 **routed experts 本体**
+
+#### 观察 2：FusedMoE 内部，最大块是 `w1`，其次是 `w2`
+
+多轮日志：
+
+- `FusedMoE profile avg`
+  - 一轮：
+    - `w1 = 0.6036 ms`
+    - `stage2 = 0.0298 ms`
+    - `w2 = 0.2533 ms`
+    - `reduce = 0.0751 ms`
+  - 另一轮：
+    - `w1 = 0.6420 ms`
+    - `stage2 = 0.0181 ms`
+    - `w2 = 0.3212 ms`
+    - `reduce = 0.0315 ms`
+
+结论：
+
+- routed experts 内部：
+  - 第一优先级是 `w1 / gate_up` GEMM
+  - 第二优先级是 `w2 / down_proj` GEMM
+- `stage2`（activation）已经很小
+- `reduce` 也不是当前主矛盾
+
+#### 观察 3：这解释了为什么前面的几类优化收益已经逐渐变小
+
+- router / dispatch / config lookup / down-config 的优化之所以有效，是因为它们在 routed experts 周边
+- 但当这些周边开销被削掉后，剩余瓶颈自然回到 **routed experts 两个 GEMM 本体**
+
+#### 更新后的下一优先级
+
+1. 回到 **routed experts kernel 本体**
+   - 第一优先级：`w1`
+   - 第二优先级：`w2`
+2. 暂时降低以下方向优先级：
+   - decode 小索引 buffer 复用
+   - replay planner 小修补
+   - shared expert 小优化
+   - MoE reduce / activation 小优化
+3. 如果继续与 sglang 对齐，最值得看的不再是外围胶水，而是：
+   - sglang 在 routed experts `w1/w2` 上是否还有 kernel / tile / launch / schedule 差异
 
 ### 下一优先级更新
 
@@ -835,3 +977,27 @@
    - graph replay 外的 batch/metadata 边界
    - residual / layer glue
    - 非 linear-attn / 非 routed-expert 的整层累计开销
+5. 暂时不建议继续深挖单纯的 decode 小索引 buffer 复用，除非先通过 profile 找到更明确的边界大头
+
+### W8A8 补充结论（2026-06-29）
+
+在尽量对齐当前 bf16 最优主线的配置下，补做了三组同口径对比：
+
+- `bf16`
+  - `output_tps = 113.59 tok/s`
+- `W8A8`
+  - `output_tps = 110.24 tok/s`
+- `W8A8 + MINISGL_W8A8_FUSED_GEMMA_NORM_QUANT=1`
+  - `output_tps = 110.49 tok/s`
+
+结论：
+
+- 当前最优主线下，`W8A8` 相对 `bf16` 仍然慢约 `2.95%`
+- `GemmaRMSNorm + per-token int8 quant` 的真实 Triton fuse 是有效的，但收益很小：
+  - `110.24 -> 110.49 tok/s`
+  - 约 `+0.23%`
+- 因此：
+  - `norm+quant` 边界不是当前 W8A8 相对 bf16 的主瓶颈
+  - 如果继续追 W8A8，优先级应转向：
+    - linear-attention 的 int8 `in_proj/out_proj`
+    - routed/shared expert 的 int8 主链

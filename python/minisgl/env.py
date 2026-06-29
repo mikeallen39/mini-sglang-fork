@@ -78,16 +78,23 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     FI_GRAPH_FAST_DECODE_PLAN = EnvBool(False)  # use flashinfer fast_decode_plan on decode cuda-graph replay
     FI_GRAPH_REUSE_METADATA = EnvBool(False)  # reuse decode cuda-graph attention metadata buffers instead of rebuilding tensors each step
+    DECODE_BATCH_REUSE_BUFFERS = EnvBool(False)  # reuse decode batch host/device index buffers instead of rebuilding tensors every step
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     OVERLAP_EXTRA_SYNC = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     PROFILE_QWEN35 = EnvBool(False)
     PROFILE_FUSED_MOE = EnvBool(False)
     PROFILE_SPARSE_MOE = EnvBool(False)
+    PROFILE_MOE_DECODE_ONLY = EnvBool(False)  # only accumulate MoE profile stats on decode batches
     PROFILE_INT8_DENSE = EnvBool(False)
-    MOE_REUSE_WORKSPACE = EnvBool(False)  # reuse topk/alignment temporary buffers on the fused MoE path
+    MOE_REUSE_WORKSPACE = EnvBool(False)  # legacy master switch for reusing MoE temporary buffers
+    MOE_REUSE_TOPK_WORKSPACE = EnvBool(False)  # reuse topk temporary buffers on the fused MoE path
+    MOE_REUSE_ALIGN_WORKSPACE = EnvBool(False)  # reuse align temporary buffers on the fused MoE path
+    MOE_REUSE_OUTPUT_BUFFER = EnvBool(False)  # reuse a per-layer routed-expert output buffer instead of torch.empty_like each call
     MOE_SKIP_TOPK_POST_RENORM = EnvBool(False)  # trust sgl_kernel.topk_softmax renormalize output and skip the extra Python-side renorm
     MOE_SKIP_TOPK_FP32_CAST = EnvBool(False)  # pass router logits to sgl_kernel.topk_softmax without an extra Python-side float() cast
+    MOE_GATE_MM_OUT = EnvBool(False)  # reuse a preallocated router_logits buffer and fill it with torch.mm(..., out=...)
+    MOE_FASTPATH_TOPK2_REDUCE = EnvBool(False)  # bypass generic moe reduce when topk==2 and routed scaling is 1.0
     MOE_SKIP_DISPATCH_LOCAL_MASK = EnvBool(False)  # skip constructing an unused all-true local_mask on the single-rank fast path
     MOE_DIRECT_FASTPATH = EnvBool(False)  # bypass LocalExpertDispatchPlan on the fused MoE single-rank fast path
     MOE_ALIGN_SMALL_CAP = EnvBool(False)  # use sglang's smaller temporary-buffer upper bound when topk_ids.numel() < num_experts + 1
@@ -96,6 +103,8 @@ class EnvClassSingleton:
     MOE_SINGLE_KERNEL = EnvBool(False)  # fuse silu_and_mul into the second MoE GEMM
     MOE_FUSED_ACTIVATION = EnvBool(False)  # use sgl_kernel fused silu_and_mul / gelu_and_mul in MoE stage2
     MOE_SGL_REDUCE = EnvBool(False)  # use sgl_kernel moe_sum_reduce instead of local Triton reduce
+    MOE_TORCH_COMPILE_REDUCE = EnvBool(False)  # use torch.compile moe_sum_reduce fastpath for small-token CUDA MoE reduce
+    W8A8_FUSED_GEMMA_NORM_QUANT = EnvBool(False)  # fuse GemmaRMSNorm with per-token int8 activation quant on W8A8 paths
     LINEAR_RMSNORM_GATED = EnvBool(False)  # use fused RMSNorm+gate for Qwen3.6 linear attention output norm
     SHARED_EXPERT_FUSED_GATE_ADD = EnvBool(False)  # fuse sigmoid(gate)*shared_output + moe_output for shared expert
     SHARED_EXPERT_FUSED_ACTIVATION = EnvBool(False)  # use fused silu_and_mul inside shared expert bf16 path

@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
-from minisgl.kernel import silu_and_mul_quant_int8_triton
 from minisgl.linear_attention import (
     fused_gdn_gating_sglang,
     fused_linear_attn_decode_sglang,
@@ -68,7 +67,7 @@ _SPARSE_MOE_PROFILE = {
     "shared_ms": 0.0,
     "count": 0,
 }
-_SPARSE_MOE_PROFILE_INTERVAL = 100
+_SPARSE_MOE_PROFILE_INTERVAL = 20
 _LINEAR_ATTN_PROFILE = {
     "prefill": {
         "quant_ms": 0.0,
@@ -257,6 +256,7 @@ class Qwen3_5SparseMoeBlock(BaseOP):
             )
             self.shared_expert_gate.disable_int8_quantization = True
         self._shared_alt_stream: torch.cuda.Stream | None = None
+        self._router_logits_buffer: torch.Tensor | None = None
 
     def process_weights_after_loading(self) -> None:
         if (
@@ -267,28 +267,76 @@ class Qwen3_5SparseMoeBlock(BaseOP):
         ):
             self._shared_alt_stream = torch.cuda.Stream(device=self.shared_expert_gate.weight.device)
 
+    def _forward_router_logits(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_q: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if (
+            ENV.MOE_GATE_MM_OUT.value
+            and hidden_states.is_cuda
+            and hidden_states.ndim == 2
+            and hidden_states.is_contiguous()
+            and self.gate.bias is None
+            and self.gate.weight.dtype != torch.int8
+            and hidden_states.dtype == self.gate.weight.dtype
+            and self.gate.weight.is_contiguous()
+        ):
+            rows = hidden_states.shape[0]
+            cols = self.gate.weight.shape[0]
+            cached = self._router_logits_buffer
+            if (
+                cached is None
+                or cached.shape != (rows, cols)
+                or cached.dtype != hidden_states.dtype
+                or cached.device != hidden_states.device
+                or not cached.is_contiguous()
+            ):
+                cached = torch.empty((rows, cols), device=hidden_states.device, dtype=hidden_states.dtype)
+                self._router_logits_buffer = cached
+            return torch.mm(hidden_states, self.gate.weight.t(), out=cached)
+        return self.gate.forward_prequantized(
+            hidden_states, hidden_states_q, hidden_states_scale
+        )
+
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        profile_enabled = ENV.PROFILE_SPARSE_MOE.value and _can_profile_cuda_events(hidden_states)
+        return self.forward_prequantized(hidden_states, None, None)
+
+    def forward_prequantized(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_q: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch = get_global_ctx().batch
+        profile_enabled = (
+            ENV.PROFILE_SPARSE_MOE.value
+            and _can_profile_cuda_events(hidden_states)
+            and (
+                not ENV.PROFILE_MOE_DECODE_ONLY.value
+                or batch.is_decode
+            )
+        )
         if profile_enabled:
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
             e2 = torch.cuda.Event(enable_timing=True)
             e3 = torch.cuda.Event(enable_timing=True)
             e0.record()
-        hidden_states_q = None
-        hidden_states_scale = None
-        if (
-            self.gate.weight.dtype == torch.int8
-            or (self.shared_expert is not None and self.shared_expert.gate_up_proj.weight.dtype == torch.int8)
-            or (
-                self.shared_expert_gate is not None
-                and self.shared_expert_gate.weight.dtype == torch.int8
-            )
-        ):
-            hidden_states_q, hidden_states_scale = quantize_activation_per_token_int8(hidden_states)
+        if hidden_states_q is None or hidden_states_scale is None:
+            if (
+                self.gate.weight.dtype == torch.int8
+                or (self.shared_expert is not None and self.shared_expert.gate_up_proj.weight.dtype == torch.int8)
+                or (
+                    self.shared_expert_gate is not None
+                    and self.shared_expert_gate.weight.dtype == torch.int8
+                )
+            ):
+                hidden_states_q, hidden_states_scale = quantize_activation_per_token_int8(hidden_states)
 
-        router_logits = self.gate.forward_prequantized(
+        router_logits = self._forward_router_logits(
             hidden_states, hidden_states_q, hidden_states_scale
         )
         if profile_enabled:
@@ -430,13 +478,13 @@ class Qwen3_5SharedExpert(BaseOP):
             and x.is_contiguous()
         ):
             gate_up = self.gate_up_proj.forward_prequantized(x, hidden_states_q, hidden_states_scale)
-            inter_q = torch.empty(
+            inter = torch.empty(
                 (gate_up.shape[0], gate_up.shape[1] // 2),
                 device=gate_up.device,
-                dtype=torch.int8,
+                dtype=gate_up.dtype,
             )
-            inter_s = torch.empty((gate_up.shape[0], 1), device=gate_up.device, dtype=torch.float32)
-            silu_and_mul_quant_int8_triton(gate_up, inter_q, inter_s)
+            fused_silu_and_mul(gate_up, inter)
+            inter_q, inter_s = quantize_activation_per_token_int8(inter)
             return apply_w8a8_int8_linear_from_prequantized(
                 inter_q,
                 inter_s,
@@ -1113,8 +1161,39 @@ class Qwen3_5DecoderLayer(BaseOP):
             x = self.linear_attn.forward(x)
         if profile_enabled:
             t1.record()
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        mlp_x_q = None
+        mlp_x_scale = None
+        use_fused_norm_quant = (
+            ENV.W8A8_FUSED_GEMMA_NORM_QUANT.value
+            and x.is_cuda
+            and x.ndim == 2
+            and x.is_contiguous()
+        )
+        if use_fused_norm_quant:
+            is_int8_mlp = False
+            if isinstance(self.mlp, Qwen3_5SparseMoeBlock):
+                is_int8_mlp = (
+                    self.mlp.shared_expert is not None
+                    and self.mlp.shared_expert.gate_up_proj.weight.dtype == torch.int8
+                )
+            elif isinstance(self.mlp, GatedMLP):
+                is_int8_mlp = getattr(self.mlp.gate_up_proj, "weight", None) is not None and self.mlp.gate_up_proj.weight.dtype == torch.int8
+            if is_int8_mlp:
+                x, residual, mlp_x_q, mlp_x_scale = self.post_attention_layernorm.forward_quantized(x, residual)
+            else:
+                x, residual = self.post_attention_layernorm.forward(x, residual)
+        else:
+            x, residual = self.post_attention_layernorm.forward(x, residual)
+        if mlp_x_q is not None and mlp_x_scale is not None:
+            if isinstance(self.mlp, Qwen3_5SparseMoeBlock):
+                x = self.mlp.forward_prequantized(x, mlp_x_q, mlp_x_scale)
+            else:
+                try:
+                    x = self.mlp.forward(x, x_q=mlp_x_q, x_scale=mlp_x_scale)
+                except TypeError:
+                    x = self.mlp.forward(x)
+        else:
+            x = self.mlp.forward(x)
         if profile_enabled:
             t2.record()
             t3.record()

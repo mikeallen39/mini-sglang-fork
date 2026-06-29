@@ -6,6 +6,7 @@ import json
 import torch
 
 from minisgl.benchmark.perf import perf_cuda
+from minisgl.kernel import gemma_rmsnorm_quant_int8_triton
 from minisgl.quantization import quantize_activation_per_token_int8
 
 
@@ -35,6 +36,17 @@ def gemma_rmsnorm_quant_fused_ref(
     scales = y.abs().amax(dim=-1, keepdim=True).clamp_min_(1e-10) / 127.0
     q = torch.round(y / scales).clamp_(-128, 127).to(torch.int8)
     return q, scales.contiguous()
+
+
+def gemma_rmsnorm_quant_fused_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = torch.empty_like(x, dtype=torch.int8)
+    scales = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
+    gemma_rmsnorm_quant_int8_triton(x, weight, eps, q, scales)
+    return q, scales
 
 
 def main() -> None:
@@ -75,6 +87,11 @@ def main() -> None:
             repetitions=args.repetitions,
             cuda_graph_repetitions=None,
         )
+        fused_triton_ms = perf_cuda(
+            lambda: gemma_rmsnorm_quant_fused_triton(x, weight, args.eps),
+            repetitions=args.repetitions,
+            cuda_graph_repetitions=None,
+        )
 
         print(
             json.dumps(
@@ -82,7 +99,9 @@ def main() -> None:
                     "tokens": tokens,
                     "baseline_ms": baseline_ms,
                     "fused_ref_ms": fused_ref_ms,
-                    "speedup": baseline_ms / fused_ref_ms if fused_ref_ms > 0 else None,
+                    "fused_triton_ms": fused_triton_ms,
+                    "speedup_ref": baseline_ms / fused_ref_ms if fused_ref_ms > 0 else None,
+                    "speedup_triton": baseline_ms / fused_triton_ms if fused_triton_ms > 0 else None,
                 }
             )
         )

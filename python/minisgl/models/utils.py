@@ -44,10 +44,16 @@ class GatedMLP(BaseOP):
         )
 
     @nvtx_annotate("MLP")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_q = None
-        x_scale = None
-        if getattr(self.gate_up_proj, "weight", None) is not None and self.gate_up_proj.weight.dtype == torch.int8:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        x_q: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            x_q is None or x_scale is None
+        ) and getattr(self.gate_up_proj, "weight", None) is not None and self.gate_up_proj.weight.dtype == torch.int8:
             x_q, x_scale = quantize_activation_per_token_int8(x)
         gate_up = self.gate_up_proj.forward_prequantized(x, x_q, x_scale)
         del x

@@ -53,7 +53,7 @@ def fused_rmsnorm_gated(
     assert weight.ndim == 1 and weight.shape[0] == x.shape[-1]
     M, N = x.shape
     if out is None:
-        out = torch.empty_like(x)
+        out = torch.empty_like(gate)
     else:
         assert out.shape == x.shape
         assert out.stride(-1) == 1

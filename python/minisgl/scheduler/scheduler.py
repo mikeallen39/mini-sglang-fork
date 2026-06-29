@@ -94,6 +94,8 @@ class Scheduler(SchedulerIOMixin):
         self.page_size = config.page_size
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self._decode_batch_buffers: list[dict[str, torch.Tensor]] = []
+        self._decode_batch_buffer_index = 0
         self._dflash_profile_count = 0
         self._dflash_profile_draft_ms = 0.0
         self._dflash_profile_verify_ms = 0.0
@@ -492,11 +494,15 @@ class Scheduler(SchedulerIOMixin):
             batch.pixel_values = None
             batch.image_grid_thw = None
             batch.mm_token_type_ids = None
-        batch.text_positions = _make_positions(batch, self.device)
+        if ENV.DECODE_BATCH_REUSE_BUFFERS.value and batch.is_decode:
+            batch.text_positions, input_mapping, write_mapping = self._prepare_decode_batch_fast(batch)
+        else:
+            batch.text_positions = _make_positions(batch, self.device)
+            batch.positions = batch.text_positions
+            input_mapping = _make_input_tuple(batch, self.device)
+            write_mapping = _make_write_tuple(batch, self.device)
         batch.positions = batch.text_positions
         batch.mrope_positions = None
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
@@ -505,6 +511,68 @@ class Scheduler(SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _allocate_decode_batch_buffer_slot(self, max_reqs: int) -> dict[str, torch.Tensor]:
+        return {
+            "host_positions": torch.empty(max_reqs, dtype=torch.int32, pin_memory=True),
+            "host_req_map": torch.empty(max_reqs, dtype=torch.int64, pin_memory=True),
+            "host_write_map": torch.empty(max_reqs, dtype=torch.int64, pin_memory=True),
+            "host_write_pos": torch.empty(max_reqs, dtype=torch.int64, pin_memory=True),
+            "device_positions": torch.empty(max_reqs, dtype=torch.int32, device=self.device),
+            "device_req_map": torch.empty(max_reqs, dtype=torch.int64, device=self.device),
+            "device_write_map": torch.empty(max_reqs, dtype=torch.int64, device=self.device),
+            "device_write_pos": torch.empty(max_reqs, dtype=torch.int64, device=self.device),
+        }
+
+    def _ensure_decode_batch_buffers(self, max_reqs: int) -> dict[str, torch.Tensor]:
+        if not self._decode_batch_buffers:
+            self._decode_batch_buffers = [
+                self._allocate_decode_batch_buffer_slot(max_reqs),
+                self._allocate_decode_batch_buffer_slot(max_reqs),
+            ]
+            self._decode_batch_buffer_index = 0
+        else:
+            for i, buffers in enumerate(self._decode_batch_buffers):
+                if int(buffers["host_positions"].numel()) < max_reqs:
+                    self._decode_batch_buffers[i] = self._allocate_decode_batch_buffer_slot(max_reqs)
+
+        buffers = self._decode_batch_buffers[self._decode_batch_buffer_index]
+        self._decode_batch_buffer_index = (self._decode_batch_buffer_index + 1) % len(
+            self._decode_batch_buffers
+        )
+        return buffers
+
+    def _prepare_decode_batch_fast(self, batch: Batch) -> tuple[torch.Tensor, Indice2D, Indice2D]:
+        padded_size = len(batch.padded_reqs)
+        req_size = len(batch.reqs)
+        buffers = self._ensure_decode_batch_buffers(max(padded_size, req_size))
+
+        host_positions = buffers["host_positions"][:padded_size]
+        host_req_map = buffers["host_req_map"][:padded_size]
+        host_write_map = buffers["host_write_map"][:req_size]
+        host_write_pos = buffers["host_write_pos"][:req_size]
+
+        for i, req in enumerate(batch.padded_reqs):
+            host_positions[i] = req.cached_len
+            host_req_map[i] = req.table_idx
+        for i, req in enumerate(batch.reqs):
+            host_write_map[i] = req.table_idx
+            host_write_pos[i] = req.device_len if req.can_decode else -1
+
+        device_positions = buffers["device_positions"][:padded_size]
+        device_req_map = buffers["device_req_map"][:padded_size]
+        device_write_map = buffers["device_write_map"][:req_size]
+        device_write_pos = buffers["device_write_pos"][:req_size]
+
+        device_positions.copy_(host_positions, non_blocking=True)
+        device_req_map.copy_(host_req_map, non_blocking=True)
+        device_write_map.copy_(host_write_map, non_blocking=True)
+        device_write_pos.copy_(host_write_pos, non_blocking=True)
+
+        positions = device_positions
+        input_mapping: Indice2D = (device_req_map, positions.to(torch.int64))
+        write_mapping: Indice2D = (device_write_map, device_write_pos)
+        return positions, input_mapping, write_mapping
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

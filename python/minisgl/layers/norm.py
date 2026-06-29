@@ -5,6 +5,7 @@ from typing import Tuple
 
 import torch
 from minisgl.env import ENV
+from minisgl.kernel import gemma_rmsnorm_quant_int8_triton
 from minisgl.utils.logger import init_logger
 
 from .base import BaseOP
@@ -224,5 +225,21 @@ class GemmaRMSNormFused(BaseOP):
                 count,
             )
             _GEMMA_RMSNORM_PROFILE["gemma_rmsnorm_ms"] = 0.0
-            _GEMMA_RMSNORM_PROFILE["count"] = 0
+        _GEMMA_RMSNORM_PROFILE["count"] = 0
         return normalized, merged
+
+    def forward_quantized(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        merged = x if residual is None else x + residual
+        if not (merged.is_cuda and merged.ndim == 2 and merged.is_contiguous()):
+            raise RuntimeError(
+                "GemmaRMSNorm forward_quantized requires a contiguous 2D CUDA tensor"
+            )
+        x_q = torch.empty_like(merged, dtype=torch.int8)
+        x_scale = torch.empty((merged.shape[0], 1), device=merged.device, dtype=torch.float32)
+        gemma_rmsnorm_quant_int8_triton(merged, self.weight, self.eps, x_q, x_scale)
+        normalized = (x_q.to(merged.dtype) * x_scale.to(merged.dtype)).contiguous()
+        return normalized, merged, x_q, x_scale

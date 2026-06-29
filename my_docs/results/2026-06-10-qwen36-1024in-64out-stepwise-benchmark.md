@@ -2576,3 +2576,335 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 
 - 另外还尝试了更激进的 `FI_GRAPH_REUSE_METADATA` 思路，目标是复用 decode graph 的 capture metadata buffer、减少每步 `torch.tensor/torch.cat` 重建
 - 这条线目前只完成了实验脚手架，还没有形成稳定 benchmark 结果，不进入主线
+
+### 引擎级 decode batch 边界复用：DECODE_BATCH_REUSE_BUFFERS (2026-06-29)
+
+背景：
+
+- 在继续从“整个推理引擎”角度看 mini-sglang 与 sglang 差异时，除了 attention replay planner 外，另一个明显差异是 decode 每步 batch 准备边界：
+  - mini-sglang 当前在 scheduler 中每步都会新建：
+    - `positions`
+    - `input_mapping`
+    - `write_mapping`
+  - 然后再做 host->device copy
+- sglang 的 decode graph 路径则更偏向：
+  - 预分配静态 buffer
+  - batched copy / grouped copy
+  - replay 前只更新切片
+
+实验：
+
+- 新增开关：
+  - `MINISGL_DECODE_BATCH_REUSE_BUFFERS=1`
+- 做法：
+  - 只在 decode 路径启用
+  - 为 `positions / input_mapping / write_mapping` 引入 host/device 复用 buffer
+  - 为兼容 overlap scheduling，再补成双缓冲，避免上一批尚未消费完时被下一批覆盖
+
+correctness：
+
+- 第一版单缓冲实现会破坏 overlap 调度，导致输出错乱
+- 补成双缓冲后，短输出 correctness 恢复正常
+
+性能结果：
+
+- 稳态 benchmark：
+  - `TTFT = 100.89 ms`
+  - `E2E = 0.5643 s`
+  - `output_tps = 111.64 tok/s`
+
+对比：
+
+- 当前主线 best：
+  - `TTFT = 100.47 ms`
+  - `E2E = 0.5621 s`
+  - `output_tps = 112.08 tok/s`
+- 开启 `MINISGL_DECODE_BATCH_REUSE_BUFFERS=1` 后：
+  - `112.08 -> 111.64 tok/s`
+
+结论：
+
+- 这条实验在修正 correctness 后仍然退化，不进入主线
+- 说明：
+  - “decode batch 边界仍有引擎级开销” 这个方向本身不一定错
+  - 但当前这种简单的 host/device 索引 buffer 复用方式，没有打中真正端到端瓶颈
+  - 相比之下，继续在这类小索引张量复用上深挖的优先级应当降低
+
+### MoE 周边小张量复用拆分实验 (2026-06-29)
+
+背景：
+
+- 之前 `MINISGL_MOE_REUSE_WORKSPACE=1` 整体测出来是退化的
+- 但它把两类行为绑在了一起：
+  - `topk_weights / topk_ids` 复用
+  - `moe_align_block_size` 的 `sorted_ids / expert_ids / cumsum_buffer` 复用
+- 为了避免不同子项互相掩盖，这一轮把它拆成了两个独立开关：
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+  - `MINISGL_MOE_REUSE_ALIGN_WORKSPACE=1`
+
+实验 1：只开 `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 100.52 ms`
+  - `E2E = 0.5572 s`
+  - `output_tps = 113.06 tok/s`
+
+对比：
+
+- 相对上一主线 best `112.85 tok/s`
+  - `112.85 -> 113.06 tok/s`
+
+结论：
+
+- `topk` 临时缓冲复用是正收益
+- 说明当前 MoE 周边链里，“每步小张量分配” 仍然有真实成本
+- 这条实验进入主线候选
+
+实验 2：只开 `MINISGL_MOE_REUSE_ALIGN_WORKSPACE=1`
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 100.89 ms`
+  - `E2E = 0.5579 s`
+  - `output_tps = 112.93 tok/s`
+
+对比：
+
+- 相对 `112.85 tok/s`
+  - `112.85 -> 112.93 tok/s`
+
+结论：
+
+- `align` 临时缓冲复用基本持平，仅有极小收益
+- 说明 `moe_align_block_size` 的瓶颈更可能在 kernel 本身或调用组织，而不是这些缓冲分配
+
+实验 3：同时开 `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1` 与 `MINISGL_MOE_REUSE_ALIGN_WORKSPACE=1`
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 100.57 ms`
+  - `E2E = 0.5573 s`
+  - `output_tps = 113.04 tok/s`
+
+结论：
+
+- 同时打开基本等于只开 `topk workspace`
+- 进一步说明这条收益主要来自 `topk`，不是 `align`
+
+实验 4：`MINISGL_MOE_GATE_MM_OUT=1`
+
+背景：
+
+- 受 `topk workspace` 有收益这个现象启发，继续尝试把 router logits 的输出分配也改成复用
+- 做法：
+  - 为 MoE gate 增加 `_router_logits_buffer`
+  - 在满足条件时，用 `torch.mm(hidden_states, gate.weight.t(), out=cached)` 代替普通 `F.linear(...)`
+
+结果：
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 100.98 ms`
+  - `E2E = 0.5587 s`
+  - `output_tps = 112.76 tok/s`
+
+结论：
+
+- router logits 这条 `mm(out=...)` 路线没有收益，略微退化
+- 说明：
+  - MoE 周边的“小张量分配”并不是都值得处理
+  - 当前真正打中的仍然是 `topk` 输出缓冲，而不是 router GEMM 输出
+
+实验 5：`MINISGL_MOE_REUSE_TOPK_WORKSPACE=1 + MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+
+背景：
+
+- `MOE_REUSE_TOPK_WORKSPACE` 与 `FI_GRAPH_FAST_DECODE_PLAN` 分别都已经证明是正收益
+- 这一轮验证两者是否可以叠加
+
+结果：
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 99.06 ms`
+  - `E2E = 0.5526 s`
+  - `output_tps = 114.01 tok/s`
+
+对比：
+
+- 相对上一主线 best `112.85 tok/s`
+  - `112.85 -> 114.01 tok/s`
+- 相对只开 `FI_GRAPH_FAST_DECODE_PLAN=1` 的 `112.65 tok/s`
+  - `112.65 -> 114.01 tok/s`
+
+结论：
+
+- 两者可以稳定叠加
+- 当前新的最好稳定值更新为：
+  - `TTFT = 99.06 ms`
+  - `E2E = 0.5526 s`
+  - `output_tps = 114.01 tok/s`
+
+阶段性判断：
+
+- 当前最有效的新点是：
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+  - `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+- 当前已经基本可以排除的点是：
+  - `MOE_REUSE_ALIGN_WORKSPACE`
+  - `MOE_GATE_MM_OUT`
+- 这说明剩余差距里，MoE 周边仍然存在可打的小张量/小边界成本，但需要继续做更细的单因素筛选，而不是泛化成“所有 buffer 复用都有收益”
+
+实验 6：`MINISGL_MOE_FASTPATH_TOPK2_REDUCE=1`
+
+背景：
+
+- 参考 `sglang main` 的 `topk == 2 && routed_scaling_factor == 1.0` 分支
+- 试图用 `torch.add(intermediate_cache3[:, 0], intermediate_cache3[:, 1], out=...)` 替代通用 reduce
+
+结果：
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 101.03 ms`
+  - `E2E = 0.5555 s`
+  - `output_tps = 113.41 tok/s`
+
+结论：
+
+- 该 fastpath 在当前图模式和 kernel 组合下没有收益
+- 相对当前 best `114.01 tok/s` 明显退化
+- 说明这类“看起来更像 sglang”的局部替换，未必能直接转化成端到端收益
+
+实验 7：`MINISGL_MOE_TORCH_COMPILE_REDUCE=1`
+
+背景：
+
+- 继续对齐 `sglang main` 的 MoE reduce 逻辑
+- `sglang` 在小 token 数下会优先走 `torch.compile` 版 `moe_sum_reduce`
+- 在 `MINISGL_MOE_SGL_REDUCE=1` 基础上，额外引入一个小 token fastpath 做验证
+
+结果：
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 100.28 ms`
+  - `E2E = 0.5548 s`
+  - `output_tps = 113.55 tok/s`
+
+结论：
+
+- 这条 `torch.compile reduce` 路线在当前环境下无收益，略退化
+- 说明：
+  - `sglang` 的这段实现细节不是当前 mini-sglang 剩余差距的关键
+  - `MOE_SGL_REDUCE` 是否有效，仍要结合当前整套主线配置单独判断，不能简单叠加更多 reduce 变体
+
+实验 8：`MINISGL_MOE_SINGLE_KERNEL=1`
+
+背景：
+
+- 把 routed experts 的 `silu_and_mul + down_proj` 融合成单 kernel
+- 属于 MoE 主体内更激进的一条线，用于验证“更宽的内核融合”是否能直接带来收益
+
+结果：
+
+- 短输出 correctness 正常
+- 稳态结果：
+  - `TTFT = 123.15 ms`
+  - `E2E = 0.6186 s`
+  - `output_tps = 101.84 tok/s`
+
+结论：
+
+- 该单 kernel 路线在当前 Qwen3.6 routed-expert shape 上强烈退化
+- 说明：
+  - 当前瓶颈虽然在 MoE 大链路，但不是“融合得越宽越好”
+  - 这类更激进的内核合并需要更精细的 shape-aware 条件，否则会直接破坏已有的更优 kernel 组合
+
+实验 9：重新消融 `MINISGL_MOE_SGL_REDUCE`
+
+背景：
+
+- 当前 best `114.01 tok/s` 已经叠加了：
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+  - `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+  - `MINISGL_MOE_SGL_REDUCE=1`
+- 为了避免误判，需要在最新主线里重新确认 `MOE_SGL_REDUCE` 是否仍然有正收益
+
+结果：
+
+- 关闭 `MINISGL_MOE_SGL_REDUCE=1` 后
+- 稳态结果：
+  - `TTFT = 100.64 ms`
+  - `E2E = 0.5584 s`
+  - `output_tps = 112.83 tok/s`
+
+结论：
+
+- 在当前最新主线里，`MOE_SGL_REDUCE` 仍然是有效项
+- 对比当前 best：
+  - `112.83 -> 114.01 tok/s`
+- 这说明：
+  - `reduce/combine` 这条 MoE 周边链仍然有真实收益
+  - 但继续沿 reduce 分支再叠加额外变体，收益已经很有限，甚至容易退化
+
+### 当前最优主线下的 bf16 / W8A8 / W8A8+NormFuse 同口径对比 (2026-06-29)
+
+背景：
+
+- 为避免把不同阶段、不同开关组合的结果混在一起，这一轮统一使用当前 bf16 最优主线的大部分稳定开关：
+  - `MINISGL_GEMMA_FUSED_NORM=1`
+  - `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+  - `MINISGL_DEPTHWISE_CONV_DECODE=1`
+  - `MINISGL_LINEAR_RMSNORM_GATED=1`
+  - `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+  - `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+  - `MINISGL_MOE_FUSED_ACTIVATION=1`
+  - `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+  - `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+  - `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+  - `MINISGL_SKIP_AB_FP32_CAST=1`
+  - `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+  - `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+  - `MINISGL_LINEAR_DECODE_SKIP_AB_CONTIGUOUS=1`
+  - `MINISGL_MOE_SKIP_TOPK_POST_RENORM=1`
+  - `MINISGL_MOE_SKIP_TOPK_FP32_CAST=1`
+  - `MINISGL_MOE_SKIP_DISPATCH_LOCAL_MASK=1`
+  - `MINISGL_MOE_ALIGN_SMALL_CAP=1`
+  - `MINISGL_MOE_SGLANG_CONFIG_LOOKUP=1`
+  - `MINISGL_MOE_SGLANG_DOWN_CONFIG=1`
+  - `MINISGL_MOE_SGL_REDUCE=1`
+  - `MINISGL_MOE_REUSE_TOPK_WORKSPACE=1`
+  - `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+- 在此基础上只切换三种模式：
+  - `bf16`
+  - `W8A8`
+  - `W8A8 + MINISGL_W8A8_FUSED_GEMMA_NORM_QUANT=1`
+
+结果：
+
+- `bf16`
+  - `TTFT = 100.57 ms`
+  - `E2E = 0.5546 s`
+  - `output_tps = 113.59 tok/s`
+- `W8A8`
+  - `TTFT = 89.25 ms`
+  - `E2E = 0.5715 s`
+  - `output_tps = 110.24 tok/s`
+- `W8A8 + NormFuse`
+  - `TTFT = 88.97 ms`
+  - `E2E = 0.5702 s`
+  - `output_tps = 110.49 tok/s`
+
+结论：
+
+- 在当前最优主线配置下，`W8A8` 相对 `bf16` 仍然存在小幅稳态退化：
+  - `113.59 -> 110.24 tok/s`
+  - 约 `-2.95%`
+- 把 `GemmaRMSNorm + per-token int8 quant` 做成真实 Triton fuse 并接到 `post_attention_layernorm -> int8 MLP/MoE` 之后，`W8A8` 有小幅回升：
+  - `110.24 -> 110.49 tok/s`
+  - 约 `+0.23%`
+- 说明：
+  - `norm+quant fuse` 本身不是无效，而是 **有效但不是当前 W8A8 相对 bf16 的主矛盾**
+  - 当前 W8A8 的主要差距更可能仍在其它量化边界，例如 linear-attention 的 int8 `in_proj/out_proj` 或 MoE expert 的 int8 主链

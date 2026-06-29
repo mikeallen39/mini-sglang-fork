@@ -3,6 +3,77 @@ import triton.language as tl
 
 
 @triton.jit
+def gemma_rmsnorm_quant_int8_kernel(
+    input_ptr,
+    weight_ptr,
+    output_q_ptr,
+    output_s_ptr,
+    input_stride_0,
+    input_stride_1,
+    output_q_stride_0,
+    output_q_stride_1,
+    output_s_stride_0,
+    M,
+    N,
+    eps,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    row = pid_m
+    if row >= M:
+        return
+
+    offs = tl.arange(0, BLOCK_N)
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    row_ptr = input_ptr + row * input_stride_0
+    acc_sumsq = tl.zeros((1,), dtype=tl.float32)
+
+    for block_idx in range(0, num_blocks):
+        block_offs = offs + block_idx * BLOCK_N
+        mask = block_offs < N
+        x = tl.load(
+            row_ptr + block_offs * input_stride_1,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc_sumsq += tl.sum(x * x, axis=0)
+
+    variance = acc_sumsq / N
+    rstd = tl.rsqrt(variance + eps)
+    acc_max = tl.zeros((1,), dtype=tl.float32)
+
+    for block_idx in range(0, num_blocks):
+        block_offs = offs + block_idx * BLOCK_N
+        mask = block_offs < N
+        x = tl.load(
+            row_ptr + block_offs * input_stride_1,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(weight_ptr + block_offs, mask=mask, other=0.0).to(tl.float32)
+        y = x * rstd * (1.0 + w)
+        acc_max = tl.maximum(acc_max, tl.max(tl.abs(y), axis=0))
+
+    scale = tl.maximum(acc_max / 127.0, 1e-10)
+    tl.store(output_s_ptr + row * output_s_stride_0 + tl.arange(0, 1), scale)
+
+    for block_idx in range(0, num_blocks):
+        block_offs = offs + block_idx * BLOCK_N
+        mask = block_offs < N
+        x = tl.load(
+            row_ptr + block_offs * input_stride_1,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(weight_ptr + block_offs, mask=mask, other=0.0).to(tl.float32)
+        y = x * rstd * (1.0 + w)
+        q = tl.extra.cuda.libdevice.llrint(y / scale)
+        q = tl.maximum(tl.minimum(q, 127.0), -128.0)
+        out_ptr = output_q_ptr + row * output_q_stride_0 + block_offs * output_q_stride_1
+        tl.store(out_ptr, q.to(tl.int8), mask=mask)
+
+
+@triton.jit
 def per_token_quant_int8_kernel(
     input_ptr,
     output_q_ptr,

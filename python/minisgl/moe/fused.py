@@ -9,6 +9,8 @@ import triton
 from minisgl.env import ENV
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
+from minisgl.core import get_global_ctx
+from minisgl.quantization import quantize_activation_per_token_int8
 from minisgl.utils import div_ceil
 from minisgl.utils.logger import init_logger
 
@@ -20,7 +22,7 @@ _FUSED_MOE_PROFILE = {
     "reduce_ms": 0.0,
     "count": 0,
 }
-_FUSED_MOE_PROFILE_INTERVAL = 100
+_FUSED_MOE_PROFILE_INTERVAL = 20
 # The specialized fused w2+silu int8 kernel regressed badly on the current
 # Qwen3.6 routed-expert shapes, especially for prefill-sized token counts.
 # Keep it disabled by default until a shape-aware heuristic or a fixed kernel
@@ -32,6 +34,24 @@ _SGLANG_MOE_CONFIG_FALLBACKS = (
     "NVIDIA_A100-SXM4-80GB",
     "NVIDIA_H20",
 )
+
+
+def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    return num_tokens <= 32
+
+
+@torch.compile
+def moe_sum_reduce_torch_compile(x: torch.Tensor, out: torch.Tensor, routed_scaling_factor: float) -> None:
+    torch.sum(x, dim=1, out=out)
+    out.mul_(routed_scaling_factor)
+
+
+def _use_moe_topk_workspace() -> bool:
+    return ENV.MOE_REUSE_WORKSPACE.value or ENV.MOE_REUSE_TOPK_WORKSPACE.value
+
+
+def _use_moe_align_workspace() -> bool:
+    return ENV.MOE_REUSE_WORKSPACE.value or ENV.MOE_REUSE_ALIGN_WORKSPACE.value
 
 
 def reset_fused_moe_profile() -> None:
@@ -268,7 +288,7 @@ def fused_topk(
     try:
         from sgl_kernel import topk_softmax
 
-        if ENV.MOE_REUSE_WORKSPACE.value:
+        if _use_moe_topk_workspace():
             topk_weights = _get_workspace_tensor_by_key(
                 device=hidden_states.device,
                 dtype=torch.float32,
@@ -460,7 +480,7 @@ def moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:
         max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    if ENV.MOE_REUSE_WORKSPACE.value:
+    if _use_moe_align_workspace():
         sorted_ids = _get_workspace_tensor_by_key(
             device=topk_ids.device,
             dtype=torch.int32,
@@ -470,7 +490,7 @@ def moe_align_block_size(
     else:
         sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
-    if ENV.MOE_REUSE_WORKSPACE.value:
+    if _use_moe_align_workspace():
         expert_ids = _get_workspace_tensor_by_key(
             device=topk_ids.device,
             dtype=torch.int32,
@@ -611,13 +631,13 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     filter_expert: bool = False,
     routed_scaling_factor: float = 1.0,
+    output_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from minisgl.kernel import (
         fused_moe_kernel_triton,
         fused_moe_silu_down_triton,
         fused_moe_w2_silu_int8_kernel_triton,
         moe_sum_reduce_triton,
-        silu_and_mul_quant_int8_triton,
     )
     from minisgl.layers import (
         fused_gelu_and_mul,
@@ -686,7 +706,16 @@ def fused_experts_impl(
     )
     compute_type = hidden_states.dtype
 
-    out_hidden_states = torch.empty_like(hidden_states)
+    if (
+        output_buffer is not None
+        and output_buffer.shape == hidden_states.shape
+        and output_buffer.dtype == hidden_states.dtype
+        and output_buffer.device == hidden_states.device
+        and output_buffer.is_contiguous()
+    ):
+        out_hidden_states = output_buffer
+    else:
+        out_hidden_states = torch.empty_like(hidden_states)
     curr_hidden_states = hidden_states
     tokens_num, _ = curr_hidden_states.shape
     begin_token_idx, end_token_idx = 0, num_tokens
@@ -707,10 +736,15 @@ def fused_experts_impl(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
+    batch = get_global_ctx().batch
     profile_enabled = (
         ENV.PROFILE_FUSED_MOE.value
         and curr_hidden_states.is_cuda
         and not torch.cuda.is_current_stream_capturing()
+        and (
+            not ENV.PROFILE_MOE_DECODE_ONLY.value
+            or batch.is_decode
+        )
     )
     if profile_enabled:
         e0 = torch.cuda.Event(enable_timing=True)
@@ -783,11 +817,16 @@ def fused_experts_impl(
         FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
         FUSED_FN_MAP = {"silu": fused_silu_and_mul, "gelu": fused_gelu_and_mul}
         if use_int8_stage2_int8:
-            silu_and_mul_quant_int8_triton(
-                intermediate_cache1.view(-1, N),
-                intermediate_cache2,
-                intermediate_cache2_scale,
+            gate_up_fp = torch.empty(
+                (intermediate_cache1.shape[0] * intermediate_cache1.shape[1], N // 2),
+                device=intermediate_cache1.device,
+                dtype=intermediate_cache1.dtype,
             )
+            fused_silu_and_mul(intermediate_cache1.view(-1, N), gate_up_fp)
+            q, s = quantize_activation_per_token_int8(gate_up_fp)
+            intermediate_cache2.copy_(q)
+            assert intermediate_cache2_scale is not None
+            intermediate_cache2_scale.copy_(s)
         else:
             if ENV.MOE_FUSED_ACTIVATION.value:
                 FUSED_FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -815,15 +854,34 @@ def fused_experts_impl(
     if profile_enabled:
         e3.record()
 
-    if ENV.MOE_SGL_REDUCE.value and intermediate_cache3.is_cuda:
+    if (
+        ENV.MOE_FASTPATH_TOPK2_REDUCE.value
+        and curr_topk_ids.shape[1] == 2
+        and routed_scaling_factor == 1.0
+    ):
+        torch.add(
+            intermediate_cache3[:, 0],
+            intermediate_cache3[:, 1],
+            out=out_hidden_states[begin_token_idx:end_token_idx],
+        )
+    elif ENV.MOE_SGL_REDUCE.value and intermediate_cache3.is_cuda:
         try:
             import sgl_kernel
 
-            sgl_kernel.moe_sum_reduce(
-                intermediate_cache3,
-                out_hidden_states[begin_token_idx:end_token_idx],
-                routed_scaling_factor,
-            )
+            if ENV.MOE_TORCH_COMPILE_REDUCE.value and _use_moe_sum_reduce_torch_compile(
+                intermediate_cache3.shape[0]
+            ):
+                moe_sum_reduce_torch_compile(
+                    intermediate_cache3,
+                    out_hidden_states[begin_token_idx:end_token_idx],
+                    routed_scaling_factor,
+                )
+            else:
+                sgl_kernel.moe_sum_reduce(
+                    intermediate_cache3,
+                    out_hidden_states[begin_token_idx:end_token_idx],
+                    routed_scaling_factor,
+                )
         except Exception:
             moe_sum_reduce_triton(
                 intermediate_cache3,
@@ -887,6 +945,7 @@ class FusedMoe(BaseMoeBackend):
         local_expert_start: int = 0,
         num_global_experts: int | None = None,
         num_dispatch_experts: int | None = None,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if use_grouped_topk:
             topk_weights, topk_ids = grouped_topk(
@@ -944,4 +1003,5 @@ class FusedMoe(BaseMoeBackend):
             apply_router_weight_on_input=apply_router_weight_on_input,
             filter_expert=filter_expert,
             routed_scaling_factor=routed_scaling_factor,
+            output_buffer=output_buffer if ENV.MOE_REUSE_OUTPUT_BUFFER.value else None,
         )
