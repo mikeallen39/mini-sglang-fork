@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass
 from functools import cached_property
+from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
@@ -118,6 +120,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self.graph_metadata: Dict[int, FIMetadata] = {}
         self.capture: FICaptureData | None = None
 
     @staticmethod
@@ -129,7 +132,9 @@ class FlashInferBackend(BaseAttnBackend):
 
         metadata.initialized = True
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
-            metadata.wrapper.plan(
+            plan_fn = metadata.wrapper.plan
+            plan_params = inspect.signature(plan_fn).parameters
+            plan_kwargs = dict(
                 indptr=metadata.cu_seqlens_k_cpu,
                 indices=metadata.indices,
                 last_page_len=metadata.last_page_len_cpu,
@@ -138,12 +143,14 @@ class FlashInferBackend(BaseAttnBackend):
                 head_dim=metadata.head_dim,
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
-                seq_lens=metadata.seq_lens_cpu,
                 data_type=metadata.dtype,
                 q_data_type=metadata.dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
             )
+            if "seq_lens" in plan_params:
+                plan_kwargs["seq_lens"] = metadata.seq_lens_cpu
+            plan_fn(**plan_kwargs)
         else:
             metadata.wrapper.plan(
                 qo_indptr=metadata.cu_seqlens_q_cpu,
@@ -185,6 +192,15 @@ class FlashInferBackend(BaseAttnBackend):
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
+        if (
+            ENV.FI_GRAPH_REUSE_METADATA.value
+            and batch.is_decode
+            and self.capture is not None
+            and len(batch.padded_reqs) in self.capture_bs
+        ):
+            self._prepare_decode_metadata_for_graph(batch)
+            return
+
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
@@ -221,6 +237,28 @@ class FlashInferBackend(BaseAttnBackend):
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 
+    def _prepare_decode_metadata_for_graph(self, batch: Batch) -> None:
+        assert self.capture is not None
+        bs = len(batch.padded_reqs)
+        capture = self.capture
+        metadata = self.graph_metadata[bs]
+        reqs = batch.padded_reqs
+        seqlens_k = [req.device_len for req in reqs]
+        page_table = get_global_ctx().page_table
+
+        metadata.seq_lens_cpu[:bs] = torch.as_tensor(seqlens_k, dtype=torch.int32, device="cpu")
+        metadata.cu_seqlens_k_cpu[0] = 0
+        metadata.cu_seqlens_k_cpu[1 : bs + 1] = torch.cumsum(metadata.seq_lens_cpu[:bs], dim=0)
+        capture.seq_lens[:bs].copy_(metadata.seq_lens_cpu[:bs], non_blocking=True)
+        capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k_cpu[: bs + 1], non_blocking=True)
+        total_tokens = int(metadata.cu_seqlens_k_cpu[bs].item())
+        if total_tokens > 0:
+            torch.cat(
+                [page_table[req.table_idx, : req.device_len] for req in reqs],
+                out=metadata.indices[:total_tokens],
+            )
+        batch.attn_metadata = metadata
+
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
@@ -239,7 +277,7 @@ class FlashInferBackend(BaseAttnBackend):
         return GQA >= 4
 
     def prepare_for_capture(self, batch: Batch) -> None:
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper, fast_decode_plan
 
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
@@ -259,10 +297,16 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
+        if ENV.FI_GRAPH_FAST_DECODE_PLAN.value:
+            metadata.wrapper.plan = partial(fast_decode_plan, metadata.wrapper)
+        self.graph_metadata[bs] = metadata
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, FIMetadata) and not metadata.initialized
+        assert isinstance(metadata, FIMetadata)
         assert self.capture is not None and bs in self.capture_bs
+        if ENV.FI_GRAPH_REUSE_METADATA.value and metadata.initialized:
+            return
+        assert not metadata.initialized
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)

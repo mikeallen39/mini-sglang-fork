@@ -1,7 +1,11 @@
 import functools
-from typing import Dict, Optional, Tuple
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import torch
+import triton
 from minisgl.env import ENV
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
@@ -23,6 +27,11 @@ _FUSED_MOE_PROFILE_INTERVAL = 100
 # is available.
 _ENABLE_FUSED_W2_SILU_INT8 = False
 logger = init_logger(__name__)
+_SGLANG_MOE_CONFIG_FALLBACKS = (
+    "NVIDIA_A800-SXM4-80GB",
+    "NVIDIA_A100-SXM4-80GB",
+    "NVIDIA_H20",
+)
 
 
 def reset_fused_moe_profile() -> None:
@@ -63,6 +72,190 @@ def _get_workspace_tensor(
     return cached[:needed_numel].view(shape)
 
 
+def _get_workspace_tensor_by_key(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    key_name: str,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    return _get_workspace_tensor(device=device, dtype=dtype, name=key_name, shape=shape)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_moe_config_fallback_once(triton_version: str, direct_path: str, fallback_path: str) -> None:
+    logger.warning(
+        "MoE config file not found for triton %s at %s; fallback to %s",
+        triton_version,
+        direct_path,
+        fallback_path,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _candidate_sglang_moe_config_dirs() -> tuple[Path, ...]:
+    env_dir = os.environ.get("MINISGL_SGLANG_MOE_CONFIG_DIR")
+    candidate_dirs: list[Path] = []
+    if env_dir:
+        candidate_dirs.append(Path(env_dir))
+    try:
+        import sglang  # type: ignore
+
+        candidate_dirs.append(
+            Path(sglang.__file__).resolve().parent
+            / "srt"
+            / "layers"
+            / "moe"
+            / "moe_runner"
+            / "triton_utils"
+            / "configs"
+        )
+    except Exception:
+        pass
+    candidate_dirs.append(
+        Path("/mnt/42_store/zxz/aiinfra/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs")
+    )
+    existing: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidate_dirs:
+        resolved = path.resolve()
+        if resolved in seen or not resolved.exists():
+            continue
+        existing.append(resolved)
+        seen.add(resolved)
+    return tuple(existing)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_moe_device_name() -> str:
+    return torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
+
+
+def _iter_moe_device_name_candidates(device_name: str) -> tuple[str, ...]:
+    candidates = [device_name]
+    compact_name = device_name.replace("_PCIe", "").replace("_80GB_PCIe", "")
+    if compact_name not in candidates:
+        candidates.append(compact_name)
+    for fallback in _SGLANG_MOE_CONFIG_FALLBACKS:
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return tuple(candidates)
+
+
+@functools.lru_cache(maxsize=None)
+def _load_sglang_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    triton_version: str,
+    device_name: str,
+) -> Optional[Dict[int, Dict[str, Any]]]:
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    version_dir = f"triton_{triton_version.replace('.', '_')}"
+    for config_root in _candidate_sglang_moe_config_dirs():
+        direct_path = config_root / version_dir / f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
+        if direct_path.exists():
+            with direct_path.open() as f:
+                return {int(key): val for key, val in json.load(f).items()}
+
+        available_versions = sorted(
+            (
+                path.name.removeprefix("triton_").replace("_", ".")
+                for path in config_root.iterdir()
+                if path.is_dir() and path.name.startswith("triton_")
+            ),
+            key=lambda value: tuple(int(x) for x in value.split(".")),
+            reverse=True,
+        )
+        for try_version in available_versions:
+            if try_version == triton_version:
+                continue
+            fallback_path = (
+                config_root
+                / f"triton_{try_version.replace('.', '_')}"
+                / f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
+            )
+            if fallback_path.exists():
+                _warn_moe_config_fallback_once(
+                    triton_version, str(direct_path), str(fallback_path)
+                )
+                with fallback_path.open() as f:
+                    return {int(key): val for key, val in json.load(f).items()}
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _get_sglang_style_moe_config(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+) -> Optional[Dict[int, Dict[str, Any]]]:
+    triton_version = triton.__version__
+    for device_name in _iter_moe_device_name_candidates(_get_moe_device_name()):
+        configs = _load_sglang_moe_configs(E, N, dtype, triton_version, device_name)
+        if configs is not None:
+            return configs
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _load_sglang_moe_down_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    triton_version: str,
+    device_name: str,
+) -> Optional[Dict[int, Dict[str, Any]]]:
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    version_dir = f"triton_{triton_version.replace('.', '_')}"
+    for config_root in _candidate_sglang_moe_config_dirs():
+        direct_path = (
+            config_root / version_dir / f"E={E},N={N},device_name={device_name}{dtype_selector}_down.json"
+        )
+        if direct_path.exists():
+            with direct_path.open() as f:
+                return {int(key): val for key, val in json.load(f).items()}
+
+        available_versions = sorted(
+            (
+                path.name.removeprefix("triton_").replace("_", ".")
+                for path in config_root.iterdir()
+                if path.is_dir() and path.name.startswith("triton_")
+            ),
+            key=lambda value: tuple(int(x) for x in value.split(".")),
+            reverse=True,
+        )
+        for try_version in available_versions:
+            if try_version == triton_version:
+                continue
+            fallback_path = (
+                config_root
+                / f"triton_{try_version.replace('.', '_')}"
+                / f"E={E},N={N},device_name={device_name}{dtype_selector}_down.json"
+            )
+            if fallback_path.exists():
+                _warn_moe_config_fallback_once(
+                    triton_version, str(direct_path), str(fallback_path)
+                )
+                with fallback_path.open() as f:
+                    return {int(key): val for key, val in json.load(f).items()}
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _get_sglang_style_moe_down_config(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+) -> Optional[Dict[int, Dict[str, Any]]]:
+    triton_version = triton.__version__
+    for device_name in _iter_moe_device_name_candidates(_get_moe_device_name()):
+        configs = _load_sglang_moe_down_configs(E, N, dtype, triton_version, device_name)
+        if configs is not None:
+            return configs
+    return None
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -75,10 +268,25 @@ def fused_topk(
     try:
         from sgl_kernel import topk_softmax
 
-        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-        topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
-        if renormalize:
+        if ENV.MOE_REUSE_WORKSPACE.value:
+            topk_weights = _get_workspace_tensor_by_key(
+                device=hidden_states.device,
+                dtype=torch.float32,
+                key_name="topk_weights",
+                shape=(M, topk),
+            )
+            topk_ids = _get_workspace_tensor_by_key(
+                device=hidden_states.device,
+                dtype=torch.int32,
+                key_name="topk_ids",
+                shape=(M, topk),
+            )
+        else:
+            topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
+            topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        gating_input = gating_output if ENV.MOE_SKIP_TOPK_FP32_CAST.value else gating_output.float()
+        topk_softmax(topk_weights, topk_ids, gating_input, renormalize)
+        if renormalize and not ENV.MOE_SKIP_TOPK_POST_RENORM.value:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
     except Exception as exc:
         raise RuntimeError(
@@ -248,15 +456,45 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
+    if ENV.MOE_ALIGN_SMALL_CAP.value and topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+    else:
+        max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    if ENV.MOE_REUSE_WORKSPACE.value:
+        sorted_ids = _get_workspace_tensor_by_key(
+            device=topk_ids.device,
+            dtype=torch.int32,
+            key_name="moe_sorted_ids",
+            shape=(max_num_tokens_padded,),
+        )
+    else:
+        sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    if ENV.MOE_REUSE_WORKSPACE.value:
+        expert_ids = _get_workspace_tensor_by_key(
+            device=topk_ids.device,
+            dtype=torch.int32,
+            key_name="moe_expert_ids",
+            shape=(max_num_m_blocks,),
+        )
+        num_tokens_post_pad = _get_workspace_tensor_by_key(
+            device=topk_ids.device,
+            dtype=torch.int32,
+            key_name="moe_num_tokens_post_pad",
+            shape=(1,),
+        )
+        cumsum_buffer = _get_workspace_tensor_by_key(
+            device=topk_ids.device,
+            dtype=torch.int32,
+            key_name="moe_cumsum_buffer",
+            shape=(num_experts + 2,),
+        )
+    else:
+        expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
+        num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+        cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
 
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
-    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
     sgl_moe_align_block_size(
         topk_ids,
         num_experts + 1,
@@ -334,8 +572,31 @@ def try_get_optimal_moe_config(
     M: int,
 ) -> Dict[str, int]:
     E, _, N = w2_shape
+    if ENV.MOE_SGLANG_CONFIG_LOOKUP.value:
+        configs = _get_sglang_style_moe_config(E, N, None)
+        if configs:
+            nearest = min(configs.keys(), key=lambda x: abs(x - M))
+            return dict(configs[nearest])
     config = get_default_config(M, E, N, w1_shape[2], top_k)
     return config
+
+
+def try_get_optimal_moe_down_config(
+    w2_shape: Tuple[int, ...],
+    M: int,
+    up_config: Dict[str, int],
+) -> Optional[Dict[str, int]]:
+    E, _, N = w2_shape
+    if not ENV.MOE_SGLANG_DOWN_CONFIG.value:
+        return None
+    configs = _get_sglang_style_moe_down_config(E, N, None)
+    if not configs:
+        return None
+    down_config = dict(configs[min(configs.keys(), key=lambda x: abs(x - M))])
+    down_config.pop("USE_TMA", None)
+    if down_config.get("BLOCK_SIZE_M") != up_config["BLOCK_SIZE_M"]:
+        down_config["BLOCK_SIZE_M"] = up_config["BLOCK_SIZE_M"]
+    return down_config
 
 
 def fused_experts_impl(
@@ -349,6 +610,7 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     filter_expert: bool = False,
+    routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     from minisgl.kernel import (
         fused_moe_kernel_triton,
@@ -433,6 +695,11 @@ def fused_experts_impl(
     intermediate_cache2 = intermediate_cache2[: tokens_num * topk_ids.shape[1]]
     intermediate_cache3 = intermediate_cache3[:tokens_num]
     config = get_config_func(tokens_num)
+    down_config = try_get_optimal_moe_down_config(
+        (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
+        tokens_num,
+        config,
+    )
 
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
@@ -486,7 +753,7 @@ def fused_experts_impl(
             expert_ids,
             num_tokens_post_padded,
             not apply_router_weight_on_input,
-            config,
+            down_config or config,
             compute_type=compute_type,
             filter_expert=filter_expert,
         )
@@ -505,7 +772,7 @@ def fused_experts_impl(
             expert_ids,
             num_tokens_post_padded,
             not apply_router_weight_on_input,
-            config,
+            down_config or config,
             compute_type=compute_type,
             filter_expert=filter_expert,
         )
@@ -541,7 +808,7 @@ def fused_experts_impl(
             num_tokens_post_padded,
             not apply_router_weight_on_input,
             1,
-            config,
+            down_config or config,
             compute_type=compute_type,
             filter_expert=filter_expert,
         )
@@ -555,7 +822,7 @@ def fused_experts_impl(
             sgl_kernel.moe_sum_reduce(
                 intermediate_cache3,
                 out_hidden_states[begin_token_idx:end_token_idx],
-                0.0,
+                routed_scaling_factor,
             )
         except Exception:
             moe_sum_reduce_triton(
@@ -641,13 +908,24 @@ class FusedMoe(BaseMoeBackend):
                 renormalize=renormalize,
             )
 
-        dispatch_plan = build_local_expert_dispatch_plan(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            local_expert_start=local_expert_start,
-            num_local_experts=w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts,
-            num_global_experts=num_global_experts,
+        fastpath_no_dispatch = (
+            ENV.MOE_DIRECT_FASTPATH.value
+            and (num_global_experts is None or (w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts) == num_global_experts)
+            and local_expert_start == 0
         )
+        if fastpath_no_dispatch:
+            dispatch_topk_weights = topk_weights
+            dispatch_topk_ids = topk_ids
+        else:
+            dispatch_plan = build_local_expert_dispatch_plan(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                local_expert_start=local_expert_start,
+                num_local_experts=w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts,
+                num_global_experts=num_global_experts,
+            )
+            dispatch_topk_weights = dispatch_plan.topk_weights
+            dispatch_topk_ids = dispatch_plan.topk_ids
         filter_expert = (
             num_global_experts is not None
             and (w1.shape[0] if num_dispatch_experts is None else num_dispatch_experts)
@@ -660,9 +938,10 @@ class FusedMoe(BaseMoeBackend):
             w2,
             w1_scale,
             w2_scale,
-            dispatch_plan.topk_weights,
-            dispatch_plan.topk_ids,
+            dispatch_topk_weights,
+            dispatch_topk_ids,
             activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             filter_expert=filter_expert,
+            routed_scaling_factor=routed_scaling_factor,
         )

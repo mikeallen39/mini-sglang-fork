@@ -1808,3 +1808,771 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
   - `kernel`
   - `norm`
   - `qkvz / out_proj / conv`
+
+### LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS (2026-06-29)
+
+目标：
+
+- 继续沿 decode `norm -> out_proj` 边界排查剩余胶水开销
+- 验证 decode 时 `out_proj` 前那次显式 `.contiguous()` 是否冗余
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+- 当开关打开且处于 decode 时：
+  - 跳过 `out_proj` 前的显式 `.contiguous()`
+  - 直接将 `reshape` 后的 2D view 送入 `out_proj`
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+- `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+
+正确性检查：
+
+- 短请求与 benchmark 输出正常
+
+结果：
+
+- `TTFT = 115.06 ms`
+- `E2E = 0.6134 s`
+- `output_tps = 102.71 tok/s`
+
+相对当前最好值：
+
+- `102.51 -> 102.71 tok/s`
+- 提升约 `0.20 tok/s`
+
+结论：
+
+- decode `out_proj` 前的显式 `.contiguous()` 确实有少量端到端成本
+- 这条线是有效的，但收益仍属于小幅边界优化
+- 当前最好稳定值更新为：
+  - `output_tps = 102.71 tok/s`
+
+### LINEAR_DECODE_SKIP_AB_CONTIGUOUS (2026-06-29)
+
+目标：
+
+- 继续沿 decode kernel 边界减少中间张量复制
+- 验证 decode 时 `a/b` 每层显式 `.contiguous()` 是否冗余
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_SKIP_AB_CONTIGUOUS=1`
+- 与 `MINISGL_SKIP_AB_FP32_CAST=1` 组合使用时：
+  - decode 路径不再强制对 `a/b` 做 `.contiguous()`
+  - 直接把 split 得到的 strided view 送入后续 kernel
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+- `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+- `MINISGL_LINEAR_DECODE_SKIP_AB_CONTIGUOUS=1`
+
+正确性检查：
+
+- 短请求与 benchmark 输出正常
+
+结果：
+
+- `TTFT = 112.87 ms`
+- `E2E = 0.6101 s`
+- `output_tps = 103.26 tok/s`
+
+相对当前最好值：
+
+- `102.71 -> 103.26 tok/s`
+- 提升约 `0.55 tok/s`
+
+结论：
+
+- decode `a/b` 的显式 `.contiguous()` 在当前路径里确实是冗余成本
+- 这说明剩余差距里仍然包含一部分边界复制/布局整理开销
+- 当前最好稳定值更新为：
+  - `output_tps = 103.26 tok/s`
+
+### LINEAR_RMSNORM_GATED_SGLANG (2026-06-29)
+
+目标：
+
+- 对齐 sglang 当前在 Qwen3.5/GDN 路径里使用的 gated RMSNorm 实现
+- 验证直接切到 `sglang.srt.layers.attention.fla.layernorm_gated.rms_norm_gated` 是否能进一步压低 decode `norm` 开销
+
+实现：
+
+- 新增临时实验开关：
+  - `MINISGL_LINEAR_RMSNORM_GATED_SGLANG=1`
+- 让 linear-attention 输出 norm 直接调用 sglang 的 `rms_norm_gated`
+
+结果：
+
+- 首次尝试暴露出 dtype 不匹配：
+  - `rms_norm_gated` 返回 `float32`
+  - 后续 `out_proj` 权重为 `bfloat16`
+- 修正 dtype 后重新测得：
+  - `TTFT = 115.60 ms`
+  - `E2E = 0.6149 s`
+  - `output_tps = 102.45 tok/s`
+
+相对当前最好值：
+
+- `103.26 -> 102.45 tok/s`
+- 退化约 `0.81 tok/s`
+
+结论：
+
+- 当前 mini-sglang 自己这版 fused `RMSNorm+gate` 至少在该单并发场景下不比 sglang 差
+- `norm` 不是下一步最值得优先继续对齐的方向
+- 该实验不进入主线，代码已撤回
+
+### LINEAR_DECODE_SGLANG_UPDATE (2026-06-29)
+
+目标：
+
+- 继续验证 decode 主差距是否来自 recurrent update kernel 本体
+- 与之前 `LINEAR_DECODE_SGLANG_PACKED` 不同，这次不是 packed decode，而是直接切到 sglang 常规 decode 所用的
+  `fused_sigmoid_gating_delta_rule_update`
+
+实现：
+
+- 新增临时实验开关：
+  - `MINISGL_LINEAR_DECODE_SGLANG_UPDATE=1`
+- 组合：
+  - `MINISGL_LINEAR_DECODE_VK_STATE=1`
+  - `MINISGL_LINEAR_DECODE_SGLANG_UPDATE=1`
+- 让 decode 主路径改用 sglang 常规 recurrent update kernel
+
+过程说明：
+
+- 初次尝试时在 CUDA graph capture 阶段暴露出 `cu_seqlens` 动态创建问题
+- 修复 graph-capture 兼容后重新完成 benchmark
+
+结果：
+
+- `TTFT = 114.38 ms`
+- `E2E = 0.6382 s`
+- `output_tps = 98.72 tok/s`
+
+相对当前最好值：
+
+- `103.26 -> 98.72 tok/s`
+- 退化约 `4.54 tok/s`
+
+结论：
+
+- 即使切到 sglang 的常规 decode recurrent update kernel，本场景仍明显退化
+- 这进一步说明当前 mini-sglang 与 sglang 的 decode 差距，并不主要来自 recurrent update kernel 本体
+- 更可能仍在整层边界组织与其余热路径组合开销
+- 该实验不进入主线，代码已撤回
+
+### LINEAR_DECODE_SKIP_CONV_STATE_COPY (2026-06-29)
+
+目标：
+
+- 验证 decode fused depthwise conv 路径里，`conv_state.copy_(next_conv_state)` 是否是冗余开销
+- 原因是 sglang `causal_conv1d_update` 本身就是原地更新 `conv_state`
+
+实现：
+
+- 新增临时实验开关：
+  - `MINISGL_LINEAR_DECODE_SKIP_CONV_STATE_COPY=1`
+- 当满足：
+  - `MINISGL_DEPTHWISE_CONV_DECODE=1`
+  - decode
+  - 使用 sglang `causal_conv1d_update`
+- 则直接把 `conv_state` 视为已原地更新，跳过额外 `copy_`
+
+结果：
+
+- `TTFT = 113.80 ms`
+- `E2E = 0.6120 s`
+- `output_tps = 102.93 tok/s`
+
+相对当前最好值：
+
+- `103.26 -> 102.93 tok/s`
+- 退化约 `0.33 tok/s`
+
+结论：
+
+- decode conv state copy 这项不是主矛盾
+- 即便理论上存在冗余，端到端收益并不成立，甚至有轻微退化
+- 该实验不进入主线
+
+### LINEAR_DECODE_FUSED_QKV_SPLIT (2026-06-29)
+
+目标：
+
+- 重新验证 `qkvz + split/reshape` 这段 decode prepare 是否仍有空间
+- 与此前全局 `FUSED_QKV_SPLIT` 不同，这次只在 decode 上启用，避免 prefill 干扰
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_FUSED_QKV_SPLIT=1`
+- 仅在：
+  - `batch.is_decode`
+  - `backend == "sglang"`
+- 时使用 `fused_qkvzba_split_reshape_cat_contiguous`
+
+结果：
+
+- `TTFT = 114.64 ms`
+- `E2E = 0.6195 s`
+- `output_tps = 101.70 tok/s`
+
+相对当前最好值：
+
+- `103.26 -> 101.70 tok/s`
+- 退化约 `1.56 tok/s`
+
+结论：
+
+- 当前这版 fused split/reshape kernel 即使只在 decode 启用，也没有转化成端到端收益
+- 这说明 `qkvz + split/reshape` 这段虽然看起来像差异点，但不是“直接打开现有 fused kernel”就能补齐的
+- 该实验不进入主线
+
+### SHARED_EXPERT_DUAL_STREAM (2026-06-29)
+
+目标：
+
+- 对齐 sglang 中常见的 shared expert 双流重叠思路
+- 让 decode 单 token 场景下 shared expert 分支与 routed experts 主分支并行
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_SHARED_EXPERT_DUAL_STREAM=1`
+- 在 `Qwen3_5SparseMoeBlock` 中为 shared expert 挂辅助 CUDA stream
+- 仅在 decode 单 token、非 graph capture 场景启用：
+  - 先复制 `hidden_states`
+  - 在辅助 stream 上跑 shared expert
+  - 主 stream 同时继续 routed experts
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 115.16 ms`
+- `E2E = 0.6161 s`
+- `output_tps = 102.26 tok/s`
+
+相对当前当时主线最好值：
+
+- `103.26 -> 102.26 tok/s`
+- 退化约 `1.00 tok/s`
+
+结论：
+
+- shared expert 双流重叠在当前单并发、graph on 场景下没有带来收益
+- shared expert 虽然在 profile 中不小，但简单改成双流并不能自动转化成端到端提升
+- 该实验不进入主线
+
+### MOE_REUSE_WORKSPACE (2026-06-29)
+
+目标：
+
+- 减少 fused MoE 路径中 `topk` 与 `moe_align_block_size` 的临时张量分配
+- 验证“每层每 token 的小分配”是否已经成为可见开销
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_REUSE_WORKSPACE=1`
+- 复用以下临时张量：
+  - `topk_weights`
+  - `topk_ids`
+  - `sorted_ids`
+  - `expert_ids`
+  - `num_tokens_post_pad`
+  - `cumsum_buffer`
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 112.82 ms`
+- `E2E = 0.6105 s`
+- `output_tps = 103.20 tok/s`
+
+相对当前当时主线最好值：
+
+- `103.26 -> 103.20 tok/s`
+- 轻微退化约 `0.06 tok/s`
+
+结论：
+
+- 这类 MoE 小张量分配并不是当前端到端主矛盾
+- 即使减少分配，也没有拿到可观收益
+- 该实验不进入主线
+
+### MOE_SKIP_TOPK_POST_RENORM (2026-06-29)
+
+目标：
+
+- 排查 mini-sglang 的 MoE router 热路径里是否存在重复工作
+- 核对后发现：
+  - `sgl_kernel.topk_softmax(..., renormalize=True)` 之后
+  - mini-sglang 仍在 Python 侧额外做一次 `sum` 归一化
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_SKIP_TOPK_POST_RENORM=1`
+- 在 fused MoE 路径中：
+  - 保留 `topk_softmax(..., renormalize)`
+  - 跳过后续额外的 Python 侧 `topk_weights = topk_weights / sum(...)`
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 116.60 ms`
+- `E2E = 0.6016 s`
+- `output_tps = 104.72 tok/s`
+
+相对当前主线最好值：
+
+- `103.26 -> 104.72 tok/s`
+- 提升约 `1.46 tok/s`
+
+结论：
+
+- 这条优化明确有效
+- mini-sglang 的 MoE router 热路径里确实存在一段多余的后处理
+- 该实验进入主线
+
+### MOE_SKIP_TOPK_FP32_CAST (2026-06-29)
+
+目标：
+
+- 继续排查 MoE router 热路径里的额外胶水开销
+- 核对后发现：
+  - mini-sglang 调 `sgl_kernel.topk_softmax` 前会先做一次 `router_logits.float()`
+  - sglang 主线则直接传原 dtype
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_SKIP_TOPK_FP32_CAST=1`
+- 与 `MINISGL_MOE_SKIP_TOPK_POST_RENORM=1` 叠加使用
+- 让 `topk_softmax` 直接消费原始 `router_logits`
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 111.81 ms`
+- `E2E = 0.5909 s`
+- `output_tps = 106.62 tok/s`
+
+相对上一主线最好值：
+
+- `104.72 -> 106.62 tok/s`
+- 提升约 `1.90 tok/s`
+
+相对更早的 decode 主线最好值：
+
+- `103.26 -> 106.62 tok/s`
+- 总提升约 `3.36 tok/s`
+
+结论：
+
+- 这条优化同样明确有效
+- MoE router 路径的额外 dtype cast 确实会转化成可见端到端开销
+- 该实验进入主线
+
+### MOE_SKIP_DISPATCH_LOCAL_MASK (2026-06-29)
+
+目标：
+
+- 继续清理 MoE router / dispatch 热路径中的无用 Python 胶水
+- 核对后发现：
+  - `build_local_expert_dispatch_plan()` 在单卡 fast path 中会构造
+    `local_mask=torch.ones_like(topk_ids, dtype=torch.bool)`
+  - 但 fused MoE 主线实际上并不消费这个 `local_mask`
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_SKIP_DISPATCH_LOCAL_MASK=1`
+- 仅在单卡 fast path 中：
+  - 跳过这块全 1 bool mask 的构造
+  - 保持 `topk_weights/topk_ids` 原样返回
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 111.74 ms`
+- `E2E = 0.5878 s`
+- `output_tps = 107.17 tok/s`
+
+相对上一主线最好值：
+
+- `106.62 -> 107.17 tok/s`
+- 提升约 `0.55 tok/s`
+
+相对更早的 decode 主线最好值：
+
+- `103.26 -> 107.17 tok/s`
+- 总提升约 `3.91 tok/s`
+
+结论：
+
+- 这条优化同样有效，但收益小于前两条 MoE router 主线优化
+- 说明单卡 dispatch fast path 中仍然存在少量无用分配
+- 当前最好稳定值更新为：
+  - `TTFT = 111.74 ms`
+  - `E2E = 0.5878 s`
+  - `output_tps = 107.17 tok/s`
+- 该实验进入主线
+
+### MOE_ALIGN_SMALL_CAP (2026-06-29)
+
+目标：
+
+- 继续对齐 sglang 在 `moe_align_block_size()` 这段的实现细节
+- 核对后发现：
+  - mini-sglang 原本总是按
+    `topk_ids.numel() + (num_experts + 1) * (block_size - 1)`
+    分配 `sorted_ids / expert_ids` 上界
+  - sglang 在 `topk_ids.numel() < num_experts + 1` 时会直接改用更小的
+    `topk_ids.numel() * block_size`
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_ALIGN_SMALL_CAP=1`
+- 仅在小 token/topk decode 场景下：
+  - 使用与 sglang 一致的更紧上界
+  - 减少 `moe_align_block_size` 周边临时张量规模
+
+结果：
+
+- 短输出正确性正常
+- `TTFT = 112.11 ms`
+- `E2E = 0.5772 s`
+- `output_tps = 109.16 tok/s`
+
+相对上一主线最好值：
+
+- `107.17 -> 109.16 tok/s`
+- 提升约 `1.99 tok/s`
+
+结论：
+
+- 这条优化明确有效
+- 说明 `moe_align_block_size` 这段 prepare 路径仍然存在可见的过量工作
+- 当前最好稳定值更新为：
+  - `TTFT = 112.11 ms`
+  - `E2E = 0.5772 s`
+  - `output_tps = 109.16 tok/s`
+- 该实验进入主线
+
+### MOE_SGLANG_CONFIG_LOOKUP (2026-06-29)
+
+目标：
+
+- 继续对齐 sglang 与 mini-sglang 在 routed-expert Triton kernel config 选择上的差异
+- 核对后发现：
+  - mini-sglang 当前只用一个极简 heuristic 选择 `BLOCK_SIZE_* / GROUP_SIZE_M`
+  - sglang 主线则优先查 JSON 调优表，没命中时才回退默认值
+  - 对于 Qwen3.6 routed experts 使用的 `E=256, N=512` 形状，sglang 的公开配置表里确实存在 tuned config
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_SGLANG_CONFIG_LOOKUP=1`
+- 在 mini-sglang 中引入一层 sglang 风格的 config lookup：
+  - 优先按当前 Triton 版本查 JSON
+  - 若当前版本未提供，则回退到较新的可用 Triton 版本目录
+  - 若当前设备名无精确命中，则按候选设备族继续尝试
+- 同时移除了先前会导致 CUDA graph capture 失败的 `MOE_ALIGN_TINY_PATH` 实验分支
+
+这次实际对比到的 config 差异：
+
+- mini-sglang 原 heuristic：
+  - 当 `M <= E` 时固定使用：
+    - `BLOCK_SIZE_M=16`
+    - `BLOCK_SIZE_N=32`
+    - `BLOCK_SIZE_K=64`
+    - `GROUP_SIZE_M=1`
+  - 当 `M > E` 时固定使用：
+    - `BLOCK_SIZE_M=64`
+    - `BLOCK_SIZE_N=64`
+    - `BLOCK_SIZE_K=32`
+    - `GROUP_SIZE_M=8`
+- 修改后：
+  - 先查 sglang 的 `E=256, N=512` JSON 配置表
+  - 这次未命中本机 `NVIDIA A800 80GB PCIe` 专属项
+  - 实际回退命中：
+    - device fallback: `NVIDIA_H20`
+    - triton version fallback: `3.5.1`
+- 对当前单并发 decode 更关键的 `M=1`：
+  - 原来：
+    - `BLOCK_SIZE_M=16`
+    - `BLOCK_SIZE_N=32`
+    - `BLOCK_SIZE_K=64`
+    - `GROUP_SIZE_M=1`
+  - 修改后：
+    - `BLOCK_SIZE_M=16`
+    - `BLOCK_SIZE_N=64`
+    - `BLOCK_SIZE_K=128`
+    - `GROUP_SIZE_M=1`
+    - `num_warps=4`
+    - `num_stages=4`
+- 对较大 `M`，例如 prefill 侧常见的 `M=1024`：
+  - 原来：
+    - `BLOCK_SIZE_M=64`
+    - `BLOCK_SIZE_N=64`
+    - `BLOCK_SIZE_K=32`
+    - `GROUP_SIZE_M=8`
+  - 修改后：
+    - `BLOCK_SIZE_M=64`
+    - `BLOCK_SIZE_N=64`
+    - `BLOCK_SIZE_K=64`
+    - `GROUP_SIZE_M=1`
+    - `num_warps=4`
+    - `num_stages=4`
+
+结果：
+
+- 短输出正确性正常
+- 两次 benchmark 稳态结果一致：
+  - `TTFT = 101.29~101.48 ms`
+  - `E2E = 0.5668~0.5669 s`
+  - `output_tps = 111.13~111.15 tok/s`
+- 取稳定值：
+  - `TTFT = 101.29 ms`
+  - `E2E = 0.5668 s`
+  - `output_tps = 111.15 tok/s`
+
+相对上一主线最好值：
+
+- `109.16 -> 111.15 tok/s`
+- 提升约 `1.99 tok/s`
+
+结论：
+
+- 这条优化明确有效，而且是当前为止较大的单因素收益之一
+- mini-sglang 与 sglang 在 routed-expert Triton config 选择上的实现差异，确实会转化成端到端性能差距
+- 这次命中的是 sglang 配置表的版本/设备回退路径，而不是本机专属 `A800 PCIe` tuned config
+- 从具体 config 看，收益主要来自：
+  - 小 `M` 场景把 `BLOCK_SIZE_N/K` 做大
+  - 大 `M` 场景把 `BLOCK_SIZE_K` 从 `32` 提到 `64`
+  - 同时显式引入 `num_warps / num_stages`
+- 当前最好稳定值更新为：
+  - `TTFT = 101.29 ms`
+  - `E2E = 0.5668 s`
+  - `output_tps = 111.15 tok/s`
+- 该实验进入主线
+
+### MOE_SGLANG_DOWN_CONFIG (2026-06-29)
+
+目标：
+
+- 在已经验证 `MINISGL_MOE_SGLANG_CONFIG_LOOKUP=1` 有效之后，继续对齐 sglang routed-expert 的第二个 GEMM
+- 核对后发现：
+  - mini-sglang 当前第二段 `w2/down_proj` GEMM 仍然直接复用第一段 `gate_up` GEMM 的 config
+  - sglang 主线会为第二段单独查 `_down.json`，再把 `BLOCK_SIZE_M` 对齐到第一段
+
+实现：
+
+- 新增实验开关：
+  - `MINISGL_MOE_SGLANG_DOWN_CONFIG=1`
+- 仅在已启用 `MINISGL_MOE_SGLANG_CONFIG_LOOKUP=1` 的基础上：
+  - 为第二段 routed-expert GEMM 单独查 sglang 风格的 `_down.json`
+  - 若命中，则只把 `BLOCK_SIZE_M` 强制改回与第一段一致
+  - 其它参数如 `BLOCK_SIZE_N/K`、`GROUP_SIZE_M`、`num_warps`、`num_stages` 保持 down_config 自己的值
+
+这次实际命中的关键 config 差异：
+
+- 对 decode 最关键的 `M=1`
+  - 第一段 up-config：
+    - `BLOCK_SIZE_M=16`
+    - `BLOCK_SIZE_N=64`
+    - `BLOCK_SIZE_K=128`
+    - `GROUP_SIZE_M=1`
+    - `num_warps=4`
+    - `num_stages=4`
+  - 第二段原来：
+    - 直接复用上面这组 up-config
+  - 第二段修改后命中的 down-config：
+    - `BLOCK_SIZE_M=16`
+    - `BLOCK_SIZE_N=32`
+    - `BLOCK_SIZE_K=256`
+    - `GROUP_SIZE_M=1`
+    - `num_warps=4`
+    - `num_stages=2`
+- 对较大 `M`，例如 `M=1024`
+  - 原来第二段：
+    - 复用第一段：
+      - `BLOCK_SIZE_M=64`
+      - `BLOCK_SIZE_N=64`
+      - `BLOCK_SIZE_K=64`
+      - `GROUP_SIZE_M=1`
+      - `num_warps=4`
+      - `num_stages=4`
+  - 修改后第二段：
+    - 命中 down-config 后：
+      - `BLOCK_SIZE_M=64`
+      - `BLOCK_SIZE_N=128`
+      - `BLOCK_SIZE_K=64`
+      - `GROUP_SIZE_M=1`
+      - `num_warps=4`
+      - `num_stages=3`
+
+结果：
+
+- 短输出正确性正常
+- 两次 benchmark 稳态结果一致：
+  - `TTFT = 100.47~100.71 ms`
+  - `E2E = 0.5621~0.5624 s`
+  - `output_tps = 112.03~112.08 tok/s`
+- 取稳定值：
+  - `TTFT = 100.47 ms`
+  - `E2E = 0.5621 s`
+  - `output_tps = 112.08 tok/s`
+
+相对上一主线最好值：
+
+- `111.15 -> 112.08 tok/s`
+- 提升约 `0.93 tok/s`
+
+结论：
+
+- 这条优化有效
+- 说明 routed-expert 第二个 GEMM 的最佳 tile/launch config 与第一段并不相同，直接复用第一段 config 会损失性能
+- 当前最好稳定值更新为：
+  - `TTFT = 100.47 ms`
+  - `E2E = 0.5621 s`
+  - `output_tps = 112.08 tok/s`
+- 该实验进入主线
+
+### MOE_SGL_REDUCE 修复复测 (2026-06-29)
+
+背景：
+
+- 早先 `MINISGL_MOE_SGL_REDUCE=1` 被判定为 correctness fail
+- 现象是短输出里会出现异常 special token 和明显错误文本
+
+根因定位：
+
+- mini-sglang 当前接 `sgl_kernel.moe_sum_reduce(...)` 时，把第三个参数硬编码成了 `0.0`
+- 但 sglang 主线传的是 `routed_scaling_factor`
+- 对当前 Qwen3.6 路径来说，这等价于把 routed experts 的 reduce 输出整体缩成 0
+- 同时，`routed_scaling_factor` 虽然从 `MoELayer` 传进了 `FusedMoe.forward()`，但原来并没有继续传到 `fused_experts_impl()`
+
+修复：
+
+- 把 `routed_scaling_factor` 继续传入 `fused_experts_impl()`
+- `MOE_SGL_REDUCE` 分支中的
+  - `sgl_kernel.moe_sum_reduce(..., 0.0)`
+  改为
+  - `sgl_kernel.moe_sum_reduce(..., routed_scaling_factor)`
+
+结果：
+
+- 修复后短输出 correctness 恢复正常
+- 两次 benchmark 稳态结果：
+  - 第一次：
+    - `TTFT = 102.50 ms`
+    - `E2E = 0.5623 s`
+    - `output_tps = 112.04 tok/s`
+  - 第二次：
+    - `TTFT = 101.31 ms`
+    - `E2E = 0.5611 s`
+    - `output_tps = 112.28 tok/s`
+
+结论：
+
+- 先前 `MOE_SGL_REDUCE` 的 correctness fail 不是 `sgl_kernel.moe_sum_reduce` 本身有问题
+- 而是 mini-sglang 的接法把 scale 传错了
+- 修复后：
+  - correctness 已恢复
+  - 性能大致与当前 best 持平，可能有极小正收益
+- 因此这条线现在不应再按“错误实验”看待，而应视为“已修复、可继续评估是否值得保留”的候选项
+
+### 引擎级 decode graph replay 对齐：FI_GRAPH_FAST_DECODE_PLAN (2026-06-29)
+
+背景：
+
+- 继续从“整个推理引擎”角度对比 mini-sglang 与 sglang，而不是继续只盯单个 MoE 或 linear-attn kernel
+- 代码对比后，发现两边在 decode + cuda graph 的 attention metadata 初始化路径上有一处明显设计差异：
+  - mini-sglang：
+    - `scheduler._prepare_batch()` 每步先构造一份新的 `attn_metadata`
+    - `graph_runner.replay()` 前再走 `attn_backend.prepare_for_replay()`
+    - 对 `FlashInferBackend` 来说，decode graph replay 仍然经过统一的 `metadata.wrapper.plan(...)` 路径
+  - sglang：
+    - attention backend 把 graph 内与 graph 外 metadata 初始化拆开
+    - decode replay 会通过专门的 `indices_updater_decode.update(...)` 和预分配 wrapper/buffer 增量更新
+    - FlashInfer decode graph 路径支持 `fast_decode_plan`
+
+分析判断：
+
+- 这说明 mini-sglang 与 sglang 的剩余差距里，至少有一部分可能来自：
+  - decode graph replay 边界的 metadata/planner 组织方式
+  - 而不只是单个算子 kernel 本体
+
+实验：
+
+- 新增开关：
+  - `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+- 做法：
+  - 仅在 `FlashInferBackend.prepare_for_capture()` 的 decode cuda-graph wrapper 上，把 replay 期的 planner 切到 flashinfer `fast_decode_plan`
+  - 为兼容 flashinfer 当前签名，在 `metadata.wrapper.plan(...)` 初始化处增加了对 `seq_lens` 参数是否存在的判断
+- 这个实验只影响 `attention-backend=fi + decode + cuda graph`，默认行为不变
+
+结果：
+
+- 短输出 correctness 正常
+- benchmark 稳态结果：
+  - `TTFT = 100.22 ms`
+  - `E2E = 0.5593 s`
+  - `output_tps = 112.65 tok/s`
+
+对比：
+
+- 当前主线 best：
+  - `TTFT = 100.47 ms`
+  - `E2E = 0.5621 s`
+  - `output_tps = 112.08 tok/s`
+- 加上 `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1` 后：
+  - `112.08 -> 112.65 tok/s`
+
+结论：
+
+- 这是一个真实的正收益，但很小，约 `+0.57 tok/s`
+- 说明从“推理引擎组织方式”角度看，decode graph replay 的 attention metadata / planner 路径确实有一部分差距
+- 但也说明：
+  - 单独把 FlashInfer decode planner 对齐到 `fast_decode_plan`，并不能解释 mini-sglang 与 sglang 之间剩余的大部分差距
+  - 剩余差距更可能来自：
+    - 更高层的 graph replay 边界组织
+    - 整层 residual / layer glue
+    - MoE 与 linear-attn 以外的累计模型级开销
+
+备注：
+
+- 另外还尝试了更激进的 `FI_GRAPH_REUSE_METADATA` 思路，目标是复用 decode graph 的 capture metadata buffer、减少每步 `torch.tensor/torch.cat` 重建
+- 这条线目前只完成了实验脚手架，还没有形成稳定 benchmark 结果，不进入主线

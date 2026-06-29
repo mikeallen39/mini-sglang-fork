@@ -256,6 +256,16 @@ class Qwen3_5SparseMoeBlock(BaseOP):
                 has_bias=False,
             )
             self.shared_expert_gate.disable_int8_quantization = True
+        self._shared_alt_stream: torch.cuda.Stream | None = None
+
+    def process_weights_after_loading(self) -> None:
+        if (
+            self.shared_expert is not None
+            and self.shared_expert_gate is not None
+            and self.shared_expert_gate.weight.is_cuda
+            and self._shared_alt_stream is None
+        ):
+            self._shared_alt_stream = torch.cuda.Stream(device=self.shared_expert_gate.weight.device)
 
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -283,15 +293,40 @@ class Qwen3_5SparseMoeBlock(BaseOP):
         )
         if profile_enabled:
             e1.record()
+        shared_output = None
+        use_shared_dual_stream = (
+            ENV.SHARED_EXPERT_DUAL_STREAM.value
+            and self._shared_alt_stream is not None
+            and hidden_states.is_cuda
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] == 1
+            and not torch.cuda.is_current_stream_capturing()
+            and self.shared_expert is not None
+            and self.shared_expert_gate is not None
+        )
+        if use_shared_dual_stream:
+            current_stream = torch.cuda.current_stream()
+            shared_input = hidden_states.clone()
+            shared_input.record_stream(self._shared_alt_stream)
+            self._shared_alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self._shared_alt_stream):
+                shared_output = self.shared_expert.forward(
+                    shared_input,
+                    hidden_states_q=hidden_states_q,
+                    hidden_states_scale=hidden_states_scale,
+                )
         output = self.experts.forward(hidden_states, router_logits)
         if profile_enabled:
             e2.record()
         if self.shared_expert is not None and self.shared_expert_gate is not None:
-            shared_output = self.shared_expert.forward(
-                hidden_states,
-                hidden_states_q=hidden_states_q,
-                hidden_states_scale=hidden_states_scale,
-            )
+            if shared_output is None:
+                shared_output = self.shared_expert.forward(
+                    hidden_states,
+                    hidden_states_q=hidden_states_q,
+                    hidden_states_scale=hidden_states_scale,
+                )
+            else:
+                torch.cuda.current_stream().wait_stream(self._shared_alt_stream)
             if (
                 ENV.SHARED_EXPERT_FUSED_GATE_ADD.value
                 and hidden_states.is_cuda
@@ -579,7 +614,7 @@ class Qwen3_5LinearAttention(BaseOP):
         self,
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch = get_global_ctx().batch
         if (
             ENV.DEPTHWISE_CONV_PREFILL.value
@@ -620,6 +655,8 @@ class Qwen3_5LinearAttention(BaseOP):
                 bias=None,
                 activation=self.activation,
             )
+            if ENV.LINEAR_DECODE_SKIP_CONV_STATE_COPY.value:
+                return updated, None
             return updated, conv_state
         conv_weight = self.conv1d.weight.squeeze(1).to(dtype=mixed_qkv.dtype)
         x = mixed_qkv.transpose(0, 1)
@@ -715,7 +752,8 @@ class Qwen3_5LinearAttention(BaseOP):
             device=mixed_qkv.device,
         )
         mixed_qkv, next_conv_state = self._run_depthwise_conv(mixed_qkv, conv_state)
-        conv_state.copy_(next_conv_state)
+        if next_conv_state is not None:
+            conv_state.copy_(next_conv_state)
 
         query, key, value, z = self._reshape_qkv(mixed_qkv, z)
         query = F.normalize(query.float(), dim=-1, eps=1e-6) * self.scale
@@ -762,16 +800,25 @@ class Qwen3_5LinearAttention(BaseOP):
             conv_start, conv_end, kernel_end, norm_end, out_end = profile_events
             conv_start.record()
         mixed_qkv, next_conv_state = self._run_depthwise_conv(mixed_qkv, conv_state)
-        conv_state.copy_(next_conv_state)
+        if next_conv_state is not None:
+            conv_state.copy_(next_conv_state)
         if profile_events is not None:
             conv_end.record()
 
         if ENV.SKIP_AB_FP32_CAST.value:
-            a = a.contiguous()
-            b = b.contiguous()
+            if ENV.LINEAR_DECODE_SKIP_AB_CONTIGUOUS.value and is_decode:
+                a = a
+                b = b
+            else:
+                a = a.contiguous()
+                b = b.contiguous()
         else:
-            a = a.float().contiguous()
-            b = b.float().contiguous()
+            if ENV.LINEAR_DECODE_SKIP_AB_CONTIGUOUS.value and is_decode:
+                a = a.float()
+                b = b.float()
+            else:
+                a = a.float().contiguous()
+                b = b.float().contiguous()
         A_log = self._get_A_log_fp32()
         dt_bias = self._get_dt_bias_fp32()
         if is_decode:
@@ -844,7 +891,10 @@ class Qwen3_5LinearAttention(BaseOP):
         outputs = self.norm.forward(outputs, z)
         if profile_events is not None:
             norm_end.record()
-        outputs = self.out_proj.forward(outputs.reshape(outputs.shape[0], -1).contiguous())
+        out_proj_in = outputs.reshape(outputs.shape[0], -1)
+        if not (is_decode and ENV.LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS.value):
+            out_proj_in = out_proj_in.contiguous()
+        outputs = self.out_proj.forward(out_proj_in)
         if profile_events is not None:
             out_end.record()
         return outputs
@@ -924,7 +974,14 @@ class Qwen3_5LinearAttention(BaseOP):
             mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
             if profile_enabled:
                 proj_events[2].record()
-        if ENV.FUSED_QKV_SPLIT.value and self.backend == "sglang":
+        use_fused_qkv_split = (
+            self.backend == "sglang"
+            and (
+                ENV.FUSED_QKV_SPLIT.value
+                or (batch.is_decode and ENV.LINEAR_DECODE_FUSED_QKV_SPLIT.value)
+            )
+        )
+        if use_fused_qkv_split:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 mixed_qkvz,
                 mixed_ba,

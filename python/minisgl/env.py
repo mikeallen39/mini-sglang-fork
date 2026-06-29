@@ -76,6 +76,8 @@ class EnvClassSingleton:
 
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
+    FI_GRAPH_FAST_DECODE_PLAN = EnvBool(False)  # use flashinfer fast_decode_plan on decode cuda-graph replay
+    FI_GRAPH_REUSE_METADATA = EnvBool(False)  # reuse decode cuda-graph attention metadata buffers instead of rebuilding tensors each step
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     OVERLAP_EXTRA_SYNC = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
@@ -83,12 +85,21 @@ class EnvClassSingleton:
     PROFILE_FUSED_MOE = EnvBool(False)
     PROFILE_SPARSE_MOE = EnvBool(False)
     PROFILE_INT8_DENSE = EnvBool(False)
+    MOE_REUSE_WORKSPACE = EnvBool(False)  # reuse topk/alignment temporary buffers on the fused MoE path
+    MOE_SKIP_TOPK_POST_RENORM = EnvBool(False)  # trust sgl_kernel.topk_softmax renormalize output and skip the extra Python-side renorm
+    MOE_SKIP_TOPK_FP32_CAST = EnvBool(False)  # pass router logits to sgl_kernel.topk_softmax without an extra Python-side float() cast
+    MOE_SKIP_DISPATCH_LOCAL_MASK = EnvBool(False)  # skip constructing an unused all-true local_mask on the single-rank fast path
+    MOE_DIRECT_FASTPATH = EnvBool(False)  # bypass LocalExpertDispatchPlan on the fused MoE single-rank fast path
+    MOE_ALIGN_SMALL_CAP = EnvBool(False)  # use sglang's smaller temporary-buffer upper bound when topk_ids.numel() < num_experts + 1
+    MOE_SGLANG_CONFIG_LOOKUP = EnvBool(False)  # load routed-expert Triton config from sglang-style JSON tables when available
+    MOE_SGLANG_DOWN_CONFIG = EnvBool(False)  # use a separate sglang-style down-proj Triton config for the second routed-expert GEMM
     MOE_SINGLE_KERNEL = EnvBool(False)  # fuse silu_and_mul into the second MoE GEMM
     MOE_FUSED_ACTIVATION = EnvBool(False)  # use sgl_kernel fused silu_and_mul / gelu_and_mul in MoE stage2
     MOE_SGL_REDUCE = EnvBool(False)  # use sgl_kernel moe_sum_reduce instead of local Triton reduce
     LINEAR_RMSNORM_GATED = EnvBool(False)  # use fused RMSNorm+gate for Qwen3.6 linear attention output norm
     SHARED_EXPERT_FUSED_GATE_ADD = EnvBool(False)  # fuse sigmoid(gate)*shared_output + moe_output for shared expert
     SHARED_EXPERT_FUSED_ACTIVATION = EnvBool(False)  # use fused silu_and_mul inside shared expert bf16 path
+    SHARED_EXPERT_DUAL_STREAM = EnvBool(False)  # overlap decode-time shared expert MLP with routed experts on an auxiliary CUDA stream
     SKIP_AB_FP32_CAST = EnvBool(False)  # keep a,b in bf16 for decode (Triton kernel loads as fp32 internally)
     DEPTHWISE_CONV_DECODE = EnvBool(False)  # use fused Triton depthwise conv for decode
     DEPTHWISE_CONV_PREFILL = EnvBool(False)  # use sglang causal_conv1d_fn for prefill depthwise conv
@@ -100,6 +111,10 @@ class EnvClassSingleton:
     LINEAR_DECODE_FUSED_INPUT_PROJ = EnvBool(False)  # fuse decode-time qkvz and ba projections into one GEMM in bf16 path
     LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ = EnvBool(False)  # overlap decode-time qkvz and ba bf16 projections on two CUDA streams
     LINEAR_RMSNORM_GATED_REUSE_OUT = EnvBool(False)  # reuse decode norm output buffer for fused RMSNorm+gate
+    LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS = EnvBool(False)  # skip explicit contiguous before linear-attention decode out_proj
+    LINEAR_DECODE_SKIP_AB_CONTIGUOUS = EnvBool(False)  # skip explicit decode-time a/b contiguous when kernel can consume strided views
+    LINEAR_DECODE_SKIP_CONV_STATE_COPY = EnvBool(False)  # skip redundant conv_state.copy_ after fused decode conv update
+    LINEAR_DECODE_FUSED_QKV_SPLIT = EnvBool(False)  # use fused qkvz/ba split+reshape only for decode
     GEMMA_FUSED_NORM = EnvBool(False)  # use sgl_kernel gemma_rmsnorm / gemma_fused_add_rmsnorm
     FULL_ATTN_FUSED_PREPARE = EnvBool(False)  # fuse Q/K GemmaRMSNorm + RoPE + gate extraction in full attention
     FULL_ATTN_FUSED_GATE_MUL = EnvBool(False)  # fuse sigmoid(gate) * attn_output in full attention

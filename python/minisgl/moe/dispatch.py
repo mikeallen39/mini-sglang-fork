@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
+from minisgl.env import ENV
 
 
 @dataclass(frozen=True)
 class LocalExpertDispatchPlan:
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    local_mask: torch.Tensor
+    local_mask: Optional[torch.Tensor]
 
 
 def build_local_expert_dispatch_plan(
@@ -22,10 +24,15 @@ def build_local_expert_dispatch_plan(
     if num_global_experts is None or (
         local_expert_start == 0 and num_local_experts == num_global_experts
     ):
+        local_mask = (
+            None
+            if ENV.MOE_SKIP_DISPATCH_LOCAL_MASK.value
+            else torch.ones_like(topk_ids, dtype=torch.bool)
+        )
         return LocalExpertDispatchPlan(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            local_mask=torch.ones_like(topk_ids, dtype=torch.bool),
+            local_mask=local_mask,
         )
 
     local_expert_end = local_expert_start + num_local_experts

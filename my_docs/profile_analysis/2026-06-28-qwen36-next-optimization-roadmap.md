@@ -494,7 +494,24 @@
   - `102.17 -> 102.51 tok/s`
 - 结论：
   - decode gated norm 还有少量可挖空间
-  - 但“减少输出分配”本身不是大头
+- 但“减少输出分配”本身不是大头
+
+4. `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+
+- 跳过 decode 时 `out_proj` 前的显式 `.contiguous()`
+- 结果：
+  - `102.51 -> 102.71 tok/s`
+- 结论：
+  - `norm -> out_proj` 边界仍存在少量可回收的布局整理成本
+
+5. `MINISGL_LINEAR_DECODE_SKIP_AB_CONTIGUOUS=1`
+
+- 跳过 decode 时 `a/b` 的显式 `.contiguous()`
+- 结果：
+  - `102.71 -> 103.26 tok/s`
+- 结论：
+  - decode kernel 前的 `a/b` 复制是可观察到的真实冗余
+  - 当前最好稳定值更新为 `103.26 tok/s`
 
 ### 已证伪 / 降级
 
@@ -514,16 +531,59 @@
 - 结论：
   - 剩余差距不是“只换 recurrent kernel 本体”就能解决
 
+3. `MINISGL_LINEAR_RMSNORM_GATED_SGLANG=1`
+
+- 直接切到 sglang `rms_norm_gated`
+- 结果：
+  - `103.26 -> 102.45 tok/s`
+- 结论：
+  - 当前 mini-sglang 自己这版 gated RMSNorm 并不比 sglang 差
+  - `norm` 不是下一步最值得继续对齐的主方向
+
+4. `MINISGL_LINEAR_DECODE_SGLANG_UPDATE=1`
+
+- 直接切到 sglang 常规 decode 所用的
+  `fused_sigmoid_gating_delta_rule_update`
+- 结果：
+  - `103.26 -> 98.72 tok/s`
+- 结论：
+  - 即使不走 packed decode，只换成 sglang 常规 recurrent update kernel 也明显退化
+  - decode 主差距并不主要来自 recurrent update kernel 本体
+
+5. `MINISGL_LINEAR_DECODE_SKIP_CONV_STATE_COPY=1`
+
+- 跳过 decode fused conv 路径后的额外 `conv_state.copy_`
+- 结果：
+  - `103.26 -> 102.93 tok/s`
+- 结论：
+  - decode conv state copy 不是主矛盾
+  - 这类单点 state-copy 清理不足以继续逼近 sglang
+
+6. `MINISGL_LINEAR_DECODE_FUSED_QKV_SPLIT=1`
+
+- 只在 decode 启用 `fused_qkvzba_split_reshape_cat_contiguous`
+- 结果：
+  - `103.26 -> 101.70 tok/s`
+- 结论：
+  - 即使去掉 prefill 干扰，当前 fused split/reshape kernel 仍没有带来端到端收益
+  - `qkvz + split/reshape` 并不是“直接启用现有 fused kernel”就能补齐的差距
+
 ### 当前 decode 分段判断
 
-基于 `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1` 的 graph-off 阶段化 profile，稳定单层 decode 开销大致为：
+基于最新更优组合：
+
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+- `MINISGL_LINEAR_DECODE_SKIP_OUTPROJ_CONTIGUOUS=1`
+- `MINISGL_LINEAR_DECODE_SKIP_AB_CONTIGUOUS=1`
+
+的 graph-off 阶段化 profile，稳定单层 decode 开销大致为：
 
 - `qkvz ≈ 0.062 ms`
 - `ba ≈ 0.003 ms`
-- `conv ≈ 0.048 ms`
-- `kernel ≈ 0.101~0.103 ms`
-- `norm ≈ 0.069~0.070 ms`
-- `out_proj ≈ 0.049~0.050 ms`
+- `conv ≈ 0.050 ms`
+- `kernel ≈ 0.103~0.104 ms`
+- `norm ≈ 0.066 ms`
+- `out_proj ≈ 0.050~0.051 ms`
 
 这说明：
 
@@ -537,6 +597,241 @@
 
 结合上面的实验与 sglang 代码对齐结果，下一步更合理的顺序应调整为：
 
-1. 优先继续看 decode 的 `norm -> out_proj` 边界
-2. 再考虑 decode `kernel` 本体附近是否还有可迁移的组织方式
-3. 不再继续优先追 `input proj`、`state layout`、`packed recurrent kernel` 这几条已经基本证伪或收益极小的线
+1. 下一步不应继续优先围绕 linear-attn decode 单段做直接对齐开关实验
+2. 更合理的是回到整个 model 层面重新看剩余差距，尤其是 linear-attn 之外的 MoE / residual / layer 边界累计成本
+3. 不再继续优先追 `input proj`、`state layout`、`packed recurrent kernel`、`sglang gated RMSNorm`、`sglang 常规 recurrent update kernel`、`conv state copy`、`decode-only fused split` 这些已经证伪或收益很小的线
+
+---
+
+## 2026-06-29 整模型重新归因
+
+在当前最好稳定组合附近，额外开启：
+
+- `MINISGL_PROFILE_QWEN35=1`
+- `MINISGL_PROFILE_SPARSE_MOE=1`
+- `MINISGL_PROFILE_FUSED_MOE=1`
+
+并在 `graph off` 下重跑整模型 profile。
+
+### 关键观察
+
+1. Linear-attn decode 单层稳定大致为：
+
+- `qkvz ≈ 0.062 ms`
+- `ba ≈ 0.003 ms`
+- `conv ≈ 0.048~0.049 ms`
+- `kernel ≈ 0.101~0.103 ms`
+- `norm ≈ 0.065~0.066 ms`
+- `out_proj ≈ 0.049 ms`
+
+合计约：
+
+- `~0.33 ms / linear-attn layer-call`
+
+2. SparseMoE 单层稳定大致为：
+
+- `router ≈ 0.041 ms`
+- `experts ≈ 0.53~0.54 ms`
+- `shared ≈ 0.146 ms`
+
+合计约：
+
+- `~0.72 ms / MoE layer-call`
+
+3. FusedMoE 内部 routed experts 稳定大致为：
+
+- `w1 ≈ 0.102 ms`
+- `stage2 ≈ 0.023 ms`
+- `w2 ≈ 0.072 ms`
+- `reduce ≈ 0.059 ms`
+
+### 结论
+
+这说明在当前代码状态下：
+
+- **MoE 层的单层成本已经明显高于 linear-attn decode 层**
+- 剩余差距如果继续只盯 linear-attn decode，性价比会越来越低
+- 下一阶段更值得优先投入的是：
+  - routed experts 主链
+  - shared expert
+  - MoE reduce / epilogue
+
+### 下一优先级调整
+
+1. 主线切到 MoE
+2. 优先看 routed experts 的 `w1 / w2 / reduce`
+3. 其次看 shared expert 路径
+4. linear-attn decode 暂时降级为次优先级，除非后续发现新的整段融合点
+
+---
+
+## 2026-06-29 MoE 主线新结论
+
+在完成整模型重新归因后，围绕 MoE 主线继续做了 4 组单因素实验。
+
+### 已证伪
+
+1. `MINISGL_SHARED_EXPERT_DUAL_STREAM=1`
+
+- 思路：
+  - 对齐 sglang 常见的 shared expert 双流重叠
+  - 让 shared expert 与 routed experts 并行
+- 结果：
+  - `103.26 -> 102.26 tok/s`
+- 结论：
+  - 当前单并发、graph on 场景下，shared expert 双流没有转化成端到端收益
+  - 这不是当前最值得继续深挖的方向
+
+2. `MINISGL_MOE_REUSE_WORKSPACE=1`
+
+- 思路：
+  - 复用 fused MoE 中 `topk/alignment` 的临时张量
+- 结果：
+  - `103.26 -> 103.20 tok/s`
+- 结论：
+  - MoE 路径里的小张量分配并不是当前端到端主矛盾
+
+### 有效优化
+
+1. `MINISGL_MOE_SKIP_TOPK_POST_RENORM=1`
+
+- 发现：
+  - mini-sglang 调 `sgl_kernel.topk_softmax(..., renormalize=True)` 后
+  - 仍在 Python 侧额外做一次 `topk_weights /= sum(topk_weights)`
+- 结果：
+  - `103.26 -> 104.72 tok/s`
+- 结论：
+  - 这是一段真实存在的重复工作
+  - MoE router 热路径因此拿到明显收益
+
+2. `MINISGL_MOE_SKIP_TOPK_FP32_CAST=1`
+
+- 发现：
+  - mini-sglang 调 `topk_softmax` 前还会额外做 `router_logits.float()`
+  - sglang 主线直接传原 dtype
+- 与 `MINISGL_MOE_SKIP_TOPK_POST_RENORM=1` 叠加后结果：
+  - `104.72 -> 106.62 tok/s`
+- 结论：
+  - 这条额外 dtype cast 同样会转化成真实端到端开销
+  - MoE router 路径目前已经成为最明确、最有效的优化来源
+
+3. `MINISGL_MOE_SKIP_DISPATCH_LOCAL_MASK=1`
+
+- 发现：
+  - `build_local_expert_dispatch_plan()` 在单卡 fast path 中会额外构造
+    `torch.ones_like(topk_ids, dtype=torch.bool)`
+  - 但 fused MoE 主线并不消费这个 `local_mask`
+- 与前两条 MoE router 优化叠加后结果：
+  - `106.62 -> 107.17 tok/s`
+- 结论：
+  - 单卡 dispatch fast path 里仍有少量无用分配
+  - 这类小胶水清理还能继续拿到稳定小收益
+
+4. `MINISGL_MOE_ALIGN_SMALL_CAP=1`
+
+- 发现：
+  - mini-sglang 在 `moe_align_block_size()` 中仍使用更松的临时张量上界
+  - sglang 在 `topk_ids.numel() < num_experts + 1` 时会改用更小的 `topk_ids.numel() * block_size`
+- 与前三条 MoE router / dispatch 优化叠加后结果：
+  - `107.17 -> 109.16 tok/s`
+- 结论：
+  - `moe_align_block_size` prepare 路径仍然是可见的真实瓶颈
+  - 仅仅收紧小 token 场景的 buffer 上界，就能带来接近 `+2 tok/s` 的收益
+
+5. `MINISGL_MOE_SGLANG_CONFIG_LOOKUP=1`
+
+- 发现：
+  - mini-sglang 当前 routed-expert Triton config 选择仍是极简 heuristic
+  - sglang 主线会优先命中 JSON 调优表，再回退默认 heuristic
+  - 对 Qwen3.6 routed experts 的 `E=256, N=512` 形状，sglang 确实有现成 tuned config
+- 这次实际命中的关键 config 差异：
+  - 原 heuristic 在 `M <= E` 时固定为
+    `BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=1`
+  - 对 decode 最关键的 `M=1`，回退命中的 sglang config 变为
+    `BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=128, GROUP_SIZE_M=1, num_warps=4, num_stages=4`
+  - 对较大 `M`，例如 `M=1024`，原 heuristic 是
+    `BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8`
+  - 命中的 sglang config 则变为
+    `BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=1, num_warps=4, num_stages=4`
+- 与前四条 MoE 主线优化叠加后结果：
+  - `109.16 -> 111.15 tok/s`
+- 结论：
+  - routed-expert kernel config 选择差异是当前 mini-sglang 落后于 sglang 的一个真实来源
+  - 即使本机没有 `A800 PCIe` 专属配置，单靠 sglang 风格的 config lookup 与版本/设备回退，也能拿到明显收益
+  - 说明当前差距并不只是 Python 胶水，kernel tile / launch config 本身也仍有优化空间
+
+6. `MINISGL_MOE_SGLANG_DOWN_CONFIG=1`
+
+- 发现：
+  - mini-sglang 第二段 `w2/down_proj` GEMM 仍然直接复用第一段 `gate_up` GEMM 的 config
+  - sglang 主线则会为第二段单独查 `_down.json`
+  - 对当前 `E=256, N=512` 形状，down-config 与 up-config 的差异是实质性的：
+    - `M=1` 时从 `N=64, K=128, stages=4` 变成 `N=32, K=256, stages=2`
+    - `M=1024` 时从 `N=64` 变成 `N=128`
+- 与前五条 MoE 主线优化叠加后结果：
+  - `111.15 -> 112.08 tok/s`
+- 结论：
+  - routed-expert 第二个 GEMM 的最佳 config 确实不同于第一段
+  - 这部分差异同样会转化成可见端到端收益
+
+7. `MINISGL_MOE_SGL_REDUCE=1` 复测
+
+- 重新定位后发现：
+  - 早先的 correctness fail 不是 `sgl_kernel.moe_sum_reduce` 自身错误
+  - 而是 mini-sglang 当前接法把第三个参数硬编码成了 `0.0`
+  - sglang 主线传的是 `routed_scaling_factor`
+- 修复后结果：
+  - 短输出 correctness 恢复正常
+  - benchmark 大致在 `112.04 ~ 112.28 tok/s`
+- 结论：
+  - 这条线已经从“错误实验”变成了“已修复、当前收益不明显但可继续评估”的候选项
+  - 也说明当前剩余差距未必主要在 MoE reduce kernel 本体，而更可能还是在更高层的整段组织
+
+### 当前最好稳定值
+
+当前主线最好稳定值更新为：
+
+- `TTFT = 100.47 ms`
+- `E2E = 0.5621 s`
+- `output_tps = 112.08 tok/s`
+
+补充：
+
+- 从“整个推理引擎”角度做了一轮 decode graph replay 对比后，新增一个已验证的小收益实验：
+  - `MINISGL_FI_GRAPH_FAST_DECODE_PLAN=1`
+  - 结果：
+    - `TTFT = 100.22 ms`
+    - `E2E = 0.5593 s`
+    - `output_tps = 112.65 tok/s`
+- 这说明 attention metadata / planner 的 graph replay 组织方式确实是 mini-sglang 落后于 sglang 的一个来源
+- 但收益只有 `+0.57 tok/s`，不能解释剩余的大部分差距
+
+相对 sglang `124.03 tok/s`：
+
+- 已达到约 `90.4%`
+
+### 对后续优化方向的影响
+
+这批实验说明：
+
+1. 当前最值得继续追的是 **MoE router / dispatch / prepare** 这条线
+2. `topk` 前后的额外 Python 胶水开销已经被证明是真实收益点
+3. `moe_align_block_size`、第一段 routed-expert config、第二段 routed-expert down-config，都已经被证明是当前主线里的真实收益点
+4. `MOE_SGL_REDUCE` 修复后 correctness 正常，但目前没有显示出明显大于噪声的收益
+5. 相比之下，shared expert 双流和 workspace 复用都不是当前主矛盾
+6. 从引擎级对比看，decode graph replay 的 attention metadata/planner 路径确实存在设计差异，但单独对齐 `fast_decode_plan` 只能带来小收益，说明它不是剩余差距的主来源
+
+### 下一优先级更新
+
+1. 继续沿 **MoE prepare / routed-expert kernel selection** 主线推进
+   - 重点看：
+     - `moe_align_block_size`
+     - routed-expert Triton config 选择
+     - second-GEMM down-config
+     - device-name / version fallback 是否还能更贴近本机
+2. 再回头排查 MoE router / dispatch 路径中是否还有额外 Python 胶水
+3. shared expert 与 linear-attn decode 继续降级，除非出现新的整段收益点
+4. 如果继续走“整个推理引擎”主线，应优先重新归因：
+   - graph replay 外的 batch/metadata 边界
+   - residual / layer glue
+   - 非 linear-attn / 非 routed-expert 的整层累计开销
