@@ -457,3 +457,86 @@
 ## 当前建议的一句话总结
 
 接下来最该做的，不是继续抠单个 attention 或 MoE 小 kernel，而是继续沿着**整层边界上的 prepare / epilogue / unfused norm 融合**这条主线推进；这已经被最近几轮实验反复证明是收益最大的方向。
+
+---
+
+## 2026-06-29 Decode 主线更新
+
+在 `101.04 tok/s` 之后，围绕 decode 主线连续做了几次“更贴近 sglang”或“更贴近 kernel fusion” 的单因素实验，结论如下。
+
+### 已验证有效
+
+1. `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+
+- 将 decode 时分开的：
+  - `in_proj_qkvz`
+  - `in_proj_ba`
+  合并为一次 bf16 GEMM
+- 结果：
+  - `101.04 -> 102.17 tok/s`
+- 结论：
+  - decode 输入边界上的 kernel/launch 组织确实是剩余差距来源之一
+  - 这是当前 decode 主线里更值得保留的有效项
+
+2. `MINISGL_LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ=1`
+
+- 对齐 sglang `_forward_input_proj` 的主流/辅流双流组织
+- 结果：
+  - `102.17 -> 102.29 tok/s`
+- 结论：
+  - 方向正确，但在 `bs=1` 下增益极小
+  - 说明 input projection 这块的 overlap 空间已经接近吃干净
+
+3. `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+
+- 在 fused `RMSNorm+gate` 路径中复用输出 buffer
+- 结果：
+  - `102.17 -> 102.51 tok/s`
+- 结论：
+  - decode gated norm 还有少量可挖空间
+  - 但“减少输出分配”本身不是大头
+
+### 已证伪 / 降级
+
+1. `MINISGL_LINEAR_DECODE_VK_STATE=1`
+
+- 仅把 decode state layout 对齐成 `[HV, V, K]`
+- 结果：
+  - 退化到 `97.01 tok/s`
+- 结论：
+  - 剩余差距并不是由 state layout 单独决定
+
+2. `MINISGL_LINEAR_DECODE_SGLANG_PACKED=1`
+
+- 直接复用 sglang packed recurrent decode kernel
+- 结果：
+  - 退化到 `96.92 tok/s`
+- 结论：
+  - 剩余差距不是“只换 recurrent kernel 本体”就能解决
+
+### 当前 decode 分段判断
+
+基于 `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1` 的 graph-off 阶段化 profile，稳定单层 decode 开销大致为：
+
+- `qkvz ≈ 0.062 ms`
+- `ba ≈ 0.003 ms`
+- `conv ≈ 0.048 ms`
+- `kernel ≈ 0.101~0.103 ms`
+- `norm ≈ 0.069~0.070 ms`
+- `out_proj ≈ 0.049~0.050 ms`
+
+这说明：
+
+- `ba` 已经基本被打平，不应再把 input proj 当成第一优先级
+- 目前 decode 主线剩余的更大块是：
+  - `kernel`
+  - `norm`
+  - `qkvz / out_proj / conv`
+
+### 下一优先级更新
+
+结合上面的实验与 sglang 代码对齐结果，下一步更合理的顺序应调整为：
+
+1. 优先继续看 decode 的 `norm -> out_proj` 边界
+2. 再考虑 decode `kernel` 本体附近是否还有可迁移的组织方式
+3. 不再继续优先追 `input proj`、`state layout`、`packed recurrent kernel` 这几条已经基本证伪或收益极小的线

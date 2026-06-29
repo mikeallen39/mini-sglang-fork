@@ -95,6 +95,11 @@ class EnvClassSingleton:
     FUSED_QKV_SPLIT = EnvBool(False)  # use fused QKV split kernel in GDN prefill
     LINEAR_PREFILL_QK_L2NORM = EnvBool(False)  # move Q/K l2norm from PyTorch prefill path into the linear-attn kernel
     LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS = EnvBool(False)  # skip explicit prefill contiguous/cast wrappers that chunk_gated_delta_rule already guards
+    LINEAR_DECODE_VK_STATE = EnvBool(False)  # keep an auxiliary [HV, V, K] state layout for decode fast path
+    LINEAR_DECODE_SGLANG_PACKED = EnvBool(False)  # call sglang packed recurrent decode kernel on the auxiliary [HV, V, K] state
+    LINEAR_DECODE_FUSED_INPUT_PROJ = EnvBool(False)  # fuse decode-time qkvz and ba projections into one GEMM in bf16 path
+    LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ = EnvBool(False)  # overlap decode-time qkvz and ba bf16 projections on two CUDA streams
+    LINEAR_RMSNORM_GATED_REUSE_OUT = EnvBool(False)  # reuse decode norm output buffer for fused RMSNorm+gate
     GEMMA_FUSED_NORM = EnvBool(False)  # use sgl_kernel gemma_rmsnorm / gemma_fused_add_rmsnorm
     FULL_ATTN_FUSED_PREPARE = EnvBool(False)  # fuse Q/K GemmaRMSNorm + RoPE + gate extraction in full attention
     FULL_ATTN_FUSED_GATE_MUL = EnvBool(False)  # fuse sigmoid(gate) * attn_output in full attention

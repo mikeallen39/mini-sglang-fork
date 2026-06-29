@@ -949,6 +949,7 @@ if triton is not None:
         BV: tl.constexpr,
         SOFTPLUS_THRESHOLD: tl.constexpr,
         USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+        STATE_LAYOUT_VK: tl.constexpr,
     ):
         i_v, i_nh = tl.program_id(0), tl.program_id(1)
         i_n, i_hv = i_nh // HV, i_nh % HV
@@ -958,7 +959,10 @@ if triton is not None:
         o_v = i_v * BV + tl.arange(0, BV)
         mask_k = o_k < K
         mask_v = o_v < V
-        mask_h = mask_k[:, None] & mask_v[None, :]
+        if STATE_LAYOUT_VK:
+            mask_h = mask_v[:, None] & mask_k[None, :]
+        else:
+            mask_h = mask_k[:, None] & mask_v[None, :]
 
         state_idx = tl.load(state_indices + i_n * stride_indices_tok).to(tl.int64)
         if state_idx < 0:
@@ -990,21 +994,39 @@ if triton is not None:
         g_val = -tl.exp(A_log_val) * softplus_x
         beta_val = tl.sigmoid(b_val)
 
-        p_state = (
-            state
-            + state_idx * stride_state_token
-            + i_hv * stride_state_head
-            + o_k[:, None] * stride_state_k
-            + o_v[None, :]
-        )
+        if STATE_LAYOUT_VK:
+            p_state = (
+                state
+                + state_idx * stride_state_token
+                + i_hv * stride_state_head
+                + o_v[:, None] * stride_state_k
+                + o_k[None, :]
+            )
+        else:
+            p_state = (
+                state
+                + state_idx * stride_state_token
+                + i_hv * stride_state_head
+                + o_k[:, None] * stride_state_k
+                + o_v[None, :]
+            )
         b_h = tl.load(p_state, mask=mask_h, other=0).to(tl.float32)
         b_h *= tl.exp(g_val)
-        b_v -= tl.sum(b_h * b_k[:, None], axis=0)
+        if STATE_LAYOUT_VK:
+            b_v -= tl.sum(b_h * b_k[None, :], axis=1)
+        else:
+            b_v -= tl.sum(b_h * b_k[:, None], axis=0)
         b_v *= beta_val
-        b_h += b_k[:, None] * b_v[None, :]
+        if STATE_LAYOUT_VK:
+            b_h += b_v[:, None] * b_k[None, :]
+        else:
+            b_h += b_k[:, None] * b_v[None, :]
 
         p_out = output + i_n * stride_output_tok + i_hv * V + o_v
-        b_o = tl.sum(b_h * b_q[:, None], axis=0)
+        if STATE_LAYOUT_VK:
+            b_o = tl.sum(b_h * b_q[None, :], axis=1)
+        else:
+            b_o = tl.sum(b_h * b_q[:, None], axis=0)
         tl.store(p_out, b_o.to(output.dtype.element_ty), mask=mask_v)
         tl.store(p_state, b_h.to(state.dtype.element_ty), mask=mask_h)
 
@@ -1139,6 +1161,7 @@ def fused_linear_attn_decode_sglang(
     scale: float,
     *,
     use_qk_l2norm_in_kernel: bool = True,
+    state_layout: str = "kv",
 ) -> torch.Tensor:
     if triton is None:
         raise RuntimeError("Triton is required for the sglang linear attention backend")
@@ -1150,9 +1173,14 @@ def fused_linear_attn_decode_sglang(
         )
     if state.ndim != 4:
         raise ValueError(f"Expected state to be 4D, got shape={tuple(state.shape)}")
+    if state_layout not in {"kv", "vk"}:
+        raise ValueError(f"Unsupported state layout: {state_layout}")
 
     batch_size = mixed_qkv.shape[0]
-    hv, k_dim, v_dim = state.shape[-3:]
+    if state_layout == "kv":
+        hv, k_dim, v_dim = state.shape[-3:]
+    else:
+        hv, v_dim, k_dim = state.shape[-3:]
     if a.shape != (batch_size, hv) or b.shape != (batch_size, hv):
         raise ValueError(
             f"Expected a/b shape {(batch_size, hv)}, got {tuple(a.shape)} and {tuple(b.shape)}"
@@ -1206,10 +1234,49 @@ def fused_linear_attn_decode_sglang(
         BV=bv,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        STATE_LAYOUT_VK=state_layout == "vk",
         num_warps=1,
         num_stages=3,
     )
     return output
+
+
+def fused_linear_attn_decode_sglang_packed(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float,
+    *,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> torch.Tensor:
+    try:
+        from sglang.srt.layers.attention.fla.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode as sglang_fused_recurrent_gated_delta_rule_packed_decode,
+        )
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("sglang packed decode kernel is unavailable") from exc
+    if state.ndim != 4:
+        raise ValueError(f"Expected state to be 4D, got shape={tuple(state.shape)}")
+    batch_size = mixed_qkv.shape[0]
+    hv, v_dim, _ = state.shape[-3:]
+    output = torch.empty((batch_size, 1, hv, v_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    sglang_fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=state,
+        out=output,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return output[:, 0]
 
 
 def fused_linear_attn_prefill_sglang(

@@ -1516,3 +1516,295 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 - 虽然收益不大，但说明当前 `64 out` 场景下 decode 路径里的 `a/b -> fp32` 包装仍有少量端到端成本
 - 当前最好稳定值更新为：
   - `output_tps = 101.04 tok/s`
+
+### LINEAR_DECODE_VK_STATE (2026-06-29)
+
+目标：
+
+- 对齐 sglang packed decode kernel 使用的 state layout
+- 验证仅将 linear-attention decode state 从 `[HV, K, V]` 扩展为辅助 `[HV, V, K]` 布局，是否能带来更好的 decode kernel 访存
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_VK_STATE=1`
+- 当开关打开时：
+  - 为每个 linear-attention layer/request slot 额外维护一份 `[HV, V, K]` 的辅助 state
+  - prefill 结束后从主 state 同步到辅助 state
+  - decode 路径改为直接读取辅助 state
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_VK_STATE=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 113.57 ms`
+- `E2E = 0.6494 s`
+- `output_tps = 97.01 tok/s`
+
+相对当前最好值：
+
+- `101.04 -> 97.01 tok/s`
+- 退化约 `4.0%`
+
+结论：
+
+- 仅仅切换 decode state layout 而不改变整条 decode 执行方式，不能带来收益
+- 这说明 mini-sglang 与 sglang 的差距并不是“state 排布”这一项单独决定的
+- 此方向降级，不进入性能主线
+
+### LINEAR_DECODE_SGLANG_PACKED (2026-06-29)
+
+目标：
+
+- 在 `LINEAR_DECODE_VK_STATE` 基础上，进一步直接复用 sglang 的 packed recurrent decode kernel
+- 验证收益究竟来自 layout，还是来自 sglang 那个 packed decode kernel 本体
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_SGLANG_PACKED=1`
+- 当开关打开时：
+  - 仅在 decode 路径调用 sglang 的 `fused_recurrent_gated_delta_rule_packed_decode`
+  - 要求同时打开 `MINISGL_LINEAR_DECODE_VK_STATE=1`
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_VK_STATE=1`
+- `MINISGL_LINEAR_DECODE_SGLANG_PACKED=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 117.25 ms`
+- `E2E = 0.6500 s`
+- `output_tps = 96.92 tok/s`
+
+相对当前最好值：
+
+- `101.04 -> 96.92 tok/s`
+- 退化约 `4.1%`
+
+结论：
+
+- 在当前 mini-sglang 的整体执行链里，直接替换成 sglang packed recurrent decode kernel 也没有收益
+- 说明剩余差距更像是 decode 整体边界开销，而不是单个 recurrent kernel 本体
+- 此方向降级，不进入性能主线
+
+### LINEAR_DECODE_FUSED_INPUT_PROJ (2026-06-29)
+
+目标：
+
+- 对齐 sglang 在 decode 输入边界上的“更紧的组织方式”
+- 验证将 decode 时分开的：
+  - `in_proj_qkvz`
+  - `in_proj_ba`
+  合并为一次 bf16 GEMM 后，能否降低 `qkvz + ba` 这段开销
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+- 当开关打开时：
+  - 仅在 `decode + bf16` 路径下，将 `in_proj_qkvz.weight` 和 `in_proj_ba.weight` 预先拼成一份 fused weight
+  - decode 时只做一次 `F.linear`
+  - 然后再切回 `mixed_qkvz` 与 `mixed_ba`
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 116.35 ms`
+- `E2E = 0.6166 s`
+- `output_tps = 102.17 tok/s`
+
+相对当前最好值：
+
+- `101.04 -> 102.17 tok/s`
+- 提升约 `1.1%`
+
+结论：
+
+- 这是 decode 主线上的有效收益
+- 它说明当前剩余差距的一部分确实来自 decode 输入边界上的 kernel/launch 组织，而不是 linear-attn 数学路径本身
+- 当前最好稳定值更新为：
+  - `output_tps = 102.17 tok/s`
+
+### LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ (2026-06-29)
+
+目标：
+
+- 更直接对齐 sglang 的 `_forward_input_proj` 组织方式
+- 验证在 `decode + bf16` 下，让：
+  - `in_proj_qkvz` 走主 CUDA stream
+  - `in_proj_ba` 走辅助 CUDA stream
+  是否能进一步重叠两次投影
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ=1`
+- 当开关打开时：
+  - 仅在 decode 路径里，为 linear-attention 层创建一个辅助 CUDA stream
+  - 主流发射 `in_proj_qkvz`
+  - 辅流发射 `in_proj_ba`
+  - 结束后做 stream 同步
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 112.77 ms`
+- `E2E = 0.6159 s`
+- `output_tps = 102.29 tok/s`
+
+相对当前最好值：
+
+- 相对 `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1` 的 `102.17 tok/s`
+- 小幅提升到 `102.29 tok/s`
+- 增益约 `+0.12 tok/s`
+
+结论：
+
+- 这条更贴近 sglang 的输入边界组织方式是正收益的
+- 但在 `bs=1` 场景下收益极小，说明 input projection 这段 overlap 空间已经接近吃干净
+- 当前最好稳定值更新为：
+  - `output_tps = 102.29 tok/s`
+
+### LINEAR_RMSNORM_GATED_REUSE_OUT (2026-06-29)
+
+目标：
+
+- 继续沿 decode gated norm 主线排查剩余开销
+- 验证 fused `RMSNorm + gate` 路径里每次 `torch.empty_like(...)` 的输出分配是否还有端到端成本
+
+实现：
+
+- 新增开关：
+  - `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+- 当开关打开时：
+  - 只在 fused `RMSNorm+gate` 路径下缓存一份输出 buffer
+  - 后续 decode 迭代复用该 buffer，避免重复分配
+
+配置：
+
+- `MINISGL_GEMMA_FUSED_NORM=1`
+- `MINISGL_FULL_ATTN_FUSED_PREPARE=1`
+- `MINISGL_DEPTHWISE_CONV_DECODE=1`
+- `MINISGL_LINEAR_RMSNORM_GATED=1`
+- `MINISGL_LINEAR_RMSNORM_GATED_REUSE_OUT=1`
+- `MINISGL_SHARED_EXPERT_FUSED_GATE_ADD=1`
+- `MINISGL_MOE_FUSED_ACTIVATION=1`
+- `MINISGL_SHARED_EXPERT_FUSED_ACTIVATION=1`
+- `MINISGL_LINEAR_PREFILL_QK_L2NORM=1`
+- `MINISGL_LINEAR_PREFILL_SKIP_REDUNDANT_CONTIGUOUS=1`
+- `MINISGL_SKIP_AB_FP32_CAST=1`
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+
+正确性检查：
+
+- 短请求 `介绍一下自己` 输出正常
+
+结果：
+
+- `TTFT = 116.88 ms`
+- `E2E = 0.6146 s`
+- `output_tps = 102.51 tok/s`
+
+相对当前最好值：
+
+- `102.17 -> 102.51 tok/s`
+- 提升约 `0.33%`
+
+结论：
+
+- decode gated norm 这条线还有少量可挖空间
+- 但“复用输出 buffer”本身不是大头，只能带来小幅收益
+- 当前最好稳定值更新为：
+  - `output_tps = 102.51 tok/s`
+
+### Decode 阶段化 Profile 更新 (2026-06-29)
+
+为了避免继续在 decode 输入边界上重复投入，对当前更优组合：
+
+- `MINISGL_LINEAR_DECODE_FUSED_INPUT_PROJ=1`
+
+做了 graph-off 的 decode 阶段化 profile。
+
+稳定单层 decode 开销大致为：
+
+- `qkvz ≈ 0.062 ms`
+- `ba ≈ 0.003 ms`
+- `conv ≈ 0.048 ms`
+- `kernel ≈ 0.101~0.103 ms`
+- `norm ≈ 0.069~0.070 ms`
+- `out_proj ≈ 0.049~0.050 ms`
+
+结论：
+
+- `FUSED_INPUT_PROJ` 已经基本打平 `ba`
+- 后续 decode 主线不应继续优先投入 input projection
+- 当前最值得继续追的剩余块是：
+  - `kernel`
+  - `norm`
+  - `qkvz / out_proj / conv`

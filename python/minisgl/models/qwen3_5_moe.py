@@ -11,6 +11,7 @@ from minisgl.kernel import silu_and_mul_quant_int8_triton
 from minisgl.linear_attention import (
     fused_gdn_gating_sglang,
     fused_linear_attn_decode_sglang,
+    fused_linear_attn_decode_sglang_packed,
     fused_linear_attn_prefill_sglang,
     fused_qkvzba_split_reshape_cat_contiguous,
 )
@@ -110,7 +111,10 @@ def _freeze_rope_scaling(scaling: dict | None) -> tuple[tuple[str, object], ...]
 
 class Qwen3_5LinearStateCache:
     def __init__(self):
-        self._states: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._states: dict[
+            int,
+            dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+        ] = {}
 
     def get(
         self,
@@ -123,7 +127,7 @@ class Qwen3_5LinearStateCache:
         head_k_dim: int,
         head_v_dim: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         layer_states = self._states.setdefault(layer_id, {})
         state = layer_states.get(table_idx)
         if state is not None:
@@ -142,7 +146,16 @@ class Qwen3_5LinearStateCache:
             dtype=torch.float32,
             device=device,
         )
-        layer_states[table_idx] = (conv_state, ssm_state)
+        ssm_state_vk = None
+        if ENV.LINEAR_DECODE_VK_STATE.value:
+            ssm_state_vk = torch.zeros(
+                num_v_heads,
+                head_v_dim,
+                head_k_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+        layer_states[table_idx] = (conv_state, ssm_state, ssm_state_vk)
         return layer_states[table_idx]
 
     def clear(self, table_idx: int) -> None:
@@ -151,7 +164,7 @@ class Qwen3_5LinearStateCache:
 
     def get_existing(
         self, layer_id: int, table_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
         layer_states = self._states.get(layer_id)
         if layer_states is None:
             return None
@@ -164,12 +177,15 @@ class Qwen3_5LinearStateCache:
             return
         dst[0].copy_(src[0])
         dst[1].copy_(src[1])
+        if src[2] is not None and dst[2] is not None:
+            dst[2].copy_(src[2])
 
 
 class Qwen3_5RMSNormGated(BaseOP):
     def __init__(self, hidden_size: int, eps: float):
         self.weight = torch.empty(hidden_size)
         self.eps = eps
+        self._fused_out_buffer: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x_shape = x.shape
@@ -183,12 +199,25 @@ class Qwen3_5RMSNormGated(BaseOP):
             and gate_2d.stride(-1) == 1
             and self.weight.is_cuda
         ):
+            out = None
+            if ENV.LINEAR_RMSNORM_GATED_REUSE_OUT.value:
+                cached = self._fused_out_buffer
+                if (
+                    cached is None
+                    or cached.shape != gate_2d.shape
+                    or cached.dtype != gate_2d.dtype
+                    or cached.device != gate_2d.device
+                    or cached.stride(-1) != 1
+                ):
+                    cached = torch.empty_like(gate_2d)
+                    self._fused_out_buffer = cached
+                out = cached
             return fused_rmsnorm_gated(
                 x_2d,
                 gate_2d,
                 self.weight,
                 self.eps,
-                out=torch.empty_like(gate_2d),
+                out=out,
             ).reshape(x_shape)
         out_dtype = gate.dtype
         x = x_2d
@@ -540,6 +569,8 @@ class Qwen3_5LinearAttention(BaseOP):
         self._decode_state_index: torch.Tensor | None = None
         self._A_log_fp32: torch.Tensor | None = None
         self._dt_bias_fp32: torch.Tensor | None = None
+        self._decode_fused_in_proj_weight: torch.Tensor | None = None
+        self._decode_alt_stream: torch.cuda.Stream | None = None
 
         assert self.num_v_heads % self.num_k_heads == 0, "Expected grouped value heads."
         self.kv_group_size = self.num_v_heads // self.num_k_heads
@@ -650,6 +681,17 @@ class Qwen3_5LinearAttention(BaseOP):
         self._dt_bias_fp32 = self.dt_bias.float().contiguous()
         self._gather_idx = torch.arange(self.num_v_heads, device=self.A_log.device) // self.kv_group_size
         self._decode_state_index = torch.tensor([0], dtype=torch.int32, device=self.A_log.device)
+        if self.A_log.is_cuda and self._decode_alt_stream is None:
+            self._decode_alt_stream = torch.cuda.Stream(device=self.A_log.device)
+        if (
+            self.in_proj_qkvz.weight.dtype != torch.int8
+            and self.in_proj_ba.weight.dtype != torch.int8
+        ):
+            self._decode_fused_in_proj_weight = torch.cat(
+                [self.in_proj_qkvz.weight, self.in_proj_ba.weight], dim=0
+            ).contiguous()
+        else:
+            self._decode_fused_in_proj_weight = None
 
     def copy_state(self, src_table_idx: int, dst_table_idx: int) -> None:
         self.state_cache.swap_states(self.layer_id, src_table_idx, dst_table_idx)
@@ -662,7 +704,7 @@ class Qwen3_5LinearAttention(BaseOP):
         b: torch.Tensor,
         table_idx: int,
     ) -> torch.Tensor:
-        conv_state, ssm_state = self.state_cache.get(
+        conv_state, ssm_state, _ = self.state_cache.get(
             self.layer_id,
             table_idx,
             conv_dim=self.conv_dim,
@@ -706,7 +748,7 @@ class Qwen3_5LinearAttention(BaseOP):
         is_decode: bool,
         profile_events: tuple[torch.cuda.Event, ...] | None = None,
     ) -> torch.Tensor:
-        conv_state, ssm_state = self.state_cache.get(
+        conv_state, ssm_state, ssm_state_vk = self.state_cache.get(
             self.layer_id,
             table_idx,
             conv_dim=self.conv_dim,
@@ -737,18 +779,36 @@ class Qwen3_5LinearAttention(BaseOP):
                 raise ValueError(
                     "Decode batches must have exactly one extend token per request for linear attention"
                 )
-            state = ssm_state.unsqueeze(0)
+            use_vk_state = ENV.LINEAR_DECODE_VK_STATE.value and ssm_state_vk is not None
+            state = (ssm_state_vk if use_vk_state else ssm_state).unsqueeze(0)
             state_indices = self._get_decode_state_index(mixed_qkv.device)
-            outputs = fused_linear_attn_decode_sglang(
-                mixed_qkv,
-                a,
-                b,
-                A_log,
-                dt_bias,
-                state,
-                state_indices,
-                self.scale,
-            )
+            if ENV.LINEAR_DECODE_SGLANG_PACKED.value:
+                if not use_vk_state:
+                    raise RuntimeError(
+                        "MINISGL_LINEAR_DECODE_SGLANG_PACKED requires MINISGL_LINEAR_DECODE_VK_STATE=1"
+                    )
+                outputs = fused_linear_attn_decode_sglang_packed(
+                    mixed_qkv,
+                    a,
+                    b,
+                    A_log,
+                    dt_bias,
+                    state,
+                    state_indices,
+                    self.scale,
+                )
+            else:
+                outputs = fused_linear_attn_decode_sglang(
+                    mixed_qkv,
+                    a,
+                    b,
+                    A_log,
+                    dt_bias,
+                    state,
+                    state_indices,
+                    self.scale,
+                    state_layout="vk" if use_vk_state else "kv",
+                )
         else:
             query, key, value, _ = self._reshape_qkv(mixed_qkv, z)
             use_qk_l2norm_in_kernel = ENV.LINEAR_PREFILL_QK_L2NORM.value
@@ -777,6 +837,8 @@ class Qwen3_5LinearAttention(BaseOP):
                 self.scale,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
+            if ssm_state_vk is not None:
+                ssm_state_vk.copy_(ssm_state.permute(0, 2, 1).contiguous())
         if profile_events is not None:
             kernel_end.record()
         outputs = self.norm.forward(outputs, z)
@@ -823,12 +885,45 @@ class Qwen3_5LinearAttention(BaseOP):
         if profile_enabled:
             assert proj_events is not None
             proj_events[0].record()
-        mixed_qkvz = self.in_proj_qkvz.forward_prequantized(x, x_q, x_scale)
-        if profile_enabled:
-            proj_events[1].record()
-        mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
-        if profile_enabled:
-            proj_events[2].record()
+        use_fused_decode_input_proj = (
+            batch.is_decode
+            and ENV.LINEAR_DECODE_FUSED_INPUT_PROJ.value
+            and x_q is None
+            and x_scale is None
+            and self._decode_fused_in_proj_weight is not None
+        )
+        if use_fused_decode_input_proj:
+            fused_proj = F.linear(x, self._decode_fused_in_proj_weight)
+            split_qkvz = self.local_key_dim * 2 + self.local_value_dim * 2
+            mixed_qkvz = fused_proj[:, :split_qkvz]
+            mixed_ba = fused_proj[:, split_qkvz:]
+            if profile_enabled:
+                proj_events[1].record()
+                proj_events[2].record()
+        elif (
+            batch.is_decode
+            and ENV.LINEAR_DECODE_DUAL_STREAM_INPUT_PROJ.value
+            and x_q is None
+            and x_scale is None
+            and self._decode_alt_stream is not None
+        ):
+            current_stream = torch.cuda.current_stream()
+            self._decode_alt_stream.wait_stream(current_stream)
+            mixed_qkvz = self.in_proj_qkvz.forward_prequantized(x, x_q, x_scale)
+            if profile_enabled:
+                proj_events[1].record()
+            with torch.cuda.stream(self._decode_alt_stream):
+                mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
+            current_stream.wait_stream(self._decode_alt_stream)
+            if profile_enabled:
+                proj_events[2].record()
+        else:
+            mixed_qkvz = self.in_proj_qkvz.forward_prequantized(x, x_q, x_scale)
+            if profile_enabled:
+                proj_events[1].record()
+            mixed_ba = self.in_proj_ba.forward_prequantized(x, x_q, x_scale)
+            if profile_enabled:
+                proj_events[2].record()
         if ENV.FUSED_QKV_SPLIT.value and self.backend == "sglang":
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 mixed_qkvz,
