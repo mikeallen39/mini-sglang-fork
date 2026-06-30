@@ -85,17 +85,19 @@ def fused_moe_kernel_triton(
     import triton.language as tl
 
     from .triton.fused_moe import fused_moe_kernel
-    from minisgl.quantization import quantize_activation_per_token_int8
+    from minisgl.quantization import is_w8a16_int8_enabled, quantize_activation_per_token_int8
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     padded_size = 0
-    use_int8_w8a8 = B.dtype == torch.int8
+    use_int8_weight = B.dtype == torch.int8
+    use_int8_w8a8 = use_int8_weight and not is_w8a16_int8_enabled()
+    use_int8_w8a16 = use_int8_weight and is_w8a16_int8_enabled()
     per_channel_quant = use_int8_w8a8
-    if use_int8_w8a8:
+    if use_int8_weight:
         if B_scale is None:
             raise ValueError("B_scale must be provided for int8 fused MoE")
-        if A_scale is None:
+        if use_int8_w8a8 and A_scale is None:
             A, A_scale = quantize_activation_per_token_int8(A)
         else:
             A = A.contiguous()
@@ -140,6 +142,7 @@ def fused_moe_kernel_triton(
         top_k=top_k,  # type: ignore
         compute_type=dtype,  # type: ignore
         use_int8_w8a8=use_int8_w8a8,  # type: ignore
+        use_weight_only_int8=use_int8_w8a16,  # type: ignore
         per_channel_quant=per_channel_quant,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
         filter_expert=filter_expert,  # type: ignore

@@ -8,6 +8,8 @@ class BaseMoeBackend(ABC):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_q: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
         w1: torch.Tensor,
         w1_scale: torch.Tensor | None,
         w2: torch.Tensor,

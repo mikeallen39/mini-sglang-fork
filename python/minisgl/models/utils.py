@@ -17,7 +17,7 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.models import ModelConfig
-from minisgl.quantization import quantize_activation_per_token_int8
+from minisgl.quantization import is_w8a8_int8_enabled, quantize_activation_per_token_int8
 from minisgl.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -53,7 +53,11 @@ class GatedMLP(BaseOP):
     ) -> torch.Tensor:
         if (
             x_q is None or x_scale is None
-        ) and getattr(self.gate_up_proj, "weight", None) is not None and self.gate_up_proj.weight.dtype == torch.int8:
+        ) and (
+            is_w8a8_int8_enabled()
+            and getattr(self.gate_up_proj, "weight", None) is not None
+            and self.gate_up_proj.weight.dtype == torch.int8
+        ):
             x_q, x_scale = quantize_activation_per_token_int8(x)
         gate_up = self.gate_up_proj.forward_prequantized(x, x_q, x_scale)
         del x

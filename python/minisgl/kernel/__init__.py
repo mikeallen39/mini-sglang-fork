@@ -1,8 +1,10 @@
 from .index import indexing
 from .activation_quant import (
+    decode_quant_int8_gemm_triton,
     gemma_rmsnorm_quant_int8_triton,
     per_token_quant_int8_triton,
     silu_and_mul_quant_int8_triton,
+    weight_only_int8_gemm_triton,
 )
 from .moe_impl import (
     fused_moe_kernel_triton,
@@ -18,8 +20,10 @@ from .tensor import test_tensor
 __all__ = [
     "indexing",
     "per_token_quant_int8_triton",
+    "decode_quant_int8_gemm_triton",
     "gemma_rmsnorm_quant_int8_triton",
     "silu_and_mul_quant_int8_triton",
+    "weight_only_int8_gemm_triton",
     "fast_compare_key",
     "store_cache",
     "test_tensor",

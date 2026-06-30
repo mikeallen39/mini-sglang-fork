@@ -10,7 +10,7 @@ from minisgl.distributed import (
     get_world_info,
 )
 from minisgl.quantization import (
-    is_w8a8_int8_enabled,
+    is_int8_weight_quant_enabled,
     quantize_weight_per_channel_int8_row_major,
 )
 from minisgl.utils import div_even
@@ -78,6 +78,8 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        hidden_states_q: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
         correction_bias: Optional[torch.Tensor] = None,
     ):
         ctx = get_global_ctx()
@@ -85,6 +87,8 @@ class MoELayer(BaseOP):
 
         final_hidden_states = moe_backend.forward(
             hidden_states=hidden_states,
+            hidden_states_q=hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
             w1=self.gate_up_proj,
             w1_scale=self.gate_up_proj_scale,
             w2=self.down_proj,
@@ -118,7 +122,7 @@ class MoELayer(BaseOP):
         return final_hidden_states
 
     def process_weights_after_loading(self) -> None:
-        if not is_w8a8_int8_enabled() or self.gate_up_proj.dtype == torch.int8:
+        if not is_int8_weight_quant_enabled() or self.gate_up_proj.dtype == torch.int8:
             return
 
         gate_up_q = []

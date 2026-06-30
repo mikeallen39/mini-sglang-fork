@@ -136,6 +136,50 @@ python benchmark/online/bench_qwen36_1024in_64out.py \
 | bf16 + Gemma Fused Norm + FullAttn Fused Prepare + Fused Gate Mul + Fused MoE + SGLang Linear Attention + CUDA Graph | 122.81 ms | 0.7279 s | 86.55 tok/s | 11.55 ms | 63.00 | 68153 MiB |
 | bf16 + Gemma Fused Norm + FullAttn Fused Prepare + SGLang CausalConv1dUpdate Decode + Fused MoE + SGLang Linear Attention + CUDA Graph | 123.30 ms | 0.7131 s | 88.35 tok/s | 11.32 ms | 63.00 | 68155 MiB |
 
+### 3.x W8A16（当前最优主线 + Fused MoE + CUDA Graph）
+
+- 配置：
+  - `quantization=w8a16_int8`
+  - `moe-backend=fused`
+  - `linear-attn-backend=sglang`
+  - `attention-backend=fi`
+  - `cuda-graph-max-bs=1`
+  - 保留当前 bf16/W8A8 主线中的其余有效优化
+- 正确性检查：
+  - 在真实仓库代码上去掉临时 `W8A16 -> TorchMoe` fallback 后
+  - 直接走 `fused MoE + W8A16 + CUDA Graph on`
+  - 服务可正常完成 CUDA graph capture 并启动
+  - 固定 prompt `“介绍一下自己”` 输出正常，开头为：
+    - `你好！我是通义千问（Qwen），是由阿里巴巴集团通义实验室独立研发的大语言模型。`
+  - 说明当前代码状态下，`W8A16 + fused MoE + graph on` 的 correctness 正常
+- 结果：
+
+| 项目 | TTFT | E2E | output_tokens |
+| --- | ---: | ---: | ---: |
+| run1 | 405.24 ms | 1.2848 s | 63 |
+| run2 | 146.83 ms | 1.0269 s | 63 |
+| run3 | 146.44 ms | 1.0268 s | 63 |
+| run4 | 146.67 ms | 1.0269 s | 63 |
+| run5 | 148.53 ms | 1.0285 s | 63 |
+
+| 稳态统计 | 数值 |
+| --- | ---: |
+| run2-run5 avg TTFT | 147.12 ms |
+| run2-run5 avg E2E | 1.0273 s |
+| run2-run5 output_tps | 61.33 tok/s |
+| avg_ms_per_output_token | 16.31 ms |
+| avg_output_tokens | 63.00 |
+
+- 对比同口径结果：
+  - `bf16`: `113.59 tok/s`
+  - `W8A8`: `110.24 tok/s`
+  - `W8A8 + norm fuse`: `110.49 tok/s`
+  - `W8A16`: `61.33 tok/s`
+- 当前结论：
+  - `W8A16` 的主要问题不是 correctness，而是性能显著落后
+  - 即使换掉 `torch._weight_int8pack_mm`，改为自写 Triton weight-only kernel，端到端吞吐仍然只有 bf16 的约一半
+  - 后续若继续优化 `W8A16`，主线应转向 `M=1` decode 热点 shape 的 weight-only kernel 调优，而不是继续排查 correctness
+
 **sglang main 对标（bf16，相同 workload，disable radix cache）：**
 
 | sglang bf16 | 106.40 ms | 0.5160 s | 124.03 tok/s | — | 63.00 | — |
@@ -2908,3 +2952,143 @@ correctness：
 - 说明：
   - `norm+quant fuse` 本身不是无效，而是 **有效但不是当前 W8A8 相对 bf16 的主矛盾**
   - 当前 W8A8 的主要差距更可能仍在其它量化边界，例如 linear-attention 的 int8 `in_proj/out_proj` 或 MoE expert 的 int8 主链
+
+### W8A8 Decode 通用 Quant+GEMM 融合尝试（失败，2026-06-29）
+
+背景：
+
+- 用户希望优先探索 decode 阶段的 `quant + gemm` 融合，而不是继续只做 `norm + quant`
+- 因此补做了一版 **decode-only、通用 W8A8 linear 入口** 的 Triton 融合路径：
+  - 新增开关：`MINISGL_W8A8_DECODE_FUSED_QUANT_GEMM=1`
+  - 只在：
+    - `batch.is_decode`
+    - `x.ndim == 2`
+    - `x.dtype == bfloat16`
+    - 小 batch
+    下触发
+  - 其余情况仍走原来的：
+    - `sgl_kernel.sgl_per_token_group_quant_int8`
+    - `sgl_kernel.int8_scaled_mm`
+
+同口径结果：
+
+- `W8A8 baseline`
+  - `TTFT = 88.88 ms`
+  - `E2E = 0.5698 s`
+  - `output_tps = 110.57 tok/s`
+- `W8A8 + MINISGL_W8A8_DECODE_FUSED_QUANT_GEMM=1`
+  - `TTFT = 89.12 ms`
+  - `E2E = 0.5709 s`
+  - `output_tps = 110.36 tok/s`
+
+microbench 也一致：
+
+- 在典型 decode shape（如 `M=1, K=2048, N=8192/4096/256`）上
+- 这版 fused kernel 比 `separate quant + sgl int8 GEMM` 慢约 `3% ~ 4%`
+
+原因分析：
+
+- 这次失败并不说明 “decode quant+gemm 融合方向本身无效”
+- 更准确地说，是 **“通用 linear 入口上的全局替换” 没有打中真正热点**
+- 当前 decode 的一些 W8A8 热路径里，量化结果本来就会被复用，例如：
+  - linear-attention 的 `in_proj_qkvz / in_proj_ba`
+  - 某些 MLP / MoE 预量化路径
+- 这些路径里原本是：
+  - 先量化一次，得到 `x_q / x_scale`
+  - 再喂给多个后续 int8 GEMM
+- 这次把 `quant` 重新内联进单个 GEMM 后，虽然省掉了：
+  - 一次单独 quant launch
+  - 一份中间 int8 激活张量写回
+- 但同时也失去了：
+  - `x_q / x_scale` 在多个 GEMM 之间的复用价值
+- 所以最终变成：
+  - 节省的 launch / 中间张量成本
+  - 不足以抵消失去复用后带来的额外量化成本
+
+结论：
+
+- `MINISGL_W8A8_DECODE_FUSED_QUANT_GEMM=1` 不进入主线
+- 下一步不应继续做“全局 W8A8 linear 入口替换”
+- 更合理的方向是只打那些：
+  - **量化后立刻 GEMM**
+  - **且不会复用 prequant 结果**
+  的 decode 子路径，例如：
+  - `shared expert: inter -> down_proj`
+  - `routed expert: stage2 -> w2/down_proj`
+
+### W8A8 Decode 子路径补充：Shared Expert `inter -> down_proj`（失败，2026-06-29）
+
+在上面的通用 linear 入口融合失败之后，又补做了一次更窄的 decode 子路径实验：
+
+- 新增开关：`MINISGL_W8A8_SHARED_EXPERT_DECODE_FUSED_DOWNPROJ=1`
+- 只在：
+  - `shared expert`
+  - `fused_silu_and_mul(gate_up) -> inter`
+  - `inter -> down_proj`
+  这一段触发
+- 目的就是验证：
+  - 对那些 **量化后立刻 GEMM**
+  - 且 **不会复用 prequant 结果**
+  的 decode 子路径，`quant+gemm` 融合能否赚钱
+
+结果：
+
+- baseline：
+  - `TTFT = 88.88 ms`
+  - `E2E = 0.5698 s`
+  - `output_tps = 110.57 tok/s`
+- `+ MINISGL_W8A8_SHARED_EXPERT_DECODE_FUSED_DOWNPROJ=1`
+  - `TTFT = 89.60 ms`
+  - `E2E = 0.5716 s`
+  - `output_tps = 110.22 tok/s`
+
+结论：
+
+- 这条 `shared expert` 子路径也没有收益，反而小幅退化
+- 说明：
+  - `shared expert inter -> down_proj` 不是当前 W8A8 decode 的主要矛盾
+  - 下一步应把优先级进一步收缩到更重的 `routed expert stage2 -> w2/down_proj`
+
+### W8A8 Decode 子路径补充：Routed Expert `stage2 -> w2/down_proj`（失败，2026-06-29）
+
+继续沿更重的 decode 子路径做实验：
+
+- 新增开关：`MINISGL_W8A8_ROUTED_EXPERT_DECODE_FUSED_W2=1`
+- 这次没有重写全新 kernel，而是把仓库里已有但默认关闭的：
+  - `fused_moe_w2_silu_int8_kernel_triton`
+  重新接成 **decode-only** 路径
+- 只在：
+  - `batch.is_decode`
+  - `activation == silu`
+  - `w2.dtype == int8`
+  时启用
+
+这条 kernel 的语义是把 routed expert 的：
+
+- `silu(gate) * up`
+- `per-token int8 quant`
+- `w2/down_proj int8 GEMM`
+
+合成一条更宽的内核路径。
+
+结果：
+
+- baseline：
+  - `TTFT = 88.88 ms`
+  - `E2E = 0.5698 s`
+  - `output_tps = 110.57 tok/s`
+- `+ MINISGL_W8A8_ROUTED_EXPERT_DECODE_FUSED_W2=1`
+  - `TTFT = 88.84 ms`
+  - `E2E = 0.5880 s`
+  - `output_tps = 107.14 tok/s`
+
+结论：
+
+- 这条 routed expert decode fused kernel 明显退化
+- 说明当前 W8A8 decode 的主矛盾也不是：
+  - “把局部 `stage2 -> quant -> w2` 再往宽里 fuse 一点”
+- 到这里可以比较有把握地下结论：
+  - 不论是通用 linear 入口
+  - 还是 shared expert 子路径
+  - 还是 routed expert 子路径
+  当前这条 **decode 局部 `quant+gemm` 融合主线** 都没有打中真实收益点

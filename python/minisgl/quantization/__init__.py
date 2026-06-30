@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Iterable
 
 import torch
+from minisgl.core import get_global_ctx
 from minisgl.env import ENV
+from minisgl.kernel import decode_quant_int8_gemm_triton, weight_only_int8_gemm_triton
 from minisgl.utils.logger import init_logger
 
-SUPPORTED_QUANTIZATION = {None, "w8a8_int8", "w8a8_int8_moe_only"}
+SUPPORTED_QUANTIZATION = {None, "w8a8_int8", "w8a8_int8_moe_only", "w8a16_int8"}
 
 _CURRENT_QUANTIZATION: str | None = None
 logger = init_logger(__name__)
@@ -42,12 +44,24 @@ def is_w8a8_int8_enabled() -> bool:
     return _CURRENT_QUANTIZATION in {"w8a8_int8", "w8a8_int8_moe_only"}
 
 
+def is_w8a16_int8_enabled() -> bool:
+    return _CURRENT_QUANTIZATION == "w8a16_int8"
+
+
+def is_int8_weight_quant_enabled() -> bool:
+    return _CURRENT_QUANTIZATION in {"w8a8_int8", "w8a8_int8_moe_only", "w8a16_int8"}
+
+
 def is_w8a8_int8_full_linear_enabled() -> bool:
     return _CURRENT_QUANTIZATION == "w8a8_int8"
 
 
 def is_w8a8_int8_moe_only_enabled() -> bool:
     return _CURRENT_QUANTIZATION == "w8a8_int8_moe_only"
+
+
+def is_w8a16_int8_full_linear_enabled() -> bool:
+    return _CURRENT_QUANTIZATION == "w8a16_int8"
 
 
 def supports_sgl_kernel_int8_linear(input_size: int, output_size: int) -> bool:
@@ -170,6 +184,62 @@ def _apply_int8_scaled_mm(
     return output
 
 
+def _can_use_decode_fused_quant_gemm(
+    x: torch.Tensor,
+    qweight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    if not ENV.W8A8_DECODE_FUSED_QUANT_GEMM.value:
+        return False
+    if out_dtype != torch.bfloat16:
+        return False
+    if not (x.is_cuda and x.ndim == 2 and x.is_contiguous()):
+        return False
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if not (qweight_t.is_cuda and qweight_t.ndim == 2 and qweight_t.is_contiguous()):
+        return False
+    if qweight_t.dtype != torch.int8:
+        return False
+    if not (weight_scale.is_cuda and weight_scale.ndim == 2 and weight_scale.is_contiguous()):
+        return False
+    if weight_scale.dtype != torch.float32:
+        return False
+    if x.shape[1] != qweight_t.shape[0]:
+        return False
+    if weight_scale.shape != (qweight_t.shape[1], 1):
+        return False
+    if x.shape[0] > 8:
+        return False
+    try:
+        batch = get_global_ctx().batch
+    except Exception:
+        return False
+    return batch.is_decode
+
+
+def _apply_decode_fused_quant_gemm(
+    x: torch.Tensor,
+    qweight_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    if bias is not None:
+        if not (bias.is_cuda and bias.ndim == 1 and bias.dtype == out_dtype and bias.is_contiguous()):
+            raise RuntimeError("Decode fused quant+gemm requires a contiguous CUDA bias matching out_dtype")
+    output = torch.empty((x.shape[0], qweight_t.shape[1]), device=x.device, dtype=out_dtype)
+    decode_quant_int8_gemm_triton(
+        x,
+        qweight_t,
+        weight_scale,
+        output,
+        bias=bias,
+    )
+    return output
+
+
 def _record_int8_dense_profile(key: str, value_ms: float, count_key: str) -> None:
     _INT8_DENSE_PROFILE[key] += value_ms
     _INT8_DENSE_PROFILE[count_key] += 1
@@ -218,6 +288,14 @@ def apply_w8a8_int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    if _can_use_decode_fused_quant_gemm(x, qweight_t, weight_scale, x.dtype):
+        return _apply_decode_fused_quant_gemm(
+            x,
+            qweight_t,
+            weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
+        )
     x_q, x_scale = quantize_activation_per_token_int8(x)
     return apply_w8a8_int8_linear_from_prequantized(
         x_q,
@@ -247,6 +325,39 @@ def apply_w8a8_int8_linear_with_prequantized_fallback(
         out_dtype=x.dtype,
         bias=bias,
     )
+
+
+def apply_w8a16_int8_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    if x.ndim < 2:
+        raise ValueError(f"Expected an input with ndim >= 2, got ndim={x.ndim}")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(f"W8A16 only supports fp16/bf16 activations, got dtype={x.dtype}")
+    if qweight.dtype != torch.int8:
+        raise RuntimeError(f"W8A16 expects int8 weights, got dtype={qweight.dtype}")
+    if not x.is_cuda or not qweight.is_cuda or not weight_scale.is_cuda:
+        raise RuntimeError("W8A16 requires CUDA tensors")
+    x_2d = x.view(-1, x.shape[-1]).contiguous()
+    output = torch.empty(
+        (x_2d.shape[0], qweight.shape[0]),
+        device=x.device,
+        dtype=x.dtype,
+    )
+    try:
+        weight_only_int8_gemm_triton(
+            x_2d,
+            qweight.contiguous(),
+            weight_scale.contiguous(),
+            output,
+            bias=bias,
+        )
+    except Exception as exc:
+        raise RuntimeError("weight_only_int8_gemm_triton failed in W8A16 path") from exc
+    return output.view(*x.shape[:-1], qweight.shape[0])
 
 
 def process_weights_after_loading(root: object) -> None:

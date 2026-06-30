@@ -88,6 +88,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
+    use_weight_only_int8: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -166,11 +167,12 @@ def fused_moe_kernel(
         + off_experts * stride_be
         + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
-    if use_int8_w8a8 and per_channel_quant:
+    if use_int8_w8a8 or use_weight_only_int8:
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
         b_scale = tl.load(b_scale_ptrs)
-        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-        a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        if use_int8_w8a8:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -201,6 +203,8 @@ def fused_moe_kernel(
 
         if use_int8_w8a8:
             accumulator += tl.dot(a, b)
+        elif use_weight_only_int8:
+            accumulator += tl.dot(a, b.to(a.dtype))
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -209,6 +213,8 @@ def fused_moe_kernel(
 
     if use_int8_w8a8:
         accumulator *= a_scale * b_scale
+    elif use_weight_only_int8:
+        accumulator *= b_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)

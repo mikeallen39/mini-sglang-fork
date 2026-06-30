@@ -6,8 +6,12 @@ import torch
 import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.quantization import (
+    quantize_weight_per_channel_int8_row_major,
+    apply_w8a16_int8_linear,
     apply_w8a8_int8_linear,
     apply_w8a8_int8_linear_with_prequantized_fallback,
+    is_int8_weight_quant_enabled,
+    is_w8a16_int8_full_linear_enabled,
     is_w8a8_int8_full_linear_enabled,
     is_w8a8_int8_moe_only_enabled,
     quantize_weight_per_channel_int8,
@@ -70,6 +74,8 @@ class _LinearTPImpl(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight.dtype == torch.int8:
             assert self.weight_scale is not None
+            if is_w8a16_int8_full_linear_enabled():
+                return apply_w8a16_int8_linear(x, self.weight, self.weight_scale, self.bias)
             return apply_w8a8_int8_linear(x, self.weight, self.weight_scale, self.bias)
         return F.linear(x, self.weight, self.bias)
 
@@ -81,6 +87,8 @@ class _LinearTPImpl(BaseOP):
     ) -> torch.Tensor:
         if self.weight.dtype == torch.int8:
             assert self.weight_scale is not None
+            if is_w8a16_int8_full_linear_enabled():
+                return apply_w8a16_int8_linear(x, self.weight, self.weight_scale, self.bias)
             return apply_w8a8_int8_linear_with_prequantized_fallback(
                 x,
                 x_q,
@@ -95,16 +103,22 @@ class _LinearTPImpl(BaseOP):
         should_quantize = is_w8a8_int8_full_linear_enabled() or (
             self.quantize_in_moe_only and is_w8a8_int8_moe_only_enabled()
         )
+        should_quantize = should_quantize or is_w8a16_int8_full_linear_enabled()
         if self.disable_int8_quantization:
             return
         if not should_quantize or self.weight.dtype == torch.int8:
+            return
+        if not is_int8_weight_quant_enabled():
             return
         if not supports_sgl_kernel_int8_linear(
             self.local_input_size,
             self.local_output_size,
         ):
             return
-        self.weight, self.weight_scale = quantize_weight_per_channel_int8(self.weight)
+        if is_w8a16_int8_full_linear_enabled():
+            self.weight, self.weight_scale = quantize_weight_per_channel_int8_row_major(self.weight)
+        else:
+            self.weight, self.weight_scale = quantize_weight_per_channel_int8(self.weight)
 
 
 class LinearReplicated(_LinearTPImpl):

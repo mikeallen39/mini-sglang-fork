@@ -33,7 +33,10 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.quantization import (
+    apply_w8a16_int8_linear,
+    apply_w8a8_int8_linear,
     apply_w8a8_int8_linear_from_prequantized,
+    is_w8a8_int8_enabled,
     quantize_activation_per_token_int8,
 )
 from minisgl.utils import div_even, get_linear_attn_backend, local_kv_heads, nvtx_annotate
@@ -327,11 +330,17 @@ class Qwen3_5SparseMoeBlock(BaseOP):
             e0.record()
         if hidden_states_q is None or hidden_states_scale is None:
             if (
-                self.gate.weight.dtype == torch.int8
-                or (self.shared_expert is not None and self.shared_expert.gate_up_proj.weight.dtype == torch.int8)
-                or (
-                    self.shared_expert_gate is not None
-                    and self.shared_expert_gate.weight.dtype == torch.int8
+                is_w8a8_int8_enabled()
+                and (
+                    self.gate.weight.dtype == torch.int8
+                    or (
+                        self.shared_expert is not None
+                        and self.shared_expert.gate_up_proj.weight.dtype == torch.int8
+                    )
+                    or (
+                        self.shared_expert_gate is not None
+                        and self.shared_expert_gate.weight.dtype == torch.int8
+                    )
                 )
             ):
                 hidden_states_q, hidden_states_scale = quantize_activation_per_token_int8(hidden_states)
@@ -363,7 +372,12 @@ class Qwen3_5SparseMoeBlock(BaseOP):
                     hidden_states_q=hidden_states_q,
                     hidden_states_scale=hidden_states_scale,
                 )
-        output = self.experts.forward(hidden_states, router_logits)
+        output = self.experts.forward(
+            hidden_states,
+            router_logits,
+            hidden_states_q=hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+        )
         if profile_enabled:
             e2.record()
         if self.shared_expert is not None and self.shared_expert_gate is not None:
@@ -468,6 +482,7 @@ class Qwen3_5SharedExpert(BaseOP):
         hidden_states_q: torch.Tensor | None = None,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        batch = get_global_ctx().batch
         if (
             self.gate_up_proj.weight.dtype == torch.int8
             and self.gate_up_proj.weight_scale is not None
@@ -484,14 +499,32 @@ class Qwen3_5SharedExpert(BaseOP):
                 dtype=gate_up.dtype,
             )
             fused_silu_and_mul(gate_up, inter)
-            inter_q, inter_s = quantize_activation_per_token_int8(inter)
-            return apply_w8a8_int8_linear_from_prequantized(
-                inter_q,
-                inter_s,
+            if (
+                ENV.W8A8_SHARED_EXPERT_DECODE_FUSED_DOWNPROJ.value
+                and batch.is_decode
+                and inter.shape[0] <= 8
+            ):
+                return apply_w8a8_int8_linear(
+                    inter,
+                    self.down_proj.weight,
+                    self.down_proj.weight_scale,
+                    self.down_proj.bias,
+                )
+            if is_w8a8_int8_enabled():
+                inter_q, inter_s = quantize_activation_per_token_int8(inter)
+                return apply_w8a8_int8_linear_from_prequantized(
+                    inter_q,
+                    inter_s,
+                    self.down_proj.weight,
+                    self.down_proj.weight_scale,
+                    out_dtype=x.dtype,
+                    bias=self.down_proj.bias,
+                )
+            return apply_w8a16_int8_linear(
+                inter,
                 self.down_proj.weight,
                 self.down_proj.weight_scale,
-                out_dtype=x.dtype,
-                bias=self.down_proj.bias,
+                self.down_proj.bias,
             )
         gate_up = self.gate_up_proj.forward_prequantized(x, hidden_states_q, hidden_states_scale)
         if ENV.SHARED_EXPERT_FUSED_ACTIVATION.value and gate_up.is_cuda and gate_up.ndim == 2:
@@ -972,7 +1005,9 @@ class Qwen3_5LinearAttention(BaseOP):
             )
         x_q = None
         x_scale = None
-        if self.in_proj_qkvz.weight.dtype == torch.int8 or self.in_proj_ba.weight.dtype == torch.int8:
+        if is_w8a8_int8_enabled() and (
+            self.in_proj_qkvz.weight.dtype == torch.int8 or self.in_proj_ba.weight.dtype == torch.int8
+        ):
             if profile_enabled:
                 assert quant_events is not None
                 quant_events[0].record()

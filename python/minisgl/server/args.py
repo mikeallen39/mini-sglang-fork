@@ -252,11 +252,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--quantization",
         type=str,
         default="none" if ServerArgs.quantization is None else ServerArgs.quantization,
-        choices=["none", "w8a8_int8", "w8a8_int8_moe_only"],
+        choices=["none", "w8a8_int8", "w8a8_int8_moe_only", "w8a16_int8"],
         help=(
             "Optional model quantization mode. "
             "'w8a8_int8' enables model-wide weight-int8 and activation-int8 linear kernels; "
-            "'w8a8_int8_moe_only' only quantizes MoE expert weights."
+            "'w8a8_int8_moe_only' only quantizes MoE expert weights; "
+            "'w8a16_int8' enables model-wide weight-int8 and activation-bf16/fp16 linear kernels."
         ),
     )
 

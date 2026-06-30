@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
-from minisgl.quantization import apply_w8a8_int8_linear
+from minisgl.quantization import apply_w8a16_int8_linear, apply_w8a8_int8_linear, is_w8a16_int8_enabled
 
 from .fused import fused_topk, grouped_topk
 
@@ -98,23 +98,39 @@ class TorchMoe(BaseMoeBackend):
 
             if w1.dtype == torch.int8:
                 assert w1_scale is not None
-                inter = apply_w8a8_int8_linear(
-                    routed_x,
-                    w1[expert_id].transpose(0, 1).contiguous(),
-                    w1_scale[expert_id].unsqueeze(-1),
-                    None,
-                )
+                if is_w8a16_int8_enabled():
+                    inter = apply_w8a16_int8_linear(
+                        routed_x,
+                        w1[expert_id].contiguous(),
+                        w1_scale[expert_id].unsqueeze(-1),
+                        None,
+                    )
+                else:
+                    inter = apply_w8a8_int8_linear(
+                        routed_x,
+                        w1[expert_id].transpose(0, 1).contiguous(),
+                        w1_scale[expert_id].unsqueeze(-1),
+                        None,
+                    )
             else:
                 inter = F.linear(routed_x, w1[expert_id])
             inter = _apply_activation(inter, activation)
             if w2.dtype == torch.int8:
                 assert w2_scale is not None
-                routed_out = apply_w8a8_int8_linear(
-                    inter,
-                    w2[expert_id].transpose(0, 1).contiguous(),
-                    w2_scale[expert_id].unsqueeze(-1),
-                    None,
-                )
+                if is_w8a16_int8_enabled():
+                    routed_out = apply_w8a16_int8_linear(
+                        inter,
+                        w2[expert_id].contiguous(),
+                        w2_scale[expert_id].unsqueeze(-1),
+                        None,
+                    )
+                else:
+                    routed_out = apply_w8a8_int8_linear(
+                        inter,
+                        w2[expert_id].transpose(0, 1).contiguous(),
+                        w2_scale[expert_id].unsqueeze(-1),
+                        None,
+                    )
             else:
                 routed_out = F.linear(inter, w2[expert_id])
 

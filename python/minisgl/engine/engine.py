@@ -507,10 +507,10 @@ def _adjust_config(config: EngineConfig):
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 
-    if config.quantization == "w8a8_int8":
+    if config.quantization in {"w8a8_int8", "w8a16_int8"}:
         if config.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                f"w8a8_int8 only supports float16/bfloat16 activations, got dtype={config.dtype}"
+                f"{config.quantization} only supports float16/bfloat16 activations, got dtype={config.dtype}"
             )
 
     if config.linear_attn_backend == "sglang":

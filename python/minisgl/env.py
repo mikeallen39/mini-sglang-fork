@@ -105,6 +105,9 @@ class EnvClassSingleton:
     MOE_SGL_REDUCE = EnvBool(False)  # use sgl_kernel moe_sum_reduce instead of local Triton reduce
     MOE_TORCH_COMPILE_REDUCE = EnvBool(False)  # use torch.compile moe_sum_reduce fastpath for small-token CUDA MoE reduce
     W8A8_FUSED_GEMMA_NORM_QUANT = EnvBool(False)  # fuse GemmaRMSNorm with per-token int8 activation quant on W8A8 paths
+    W8A8_DECODE_FUSED_QUANT_GEMM = EnvBool(False)  # use a decode-only Triton fused quant+int8-GEMM path for small-batch W8A8 linears
+    W8A8_SHARED_EXPERT_DECODE_FUSED_DOWNPROJ = EnvBool(False)  # fuse shared-expert decode inter quant + down_proj int8 GEMM
+    W8A8_ROUTED_EXPERT_DECODE_FUSED_W2 = EnvBool(False)  # use decode-only fused routed-expert silu+quant+w2 int8 kernel
     LINEAR_RMSNORM_GATED = EnvBool(False)  # use fused RMSNorm+gate for Qwen3.6 linear attention output norm
     SHARED_EXPERT_FUSED_GATE_ADD = EnvBool(False)  # fuse sigmoid(gate)*shared_output + moe_output for shared expert
     SHARED_EXPERT_FUSED_ACTIVATION = EnvBool(False)  # use fused silu_and_mul inside shared expert bf16 path

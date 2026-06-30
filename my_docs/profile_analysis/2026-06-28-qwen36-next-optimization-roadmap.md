@@ -96,6 +96,33 @@
 - 如果以当前工作树最新最好值为参考，还剩大约 `25 tok/s`
 - 如果以当前工作树最新最好值为参考，还剩大约 `23.0 tok/s`
 
+### W8A16 最新状态（2026-06-30）
+
+在当前代码状态下，`W8A16` 这条线已经重新确认：
+
+- `W8A16 + fused MoE + CUDA graph on` 的 correctness 正常
+- 之前关于 `fused MoE W8A16` correctness 异常的判断应撤回
+- 但性能显著落后，当前同口径结果为：
+  - `TTFT = 147.12 ms`
+  - `E2E = 1.0273 s`
+  - `output_tps = 61.33 tok/s`
+
+对比同口径：
+
+- `bf16`: `113.59 tok/s`
+- `W8A8`: `110.24 tok/s`
+- `W8A8 + norm fuse`: `110.49 tok/s`
+- `W8A16`: `61.33 tok/s`
+
+当前结论：
+
+- `W8A16` 的主要问题不是 correctness
+- 而是 weight-only int8 kernel 在当前 decode 热点 shape 上性能明显不足
+- 后续若继续优化 `W8A16`，主线应优先：
+  - profile `linear-attn in/out proj`
+  - profile `MoE w1/w2`
+  - 针对 `M=1, K=2048, N in {2048, 4096, 8192, 8704}` 做 kernel 调优
+
 ---
 
 ## 当前最重要的总体判断
@@ -1001,3 +1028,77 @@
   - 如果继续追 W8A8，优先级应转向：
     - linear-attention 的 int8 `in_proj/out_proj`
     - routed/shared expert 的 int8 主链
+
+### W8A8 Decode Quant+GEMM 补充结论（2026-06-29）
+
+又补做了一轮 decode 阶段的 `quant+gemm` 融合验证：
+
+- 新增开关：`MINISGL_W8A8_DECODE_FUSED_QUANT_GEMM=1`
+- 做法是：
+  - 在通用 `apply_w8a8_int8_linear()` 入口上
+  - 仅对 `batch.is_decode` 的小 batch 场景
+  - 改走本地 Triton `decode fused quant+gemm`
+
+结果：
+
+- `W8A8 baseline`
+  - `output_tps = 110.57 tok/s`
+- `W8A8 + MINISGL_W8A8_DECODE_FUSED_QUANT_GEMM=1`
+  - `output_tps = 110.36 tok/s`
+
+同时 microbench 也显示：
+
+- `M=1` 的 decode 热点 shape 上
+- 这版 fused kernel 比当前 `sgl quant + sgl int8_scaled_mm` 慢约 `3%~4%`
+
+原因不是 “decode quant+gemm 融合一定没用”，而是这次打的位置不对：
+
+- 当前 decode 下的一些 W8A8 热路径，本来就会复用同一份 `x_q/x_scale`
+- 一旦在通用 linear 入口把 `quant` 重新内联进单个 GEMM：
+  - 虽然少了一次 quant launch 和一份中间张量
+  - 但也丢掉了 `x_q/x_scale` 跨多个 GEMM 的复用价值
+- 所以这条线的净收益变成负数
+
+因此，这轮实验把后续方向收得更清楚了：
+
+- 不建议继续做 **通用 W8A8 linear 入口的全局 decode fuse**
+- 更合理的下一步是只打那些：
+  - 量化后立刻 GEMM
+  - 且不会复用 prequant 结果
+  的 decode 子路径
+
+当前最值得优先试的两段是：
+
+1. `shared expert: inter -> down_proj`
+2. `routed expert: stage2 -> w2/down_proj`
+
+其中第一条已经补测完：
+
+- `MINISGL_W8A8_SHARED_EXPERT_DECODE_FUSED_DOWNPROJ=1`
+  - `110.57 -> 110.22 tok/s`
+  - 小幅退化
+
+因此：
+
+- `shared expert inter -> down_proj` 可以降级
+- 下一步优先级应进一步收缩到：
+  - `routed expert: stage2 -> w2/down_proj`
+
+第二条现在也已经补测完：
+
+- `MINISGL_W8A8_ROUTED_EXPERT_DECODE_FUSED_W2=1`
+  - `110.57 -> 107.14 tok/s`
+  - 明显退化
+
+这意味着：
+
+- 通用 decode `quant+gemm` 融合：退化
+- shared expert `inter -> down_proj`：退化
+- routed expert `stage2 -> w2/down_proj`：退化
+
+所以当前关于 W8A8 decode TPS 的判断需要进一步收紧：
+
+- 主要矛盾大概率 **不是** “局部 `quant+gemm` 不够 fused”
+- 更可能是：
+  - W8A8 decode 下其它量化边界组织问题
+  - 或者小 batch / graph on 场景里，现有 `sgl_kernel.int8_scaled_mm` 本身已经比这些局部融合更合适

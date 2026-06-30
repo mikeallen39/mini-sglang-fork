@@ -10,7 +10,7 @@ from minisgl.env import ENV
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.dispatch import build_local_expert_dispatch_plan
 from minisgl.core import get_global_ctx
-from minisgl.quantization import quantize_activation_per_token_int8
+from minisgl.quantization import is_w8a16_int8_enabled, quantize_activation_per_token_int8
 from minisgl.utils import div_ceil
 from minisgl.utils.logger import init_logger
 
@@ -23,11 +23,6 @@ _FUSED_MOE_PROFILE = {
     "count": 0,
 }
 _FUSED_MOE_PROFILE_INTERVAL = 20
-# The specialized fused w2+silu int8 kernel regressed badly on the current
-# Qwen3.6 routed-expert shapes, especially for prefill-sized token counts.
-# Keep it disabled by default until a shape-aware heuristic or a fixed kernel
-# is available.
-_ENABLE_FUSED_W2_SILU_INT8 = False
 logger = init_logger(__name__)
 _SGLANG_MOE_CONFIG_FALLBACKS = (
     "NVIDIA_A800-SXM4-80GB",
@@ -621,6 +616,8 @@ def try_get_optimal_moe_down_config(
 
 def fused_experts_impl(
     hidden_states: torch.Tensor,
+    hidden_states_q: torch.Tensor | None,
+    hidden_states_scale: torch.Tensor | None,
     w1: torch.Tensor,
     w2: torch.Tensor,
     w1_scale: torch.Tensor | None,
@@ -676,7 +673,11 @@ def fused_experts_impl(
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    use_int8_stage2_int8 = w2.dtype == torch.int8 and activation == "silu"
+    use_int8_stage2_int8 = (
+        w2.dtype == torch.int8
+        and activation == "silu"
+        and not is_w8a16_int8_enabled()
+    )
     if use_int8_stage2_int8:
         intermediate_cache2 = _get_workspace_tensor(
             device=hidden_states.device,
@@ -758,7 +759,7 @@ def fused_experts_impl(
         curr_hidden_states,
         w1,
         intermediate_cache1,
-        None,
+        hidden_states_scale,
         w1_scale,
         curr_topk_weights,
         curr_topk_ids,
@@ -773,7 +774,12 @@ def fused_experts_impl(
     )
     if profile_enabled:
         e1.record()
-    if use_int8_stage2_int8 and _ENABLE_FUSED_W2_SILU_INT8:
+    use_decode_fused_w2_int8 = (
+        use_int8_stage2_int8
+        and ENV.W8A8_ROUTED_EXPERT_DECODE_FUSED_W2.value
+        and batch.is_decode
+    )
+    if use_decode_fused_w2_int8:
         if profile_enabled:
             e2.record()
         fused_moe_w2_silu_int8_kernel_triton(
@@ -926,6 +932,8 @@ class FusedMoe(BaseMoeBackend):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_q: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
         w1: torch.Tensor,
         w1_scale: torch.Tensor | None,
         w2: torch.Tensor,
@@ -993,6 +1001,8 @@ class FusedMoe(BaseMoeBackend):
 
         return fused_experts_impl(
             hidden_states,
+            hidden_states_q,
+            hidden_states_scale,
             w1,
             w2,
             w1_scale,
